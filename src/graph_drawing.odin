@@ -2,6 +2,7 @@ package main
 
 import "core:os"
 import "core:fmt"
+import "core:math"
 import "core:strings"
 import "core:strconv"
 import mem "core:mem/virtual"
@@ -13,6 +14,7 @@ GraphDrawing :: struct
 {
     min: Point2D,
     max: Point2D,
+    total_points: int,
     edges: [dynamic]Edge,
     endpoints: [dynamic][2]Point2D,
 }
@@ -27,17 +29,16 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
         return {}, false
     }
 
+    gd.edges = make([dynamic]Edge)
     gd.min = Point2D{ max(f32), max(f32) }
     gd.max = Point2D{ min(f32), min(f32) }
-
-    points_count: int
 
     str := string(data)
     for line in strings.split_lines_iterator(&str)
     {
         line := string(line)
 
-        edge := make([dynamic]Point2D)
+        edge := make(Edge)
 
         _, _ = strings.split_iterator(&line, " ") // skip idx
         for token in strings.split_iterator(&line, " ")
@@ -78,7 +79,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
             gd.max.y = max(gd.max.y, point.y)
 
             append(&edge, point)
-            points_count += 1
+            gd.total_points += 1
         }
 
         if len(edge) == 0
@@ -93,7 +94,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
 
     fmt.println("Successfully read file:", filename)
     fmt.println(">> total edges:", len(gd.edges))
-    fmt.println(">> total control points:", points_count)
+    fmt.println(">> total control points:", gd.total_points)
 
     return
 }
@@ -124,3 +125,61 @@ graphdrawing_normalize :: proc(gd: ^GraphDrawing, border: f32 = 0.05)
 
     gd.min, gd.max = Point2D{ -1, -1 }, Point2D{ 1, 1 }
 }
+
+graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
+{
+    new_total_points: int
+    new_edges := make([dynamic]Edge, 0, len(gd.edges))
+    for edge, i in gd.edges
+    {
+        new_edge := make(Edge, 0, len(edge))
+        defer append(&new_edges, new_edge)
+
+        cur_space := spacing
+        prv_pos := edge[0]
+
+        append(&new_edge, prv_pos)
+        new_total_points += 1
+
+        for i := 1; i < len(edge);
+        {
+            cur_pos := edge[i]
+            new_space := distance(cur_pos, prv_pos)
+
+            if new_space < cur_space
+            {
+                cur_space -= new_space
+                prv_pos = cur_pos
+                i += 1
+                continue
+            }
+
+            t := cur_space / new_space
+            prv_pos = prv_pos * (1 - t) + cur_pos * t
+            append(&new_edge, prv_pos)
+            new_total_points += 1
+
+            cur_space = spacing
+        }
+
+        // If endpoint was not included during the resample pass
+        if cur_space < spacing
+        {
+            append(&new_edge, edge[len(edge) - 1])
+            new_total_points += 1
+        }
+
+        delete(edge)
+    }
+
+    delete(gd.edges)
+    gd.edges = new_edges
+    gd.total_points = new_total_points
+}
+
+point2d_distance :: #force_inline proc(l, r: Point2D) -> f32
+{
+    return math.sqrt((l.x - r.x) * (l.x - r.x) + (l.y - r.y) * (l.y - r.y))
+}
+
+distance :: proc { point2d_distance }

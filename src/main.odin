@@ -7,17 +7,22 @@ import sdl "vendor:sdl3"
 
 main :: proc()
 {
+    init_app()
     defer deinit_app()
 
-    init_app()
-
     gds := [?]GraphDrawing{
-        graphdrawing_from_trl("./data/us-airlines.trl") or_else os.exit(1),
-        graphdrawing_from_trl("./data/us-migrations.trl") or_else os.exit(1),
         graphdrawing_from_trl("./data/fr-airlines.trl") or_else os.exit(1),
+        graphdrawing_from_trl("./data/us-migrations.trl") or_else os.exit(1),
+        graphdrawing_from_trl("./data/us-airlines.trl") or_else os.exit(1),
+        graphdrawing_from_trl("./data/rj-notlocal-elective.trl") or_else os.exit(1),
         graphdrawing_from_trl("./data/rj-2019.trl") or_else os.exit(1),
     }
-    for &gd in gds do graphdrawing_normalize(&gd)
+
+    for &gd in gds 
+    {
+        graphdrawing_normalize(&gd)
+        graphdrawing_resample(&gd)
+    }
 
     i: int
     upload_to_gpu(gds[i])
@@ -38,8 +43,11 @@ main :: proc()
                 {
                 case sdl.K_ESCAPE:
                     break outer
-                case sdl.K_SPACE:
-                    i = (i + 1) % len(gds)
+                case sdl.K_RIGHT:
+                    i = (i + 1) %% len(gds)
+                    upload_to_gpu(gds[i])
+                case sdl.K_LEFT:
+                    i = (i - 1) %% len(gds)
                     upload_to_gpu(gds[i])
                 }
             }
