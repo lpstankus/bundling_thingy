@@ -18,7 +18,7 @@ GraphRenderCtx :: struct
     vert_shader: ^sdl.GPUShader,
     frag_shader: ^sdl.GPUShader,
 
-    vertex_edges: u32,
+    vertex_count: u32,
     vertex_bytes: u32,
     vertex_buffer: ^sdl.GPUBuffer,
 
@@ -99,7 +99,7 @@ init_app :: proc()
                     }
                 }),
             },
-            primitive_type  = .LINELIST,
+            primitive_type  = .POINTLIST,
             vertex_shader   = graph.vert_shader,
             fragment_shader = graph.frag_shader,
         }
@@ -111,13 +111,6 @@ init_app :: proc()
             fmt.println("Failed to create fill graphics pipeline:", sdl.GetError())
             os.exit(1)
         }
-
-        graph.vertex_edges = 5000
-        graph.vertex_bytes = u32(5000 * size_of([2]Point2D))
-        graph.vertex_buffer = sdl.CreateGPUBuffer(
-            device,
-            sdl.GPUBufferCreateInfo{ usage = { .VERTEX }, size = graph.vertex_bytes },
-        )
     }
 }
 
@@ -143,8 +136,9 @@ graphdrawing_upload_to_gpu :: proc(gd: GraphDrawing)
 {
     using render_ctx
 
-    graph.vertex_edges = u32(len(gd.endpoints)) / 2
-    bytes := u32(len(gd.endpoints) * size_of([2]Point2D))
+    graph.vertex_count = u32(gd.total_points)
+    bytes := graph.vertex_count * u32(size_of(Point2D))
+
     if graph.vertex_bytes < bytes
     {
         fmt.println("Resizing graph vertex buffer, from", graph.vertex_bytes, "to", bytes)
@@ -159,23 +153,25 @@ graphdrawing_upload_to_gpu :: proc(gd: GraphDrawing)
     }
 
     upload_buffer := sdl.CreateGPUTransferBuffer(
-        render_ctx.device,
-        sdl.GPUTransferBufferCreateInfo{
-            usage = .UPLOAD,
-            size = u32(len(gd.endpoints) * size_of([2]Point2D)) * 2,
-        }
+        device,
+        sdl.GPUTransferBufferCreateInfo{ usage = .UPLOAD, size = bytes },
     )
-    defer sdl.ReleaseGPUTransferBuffer(render_ctx.device, upload_buffer)
+    defer sdl.ReleaseGPUTransferBuffer(device, upload_buffer)
 
     {
-        raw_transfer := sdl.MapGPUTransferBuffer(render_ctx.device, upload_buffer, false)
-        defer sdl.UnmapGPUTransferBuffer(render_ctx.device, upload_buffer)
+        raw_transfer := sdl.MapGPUTransferBuffer(device, upload_buffer, false)
+        defer sdl.UnmapGPUTransferBuffer(device, upload_buffer)
 
-        transfer := (transmute([^][2]Point2D)raw_transfer)[:len(gd.endpoints)]
-        copy(transfer[:], gd.endpoints[:])
+        transfer := (transmute([^]Point2D)raw_transfer)[:gd.total_points]
+        i: int
+        for edge in gd.edges
+        {
+            copy(transfer[i:], edge[:])
+            i += len(edge)
+        }
     }
 
-    cmd_buffer := sdl.AcquireGPUCommandBuffer(render_ctx.device)
+    cmd_buffer := sdl.AcquireGPUCommandBuffer(device)
     defer {
         if !sdl.SubmitGPUCommandBuffer(cmd_buffer)
         {
@@ -189,15 +185,8 @@ graphdrawing_upload_to_gpu :: proc(gd: GraphDrawing)
 
     sdl.UploadToGPUBuffer(
         copypass,
-        sdl.GPUTransferBufferLocation{
-            transfer_buffer = upload_buffer,
-            offset = 0,
-        },
-        sdl.GPUBufferRegion{
-            buffer = graph.vertex_buffer,
-            offset = 0,
-            size = u32(len(gd.endpoints) * size_of([2]Point2D)),
-        },
+        sdl.GPUTransferBufferLocation{ transfer_buffer = upload_buffer, offset = 0 },
+        sdl.GPUBufferRegion{ buffer = graph.vertex_buffer, offset = 0, size = bytes },
         false,
     )
 }
@@ -244,7 +233,7 @@ render_current_graph :: proc()
 
         color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.05 }
         sdl.PushGPUVertexUniformData(cmd_buffer, 0, &color_uniform, size_of(type_of(color_uniform)))
-        sdl.DrawGPUPrimitives(renderpass, graph.vertex_edges, 1, 0, 0)
+        sdl.DrawGPUPrimitives(renderpass, graph.vertex_count, 1, 0, 0)
     }
 }
 
