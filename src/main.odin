@@ -25,10 +25,12 @@ main :: proc()
     }
 
     i: int
-    upload_to_gpu(gds[i])
+    mesh := build_mesh(gds[i])
+    upload_graph_to_gpu(mesh)
 
     free_all(context.temp_allocator)
 
+    dirty := true
     outer: for
     {
         evt : sdl.Event
@@ -43,15 +45,24 @@ main :: proc()
                 {
                 case sdl.K_ESCAPE:
                     break outer
-                case sdl.K_RIGHT:
+                case sdl.K_RIGHT, sdl.K_SPACE:
                     i = (i + 1) %% len(gds)
-                    upload_to_gpu(gds[i])
+                    mesh := build_mesh(gds[i])
+                    upload_graph_to_gpu(mesh)
+                    dirty = true
                 case sdl.K_LEFT:
                     i = (i - 1) %% len(gds)
-                    upload_to_gpu(gds[i])
+                    mesh := build_mesh(gds[i])
+                    upload_graph_to_gpu(mesh)
+                    dirty = true
                 }
             }
         }
-        render_current_graph()
+
+        if dirty
+        {
+            render_current_graph()
+            dirty = false
+        }
     }
 }

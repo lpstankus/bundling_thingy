@@ -32,13 +32,18 @@ init_app :: proc()
 {
     using render_ctx
 
+    if !sdl.SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1")
+    {
+        fmt.println("Failed to set SDL hint:", sdl.GetError())
+    }
+
     if !sdl.Init(sdl.INIT_VIDEO)
     {
         fmt.println("Failed to init SDL:", sdl.GetError())
         os.exit(1)
     }
 
-    if !sdl.CreateWindowAndRenderer("Bundling thingy", 800, 800, nil, &window, &renderer)
+    if !sdl.CreateWindowAndRenderer("Bundling thingy", 1600, 1600, nil, &window, &renderer)
     {
         fmt.println("Failed to create window:", sdl.GetError())
         os.exit(1)
@@ -84,7 +89,7 @@ init_app :: proc()
                 vertex_buffer_descriptions = raw_data(&[?]sdl.GPUVertexBufferDescription{
                     {
                         slot  = 0,
-                        pitch = size_of(Point2D),
+                        pitch = size_of(GraphVertex),
                         input_rate = .VERTEX,
                         instance_step_rate = 0,
                     },
@@ -96,10 +101,10 @@ init_app :: proc()
                         format      = .FLOAT2,
                         location    = 0,
                         offset      = 0,
-                    }
+                    },
                 }),
             },
-            primitive_type  = .POINTLIST,
+            primitive_type  = .TRIANGLELIST,
             vertex_shader   = graph.vert_shader,
             fragment_shader = graph.frag_shader,
         }
@@ -130,14 +135,12 @@ deinit_app :: proc()
 
 }
 
-upload_to_gpu :: proc { graphdrawing_upload_to_gpu }
-
-graphdrawing_upload_to_gpu :: proc(gd: GraphDrawing)
+upload_graph_to_gpu :: proc(mesh: []GraphVertex)
 {
     using render_ctx
 
-    graph.vertex_count = u32(gd.total_points)
-    bytes := graph.vertex_count * u32(size_of(Point2D))
+    graph.vertex_count = u32(len(mesh))
+    bytes := graph.vertex_count * size_of(type_of(mesh[0]))
 
     if graph.vertex_bytes < bytes
     {
@@ -162,13 +165,8 @@ graphdrawing_upload_to_gpu :: proc(gd: GraphDrawing)
         raw_transfer := sdl.MapGPUTransferBuffer(device, upload_buffer, false)
         defer sdl.UnmapGPUTransferBuffer(device, upload_buffer)
 
-        transfer := (transmute([^]Point2D)raw_transfer)[:gd.total_points]
-        i: int
-        for edge in gd.edges
-        {
-            copy(transfer[i:], edge[:])
-            i += len(edge)
-        }
+        transfer := (transmute([^]GraphVertex)raw_transfer)[:graph.vertex_count]
+        copy(transfer[:], mesh[:])
     }
 
     cmd_buffer := sdl.AcquireGPUCommandBuffer(device)
@@ -231,7 +229,7 @@ render_current_graph :: proc()
             1,
         )
 
-        color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.05 }
+        color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.1 }
         sdl.PushGPUVertexUniformData(cmd_buffer, 0, &color_uniform, size_of(type_of(color_uniform)))
         sdl.DrawGPUPrimitives(renderpass, graph.vertex_count, 1, 0, 0)
     }
@@ -246,8 +244,8 @@ load_shader :: proc(
 ) -> (^sdl.GPUShader, bool)
 {
     using render_ctx
-
     stage: sdl.GPUShaderStage
+
     switch shaderfile[len(shaderfile) - 5:]
     {
     case ".vert":
@@ -279,7 +277,7 @@ load_shader :: proc(
         code_size  = len(code),
         entrypoint = "main",
         stage      = stage,
-        format     = {.SPIRV},
+        format     = { .SPIRV },
         num_samplers         = sampler_count,
         num_uniform_buffers  = uniform_buffer_count,
         num_storage_buffers  = storage_buffer_count,
