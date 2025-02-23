@@ -7,17 +7,22 @@ import "core:strings"
 import "core:strconv"
 import mem "core:mem/virtual"
 
-Point2D :: distinct [2]f32
-Edge :: [dynamic]Point2D
+Vec2 :: distinct [2]f32
+Edge :: distinct [dynamic]Vec2
 
 GraphDrawing :: struct
 {
-    min: Point2D,
-    max: Point2D,
+    min: Vec2,
+    max: Vec2,
     total_points: int,
     edges: [dynamic]Edge,
-    endpoints: [dynamic][2]Point2D,
+    endpoints: [dynamic][2]Vec2,
 }
+
+cross :: proc { vec2_cross }
+normalize :: proc { graphdrawing_normalize, vec2_normalize }
+length_sq :: proc { vec2_length_sq }
+length :: proc { vec2_length }
 
 graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool = true)
 {
@@ -30,8 +35,8 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
     }
 
     gd.edges = make([dynamic]Edge)
-    gd.min = Point2D{ max(f32), max(f32) }
-    gd.max = Point2D{ min(f32), min(f32) }
+    gd.min = Vec2{ max(f32), max(f32) }
+    gd.max = Vec2{ min(f32), min(f32) }
 
     str := string(data)
     for line in strings.split_lines_iterator(&str)
@@ -70,7 +75,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
                 return {}, false
             }
 
-            point := Point2D{ x, y }
+            point := Vec2{ x, y }
 
             gd.min.x = min(gd.min.x, point.x)
             gd.min.y = min(gd.min.y, point.y)
@@ -89,7 +94,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
         }
 
         append(&gd.edges, edge)
-        append(&gd.endpoints, [?]Point2D{ edge[0], edge[len(edge) - 1] })
+        append(&gd.endpoints, [?]Vec2{ edge[0], edge[len(edge) - 1] })
     }
 
     fmt.println("Successfully read file:", filename)
@@ -101,9 +106,9 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
 
 graphdrawing_normalize :: proc(gd: ^GraphDrawing, border: f32 = 0.05)
 {
-    range := Point2D{ gd.max.x - gd.min.x, gd.max.y - gd.min.y }
+    range := Vec2{ gd.max.x - gd.min.x, gd.max.y - gd.min.y }
     scale := (1 - border) / max(range.x, range.y)
-    translation := Point2D{ (1 - scale * range.x) / 2, (1 - scale * range.y) / 2 }
+    translation := Vec2{ (1 - scale * range.x) / 2, (1 - scale * range.y) / 2 }
 
     for edge in gd.edges
     {
@@ -123,7 +128,7 @@ graphdrawing_normalize :: proc(gd: ^GraphDrawing, border: f32 = 0.05)
         points[1] = (points[1] - 0.5) * 2
     }
 
-    gd.min, gd.max = Point2D{ -1, -1 }, Point2D{ 1, 1 }
+    gd.min, gd.max = Vec2{ -1, -1 }, Vec2{ 1, 1 }
 }
 
 graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
@@ -144,7 +149,7 @@ graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
         for i := 1; i < len(edge);
         {
             cur_pos := edge[i]
-            new_space := distance(cur_pos, prv_pos)
+            new_space := length(prv_pos - cur_pos)
 
             if new_space < cur_space
             {
@@ -177,9 +182,24 @@ graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
     gd.total_points = new_total_points
 }
 
-point2d_distance :: #force_inline proc(l, r: Point2D) -> f32
+vec2_normalize :: #force_inline proc(vec: Vec2) -> (Vec2, bool)
 {
-    return math.sqrt((l.x - r.x) * (l.x - r.x) + (l.y - r.y) * (l.y - r.y))
+    len := length(vec)
+    if len == 0 do return {}, false
+    return vec / len, true
 }
 
-distance :: proc { point2d_distance }
+vec2_length_sq :: #force_inline proc(vec: Vec2) -> f32
+{
+    return vec.x * vec.x + vec.y * vec.y
+}
+
+vec2_length :: #force_inline proc(vec: Vec2) -> f32
+{
+    return math.sqrt(length_sq(vec))
+}
+
+vec2_cross :: #force_inline proc(l, r: Vec2) -> f32
+{
+    return l.x * r.y - l.y * r.x
+}
