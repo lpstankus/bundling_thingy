@@ -12,7 +12,7 @@ graphdrawing_build_mesh :: proc(
     line_width: f32 = 0.0025,
 ) -> []GraphVertex
 {
-    mesh := make([dynamic]GraphVertex, 0, gd.total_points * 3, context.temp_allocator)
+    mesh := make([dynamic]GraphVertex, 0, (gd.total_points - 1) * 2, context.temp_allocator)
 
     half_width := line_width / 2
 
@@ -20,77 +20,23 @@ graphdrawing_build_mesh :: proc(
     {
         if len(edge) <= 1 do continue
 
-        prev_point := edge[0]
-        prev_upper, prev_lower, ok := calc_bounds(edge[0], edge[1] - edge[0], half_width)
-        if !ok
+        for i := 0; i < len(edge) - 1; i += 1
         {
-            fmt.println("Degenerate segment at beggining of edge", edge_num, "skipping edge...")
-            continue
-        }
+            p0 := edge[i]
+            p1 := edge[i + 1]
 
-        for i := 1; i < len(edge) - 1; i += 1
-        {
-            prev_dir := edge[i] - prev_point
-            next_dir := edge[i + 1] - edge[i]
+            dir := normalize(p1 - p0) or_continue
+            nor := Vec2{ -dir.y, dir.x } * half_width
 
-            next_upper, next_lower := calc_bounds(edge[i], next_dir, half_width) or_continue
+            v0 := GraphVertex(p0 + nor)
+            v1 := GraphVertex(p0 - nor)
+            v2 := GraphVertex(p1 + nor)
+            v3 := GraphVertex(p1 - nor)
 
-            curr_upper := calc_intersection(prev_upper, prev_dir, next_upper, next_dir) or_continue
-            curr_lower := calc_intersection(prev_lower, prev_dir, next_lower, next_dir) or_continue
-
-            append(&mesh, GraphVertex(prev_upper))
-            append(&mesh, GraphVertex(prev_lower))
-            append(&mesh, GraphVertex(curr_upper))
-
-            append(&mesh, GraphVertex(curr_lower))
-            append(&mesh, GraphVertex(curr_upper))
-            append(&mesh, GraphVertex(prev_lower))
-
-            prev_point = edge[i]
-            prev_upper = curr_upper
-            prev_lower = curr_lower
-        }
-        {
-            dir := edge[len(edge) - 1] - prev_point
-            curr_upper, curr_lower, ok := calc_bounds(edge[len(edge) - 1], dir, half_width)
-            if ok
-            {
-                append(&mesh, GraphVertex(prev_upper))
-                append(&mesh, GraphVertex(prev_lower))
-                append(&mesh, GraphVertex(curr_upper))
-
-                append(&mesh, GraphVertex(curr_lower))
-                append(&mesh, GraphVertex(curr_upper))
-                append(&mesh, GraphVertex(prev_lower))
-            }
-            else
-            {
-                fmt.println("Failed to generate last line segment for edge", edge_num)
-            }
+            append(&mesh, v0, v1, v2)
+            append(&mesh, v3, v2, v1)
         }
     }
 
     return mesh[:]
-}
-
-@(private="file")
-calc_bounds :: #force_inline proc(anchor, dir: Vec2, half_width: f32) -> (Vec2, Vec2, bool)
-{
-    dir, ok := normalize(dir)
-    if !ok do return {}, {}, false
-
-    nor := Vec2{ -dir.y, dir.x }
-    return anchor + nor * half_width, anchor - nor * half_width, true
-}
-
-@(private="file")
-calc_intersection :: #force_inline proc(p0, dir0, p1, dir1: Vec2) -> (Vec2, bool)
-{
-    dir_cross := cross(dir0, dir1)
-    if math.abs(dir_cross) < 1e-6 do return {}, false
-
-    dir := p1 - p0
-    t := cross(dir, dir1) / dir_cross
-
-    return p0 + t * dir0, true
 }

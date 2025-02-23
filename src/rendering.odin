@@ -229,7 +229,7 @@ render_current_graph :: proc()
             1,
         )
 
-        color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.1 }
+        color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.05 }
         sdl.PushGPUVertexUniformData(cmd_buffer, 0, &color_uniform, size_of(type_of(color_uniform)))
         sdl.DrawGPUPrimitives(renderpass, graph.vertex_count, 1, 0, 0)
     }
