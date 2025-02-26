@@ -12,11 +12,12 @@ graphdrawing_build_mesh :: proc(
     line_width: f32 = 0.0025,
 ) -> []GraphVertex
 {
-    mesh := make([dynamic]GraphVertex, 0, (gd.total_points - 1) * 2, context.temp_allocator)
+    mesh := make([dynamic]GraphVertex, 0, (len(gd.points) - 1) * 2, context.temp_allocator)
 
     half_width := line_width / 2
 
-    for edge, edge_num in gd.edges
+    it := EdgeIt{ gd = gd }
+    for edge in next_edge(&it)
     {
         if len(edge) <= 1 do continue
 

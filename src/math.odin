@@ -8,15 +8,19 @@ import "core:strconv"
 import mem "core:mem/virtual"
 
 Vec2 :: distinct [2]f32
-Edge :: distinct [dynamic]Vec2
 
 GraphDrawing :: struct
 {
     min: Vec2,
     max: Vec2,
-    total_points: int,
-    edges: [dynamic]Edge,
-    endpoints: [dynamic][2]Vec2,
+    points: [dynamic]Vec2,
+    starts: [dynamic]int,
+}
+
+EdgeIt :: struct
+{
+    cur: int,
+    using gd: GraphDrawing,
 }
 
 cross :: proc { vec2_cross }
@@ -24,26 +28,28 @@ normalize :: proc { graphdrawing_normalize, vec2_normalize }
 length_sq :: proc { vec2_length_sq }
 length :: proc { vec2_length }
 
-graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool = true)
+graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
 {
-    data: []byte
-    data, ok = os.read_entire_file(filename, allocator=context.temp_allocator)
+    data, ok := os.read_entire_file(filename, allocator=context.temp_allocator)
     if !ok
     {
         fmt.println("Failed to read file `", filename, "`: allocation error", sep="")
         return {}, false
     }
 
-    gd.edges = make([dynamic]Edge)
-    gd.min = Vec2{ max(f32), max(f32) }
-    gd.max = Vec2{ min(f32), min(f32) }
+    gd := GraphDrawing{
+        min = Vec2{ max(f32), max(f32) },
+        max = Vec2{ min(f32), min(f32) },
+        points = make([dynamic]Vec2),
+        starts = make([dynamic]int),
+    }
 
     str := string(data)
     for line in strings.split_lines_iterator(&str)
     {
         line := string(line)
 
-        edge := make(Edge)
+        edge_start := len(gd.points)
 
         _, _ = strings.split_iterator(&line, " ") // skip idx
         for token in strings.split_iterator(&line, " ")
@@ -83,25 +89,17 @@ graphdrawing_from_trl :: proc(filename: string) -> (gd: GraphDrawing, ok: bool =
             gd.max.x = max(gd.max.x, point.x)
             gd.max.y = max(gd.max.y, point.y)
 
-            append(&edge, point)
-            gd.total_points += 1
+            append(&gd.points, point)
         }
 
-        if len(edge) == 0
-        {
-            delete(edge)
-            continue
-        }
-
-        append(&gd.edges, edge)
-        append(&gd.endpoints, [?]Vec2{ edge[0], edge[len(edge) - 1] })
+        if edge_start != len(gd.points) do append(&gd.starts, edge_start)
     }
 
     fmt.println("Successfully read file:", filename)
-    fmt.println(">> total edges:", len(gd.edges))
-    fmt.println(">> total control points:", gd.total_points)
+    fmt.println(">> total edges:", len(gd.starts) - 1)
+    fmt.println(">> total control points:", len(gd.points))
 
-    return
+    return gd, true
 }
 
 graphdrawing_normalize :: proc(gd: ^GraphDrawing, border: f32 = 0.05)
@@ -110,22 +108,10 @@ graphdrawing_normalize :: proc(gd: ^GraphDrawing, border: f32 = 0.05)
     scale := (1 - border) / max(range.x, range.y)
     translation := Vec2{ (1 - scale * range.x) / 2, (1 - scale * range.y) / 2 }
 
-    for edge in gd.edges
+    for &point in gd.points
     {
-        for &point in edge
-        {
-            point = (point - gd.min) * scale + translation
-            point = (point - 0.5) * 2
-        }
-    }
-
-    for &points in gd.endpoints
-    {
-        points[0] = (points[0] - gd.min) * scale + translation
-        points[0] = (points[0] - 0.5) * 2
-
-        points[1] = (points[1] - gd.min) * scale + translation
-        points[1] = (points[1] - 0.5) * 2
+        point = (point - gd.min) * scale + translation
+        point = (point - 0.5) * 2
     }
 
     gd.min, gd.max = Vec2{ -1, -1 }, Vec2{ 1, 1 }
@@ -133,18 +119,19 @@ graphdrawing_normalize :: proc(gd: ^GraphDrawing, border: f32 = 0.05)
 
 graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
 {
-    new_total_points: int
-    new_edges := make([dynamic]Edge, 0, len(gd.edges))
-    for edge, i in gd.edges
+    new_points := make([dynamic]Vec2)
+    new_starts := make([dynamic]int)
+
+    it :=  EdgeIt{ gd = gd^ }
+    for edge, i in next_edge(&it)
     {
-        new_edge := make(Edge, 0, len(edge))
-        defer append(&new_edges, new_edge)
+        new_start := len(new_points)
+        append(&new_starts, new_start)
 
         cur_space := spacing
         prv_pos := edge[0]
 
-        append(&new_edge, prv_pos)
-        new_total_points += 1
+        append(&new_points, prv_pos)
 
         for i := 1; i < len(edge);
         {
@@ -161,25 +148,32 @@ graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
 
             t := cur_space / new_space
             prv_pos = prv_pos * (1 - t) + cur_pos * t
-            append(&new_edge, prv_pos)
-            new_total_points += 1
-
             cur_space = spacing
+
+            append(&new_points, prv_pos)
         }
 
         // If endpoint was not included during the resample pass
-        if cur_space < spacing
-        {
-            append(&new_edge, edge[len(edge) - 1])
-            new_total_points += 1
-        }
+        if cur_space < spacing do append(&new_points, edge[len(edge) - 1])
+    }
+    append(&new_starts, len(new_points))
 
-        delete(edge)
+    delete(gd.points)
+    delete(gd.starts)
+
+    gd.points = new_points
+    gd.starts = new_starts
+}
+
+next_edge :: proc(it: ^EdgeIt) -> ([]Vec2, int, bool)
+{
+    if it.cur < len(it.starts) - 1
+    {
+        it.cur += 1
+        return it.points[it.starts[it.cur - 1] : it.starts[it.cur]], it.cur - 1, true
     }
 
-    delete(gd.edges)
-    gd.edges = new_edges
-    gd.total_points = new_total_points
+    return {}, -1, false
 }
 
 vec2_normalize :: #force_inline proc(vec: Vec2) -> (Vec2, bool)
