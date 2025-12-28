@@ -1,6 +1,6 @@
 #version 450
 
-layout(location = 0) in vec2  in_pos;
+layout(location = 0) in vec2 in_pos;
 
 layout(set = 1, binding = 0) uniform ColorUniform {
     vec4 u_color;

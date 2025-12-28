@@ -2,6 +2,7 @@ package main
 
 import "core:os"
 import "core:fmt"
+import "core:strings"
 import sdl "vendor:sdl3"
 
 RenderContext :: struct
@@ -9,6 +10,9 @@ RenderContext :: struct
     window:   ^sdl.Window,
     renderer: ^sdl.Renderer,
     device:   ^sdl.GPUDevice,
+
+    last_frame : sdl.Time,
+    last_title_change: sdl.Time,
 
     graph: GraphRenderCtx,
 }
@@ -117,6 +121,9 @@ init_app :: proc()
             os.exit(1)
         }
     }
+
+    _ = sdl.GetCurrentTime(&render_ctx.last_frame)
+    render_ctx.last_title_change = render_ctx.last_frame
 }
 
 deinit_app :: proc()
@@ -133,6 +140,30 @@ deinit_app :: proc()
     sdl.DestroyWindow(window)
     sdl.Quit()
 
+}
+
+begin_frame :: proc()
+{
+    prev_time := render_ctx.last_frame
+    curr_time : sdl.Time
+    ok := sdl.GetCurrentTime(&curr_time)
+    if !ok do return
+
+    render_ctx.last_frame = curr_time
+
+    if curr_time - render_ctx.last_title_change >= 1_000_000_000
+    {
+        title := strings.clone_to_cstring(
+            fmt.tprintf("Bundling Thingy (%.2fms)", f32(curr_time - prev_time) / 1_000_000_000),
+            allocator=context.temp_allocator,
+        )
+        sdl.SetWindowTitle(render_ctx.window, title)
+        render_ctx.last_title_change = curr_time
+    }
+}
+
+end_frame :: proc()
+{
 }
 
 upload_graph_to_gpu :: proc(mesh: []GraphVertex)
