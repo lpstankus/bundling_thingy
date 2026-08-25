@@ -28,11 +28,14 @@ main :: proc()
     mesh := build_mesh(gds[i])
     upload_graph_to_gpu(mesh)
 
-    free_all(context.temp_allocator)
-
     dirty := true
     outer: for
     {
+        free_all(context.temp_allocator)
+
+        begin_frame()
+        defer end_frame()
+
         evt : sdl.Event
         for sdl.PollEvent(&evt)
         {
