@@ -18,15 +18,23 @@ main :: proc()
         graphdrawing_from_trl("./data/rj-2019.trl") or_else os.exit(1),
     }
 
-    for &gd in gds 
+    meshes := make([][]GraphVertex, len(gds))
+
+    fmt.println("Normalizing and meshing...")
+    fmt.println()
+
+    for &gd, i in gds
     {
         graphdrawing_normalize(&gd)
         graphdrawing_resample(&gd)
+        meshes[i] = build_mesh(gd, 0.002)
     }
 
+    fmt.println("Done reading, starting main loop...")
+    fmt.println()
+
     i: int
-    mesh := build_mesh(gds[i])
-    upload_graph_to_gpu(mesh)
+    upload_graph_to_gpu(meshes[i])
 
     dirty := true
     outer: for
@@ -50,13 +58,11 @@ main :: proc()
                     break outer
                 case sdl.K_RIGHT, sdl.K_SPACE:
                     i = (i + 1) %% len(gds)
-                    mesh := build_mesh(gds[i])
-                    upload_graph_to_gpu(mesh)
+                    upload_graph_to_gpu(meshes[i])
                     dirty = true
                 case sdl.K_LEFT:
                     i = (i - 1) %% len(gds)
-                    mesh := build_mesh(gds[i])
-                    upload_graph_to_gpu(mesh)
+                    upload_graph_to_gpu(meshes[i])
                     dirty = true
                 }
             }
