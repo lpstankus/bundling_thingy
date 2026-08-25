@@ -11,8 +11,8 @@ Vec2 :: distinct [2]f32
 
 GraphDrawing :: struct
 {
-    min: Vec2,
-    max: Vec2,
+    name: string,
+    min, max: Vec2,
     points: [dynamic]Vec2,
     starts: [dynamic]int,
 }
@@ -34,10 +34,12 @@ graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
     if !ok
     {
         fmt.println("Failed to read file `", filename, "`: allocation error", sep="")
+        fmt.println()
         return {}, false
     }
 
     gd := GraphDrawing{
+        name = filename,
         min = Vec2{ max(f32), max(f32) },
         max = Vec2{ min(f32), min(f32) },
         points = make([dynamic]Vec2),
@@ -62,6 +64,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
             if !ok
             {
                 fmt.println("Failed to read file: unexpected EOL")
+                fmt.println()
                 return {}, false
             }
 
@@ -70,6 +73,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
             if !ok
             {
                 fmt.println("Failed to read file: failed to parse float:", first)
+                fmt.println()
                 return {}, false
             }
 
@@ -78,6 +82,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
             if !ok
             {
                 fmt.println("Failed to read file: failed to parse float:", secnd)
+                fmt.println()
                 return {}, false
             }
 
@@ -98,6 +103,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
     fmt.println("Successfully read file:", filename)
     fmt.println(">> total edges:", len(gd.starts) - 1)
     fmt.println(">> total control points:", len(gd.points))
+    fmt.println()
 
     return gd, true
 }
@@ -157,6 +163,11 @@ graphdrawing_resample :: proc(gd: ^GraphDrawing, spacing: f32 = 0.02)
         if cur_space < spacing do append(&new_points, edge[len(edge) - 1])
     }
     append(&new_starts, len(new_points))
+
+    fmt.println("Successfully resampled graph:", gd.name)
+    fmt.println(">> edges: from", len(gd.starts) - 1, "to", len(new_starts) - 1)
+    fmt.println(">> control points: from", len(gd.points), "to", len(new_points))
+    fmt.println()
 
     delete(gd.points)
     delete(gd.starts)
