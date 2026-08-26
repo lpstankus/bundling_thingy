@@ -30,8 +30,8 @@ length :: proc { vec2_length }
 
 graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
 {
-    data, ok := os.read_entire_file(filename, allocator=context.temp_allocator)
-    if !ok
+    data, err := os.read_entire_file(filename, allocator=context.temp_allocator)
+    if err != nil
     {
         fmt.println("Failed to read file `", filename, "`: allocation error", sep="")
         fmt.println()

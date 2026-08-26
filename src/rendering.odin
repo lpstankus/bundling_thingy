@@ -34,7 +34,6 @@ render_ctx : RenderContext
 
 init_app :: proc()
 {
-    using render_ctx
 
     if !sdl.SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1")
     {
@@ -47,35 +46,35 @@ init_app :: proc()
         os.exit(1)
     }
 
-    if !sdl.CreateWindowAndRenderer("Bundling thingy", 1600, 1600, nil, &window, &renderer)
+    if !sdl.CreateWindowAndRenderer("Bundling thingy", 1600, 1600, nil, &render_ctx.window, &render_ctx.renderer)
     {
         fmt.println("Failed to create window:", sdl.GetError())
         os.exit(1)
     }
 
-    device = sdl.CreateGPUDevice({ .SPIRV }, true, nil)
-    if device == nil
+    render_ctx.device = sdl.CreateGPUDevice({ .SPIRV }, true, nil)
+    if render_ctx.device == nil
     {
         fmt.println("Failed to create GPU device:", sdl.GetError())
         os.exit(1)
     }
 
-    if !sdl.ClaimWindowForGPUDevice(device, window)
+    if !sdl.ClaimWindowForGPUDevice(render_ctx.device, render_ctx.window)
     {
         fmt.println("Failed to claim window for GPU device:", sdl.GetError())
         os.exit(1)
     }
 
     { // Graph drawing render ctx
-        graph.vert_shader = load_shader("points.vert", uniform_buffer_count = 1) or_else os.exit(1)
-        graph.frag_shader = load_shader("solid.frag") or_else os.exit(1)
+        render_ctx.graph.vert_shader = load_shader("points.vert", uniform_buffer_count = 1) or_else os.exit(1)
+        render_ctx.graph.frag_shader = load_shader("solid.frag") or_else os.exit(1)
 
         pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
             target_info = {
                 num_color_targets = 1,
                 color_target_descriptions = raw_data(&[?]sdl.GPUColorTargetDescription{
                     {
-                        format = sdl.GetGPUSwapchainTextureFormat(device, window),
+                        format = sdl.GetGPUSwapchainTextureFormat(render_ctx.device, render_ctx.window),
                         blend_state = {
                             enable_blend = true,
                             color_blend_op = .ADD,
@@ -109,13 +108,13 @@ init_app :: proc()
                 }),
             },
             primitive_type  = .TRIANGLELIST,
-            vertex_shader   = graph.vert_shader,
-            fragment_shader = graph.frag_shader,
+            vertex_shader   = render_ctx.graph.vert_shader,
+            fragment_shader = render_ctx.graph.frag_shader,
         }
         pipeline_info.rasterizer_state.fill_mode = .FILL
 
-        graph.pipeline = sdl.CreateGPUGraphicsPipeline(device, pipeline_info)
-        if graph.pipeline == nil
+        render_ctx.graph.pipeline = sdl.CreateGPUGraphicsPipeline(render_ctx.device, pipeline_info)
+        if render_ctx.graph.pipeline == nil
         {
             fmt.println("Failed to create fill graphics pipeline:", sdl.GetError())
             os.exit(1)
@@ -128,16 +127,14 @@ init_app :: proc()
 
 deinit_app :: proc()
 {
-    using render_ctx
+    sdl.ReleaseGPUBuffer(render_ctx.device, render_ctx.graph.vertex_buffer)
+    sdl.ReleaseGPUGraphicsPipeline(render_ctx.device, render_ctx.graph.pipeline)
 
-    sdl.ReleaseGPUBuffer(device, graph.vertex_buffer)
-    sdl.ReleaseGPUGraphicsPipeline(device, graph.pipeline)
+    sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.frag_shader)
+    sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.vert_shader)
 
-    sdl.ReleaseGPUShader(device, graph.frag_shader)
-    sdl.ReleaseGPUShader(device, graph.vert_shader)
-
-    sdl.DestroyGPUDevice(device)
-    sdl.DestroyWindow(window)
+    sdl.DestroyGPUDevice(render_ctx.device)
+    sdl.DestroyWindow(render_ctx.window)
     sdl.Quit()
 
 }
@@ -168,41 +165,40 @@ end_frame :: proc()
 
 upload_graph_to_gpu :: proc(mesh: []GraphVertex)
 {
-    using render_ctx
 
-    graph.vertex_count = u32(len(mesh))
-    if graph.vertex_count == 0 do return
+    render_ctx.graph.vertex_count = u32(len(mesh))
+    if render_ctx.graph.vertex_count == 0 do return
 
-    bytes := graph.vertex_count * size_of(GraphVertex)
+    bytes := render_ctx.graph.vertex_count * size_of(GraphVertex)
 
-    if graph.vertex_bytes < bytes
+    if render_ctx.graph.vertex_bytes < bytes
     {
-        fmt.println("Resizing graph vertex buffer, from", graph.vertex_bytes, "to", bytes)
+        fmt.println("Resizing graph vertex buffer, from", render_ctx.graph.vertex_bytes, "to", bytes)
 
-        graph.vertex_bytes = bytes
+        render_ctx.graph.vertex_bytes = bytes
 
-        sdl.ReleaseGPUBuffer(device, graph.vertex_buffer)
-        graph.vertex_buffer = sdl.CreateGPUBuffer(
-            device,
+        sdl.ReleaseGPUBuffer(render_ctx.device, render_ctx.graph.vertex_buffer)
+        render_ctx.graph.vertex_buffer = sdl.CreateGPUBuffer(
+            render_ctx.device,
             sdl.GPUBufferCreateInfo{ usage = { .VERTEX }, size = bytes },
         )
     }
 
     upload_buffer := sdl.CreateGPUTransferBuffer(
-        device,
+        render_ctx.device,
         sdl.GPUTransferBufferCreateInfo{ usage = .UPLOAD, size = bytes },
     )
-    defer sdl.ReleaseGPUTransferBuffer(device, upload_buffer)
+    defer sdl.ReleaseGPUTransferBuffer(render_ctx.device, upload_buffer)
 
     {
-        raw_transfer := sdl.MapGPUTransferBuffer(device, upload_buffer, false)
-        defer sdl.UnmapGPUTransferBuffer(device, upload_buffer)
+        raw_transfer := sdl.MapGPUTransferBuffer(render_ctx.device, upload_buffer, false)
+        defer sdl.UnmapGPUTransferBuffer(render_ctx.device, upload_buffer)
 
-        transfer := (transmute([^]GraphVertex)raw_transfer)[:graph.vertex_count]
+        transfer := (transmute([^]GraphVertex)raw_transfer)[:render_ctx.graph.vertex_count]
         copy(transfer[:], mesh[:])
     }
 
-    cmd_buffer := sdl.AcquireGPUCommandBuffer(device)
+    cmd_buffer := sdl.AcquireGPUCommandBuffer(render_ctx.device)
     defer {
         if !sdl.SubmitGPUCommandBuffer(cmd_buffer)
         {
@@ -217,16 +213,15 @@ upload_graph_to_gpu :: proc(mesh: []GraphVertex)
     sdl.UploadToGPUBuffer(
         copypass,
         sdl.GPUTransferBufferLocation{ transfer_buffer = upload_buffer, offset = 0 },
-        sdl.GPUBufferRegion{ buffer = graph.vertex_buffer, offset = 0, size = bytes },
+        sdl.GPUBufferRegion{ buffer = render_ctx.graph.vertex_buffer, offset = 0, size = bytes },
         false,
     )
 }
 
 render_current_graph :: proc()
 {
-    using render_ctx
 
-    cmd_buffer := sdl.AcquireGPUCommandBuffer(device)
+    cmd_buffer := sdl.AcquireGPUCommandBuffer(render_ctx.device)
     defer {
         if !sdl.SubmitGPUCommandBuffer(cmd_buffer)
         {
@@ -236,7 +231,7 @@ render_current_graph :: proc()
     }
 
     swapchain_tex: ^sdl.GPUTexture
-    if !sdl.WaitAndAcquireGPUSwapchainTexture(cmd_buffer, window, &swapchain_tex, nil, nil)
+    if !sdl.WaitAndAcquireGPUSwapchainTexture(cmd_buffer, render_ctx.window, &swapchain_tex, nil, nil)
     {
         fmt.println("Failed to acquire swapchain texture:", sdl.GetError())
         os.exit(1)
@@ -254,17 +249,17 @@ render_current_graph :: proc()
         renderpass := sdl.BeginGPURenderPass(cmd_buffer, &target_info, 1, nil)
         defer sdl.EndGPURenderPass(renderpass)
 
-        sdl.BindGPUGraphicsPipeline(renderpass, graph.pipeline)
+        sdl.BindGPUGraphicsPipeline(renderpass, render_ctx.graph.pipeline)
         sdl.BindGPUVertexBuffers(
             renderpass,
             0,
-            raw_data(&[?]sdl.GPUBufferBinding{ { buffer = graph.vertex_buffer } }),
+            raw_data(&[?]sdl.GPUBufferBinding{ { buffer = render_ctx.graph.vertex_buffer } }),
             1,
         )
 
         color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.05 }
         sdl.PushGPUVertexUniformData(cmd_buffer, 0, &color_uniform, size_of(type_of(color_uniform)))
-        sdl.DrawGPUPrimitives(renderpass, graph.vertex_count, 1, 0, 0)
+        sdl.DrawGPUPrimitives(renderpass, render_ctx.graph.vertex_count, 1, 0, 0)
     }
 }
 
@@ -276,7 +271,6 @@ load_shader :: proc(
     storage_texture_count: u32 = 0,
 ) -> (^sdl.GPUShader, bool)
 {
-    using render_ctx
     stage: sdl.GPUShaderStage
 
     switch shaderfile[len(shaderfile) - 5:]
@@ -290,7 +284,7 @@ load_shader :: proc(
         return nil, false
     }
 
-    if .SPIRV not_in sdl.GetGPUShaderFormats(device)
+    if .SPIRV not_in sdl.GetGPUShaderFormats(render_ctx.device)
     {
         fmt.println("Current GPU device does not support SPIR-V shaders")
         return nil, false
@@ -298,8 +292,8 @@ load_shader :: proc(
 
     fullpath := fmt.tprint("shaders/bin/", shaderfile, ".spv", sep="")
 
-    code, ok := os.read_entire_file(fullpath, allocator=context.temp_allocator)
-    if !ok
+    code, err := os.read_entire_file(fullpath, allocator=context.temp_allocator)
+    if err != nil
     {
         fmt.println("Failed to read contents of shader file:", fullpath)
         return nil, false
@@ -317,7 +311,7 @@ load_shader :: proc(
         num_storage_textures = storage_texture_count,
     }
 
-    shader := sdl.CreateGPUShader(device, shader_info)
+    shader := sdl.CreateGPUShader(render_ctx.device, shader_info)
     if shader == nil
     {
         fmt.println("Failed to create GPU shader:", sdl.GetError())
