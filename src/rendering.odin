@@ -171,7 +171,9 @@ upload_graph_to_gpu :: proc(mesh: []GraphVertex)
     using render_ctx
 
     graph.vertex_count = u32(len(mesh))
-    bytes := graph.vertex_count * size_of(type_of(mesh[0]))
+    if graph.vertex_count == 0 do return
+
+    bytes := graph.vertex_count * size_of(GraphVertex)
 
     if graph.vertex_bytes < bytes
     {

@@ -12,6 +12,8 @@ graphdrawing_build_mesh :: proc(
     line_width: f32 = 0.0025,
 ) -> []GraphVertex
 {
+    if len(gd.points) < 2 do return {}
+
     mesh := make([dynamic]GraphVertex, 0, (len(gd.points) - 1) * 2)
 
     half_width := line_width / 2
