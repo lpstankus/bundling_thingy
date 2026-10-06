@@ -99,6 +99,7 @@ graphdrawing_from_trl :: proc(filename: string) -> (GraphDrawing, bool)
 
         if edge_start != len(gd.points) do append(&gd.starts, edge_start)
     }
+    append(&gd.starts, len(gd.points))
 
     fmt.println("Successfully read file:", filename)
     fmt.println(">> total edges:", len(gd.starts) - 1)

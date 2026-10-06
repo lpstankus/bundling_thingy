@@ -5,11 +5,17 @@ import "core:fmt"
 import "core:strings"
 import sdl "vendor:sdl3"
 
+RENDER_SIZE :: 1600
+
 RenderContext :: struct
 {
     window:   ^sdl.Window,
     renderer: ^sdl.Renderer,
     device:   ^sdl.GPUDevice,
+
+    cmd_buffer: ^sdl.GPUCommandBuffer,
+    target:     ^sdl.GPUTexture,
+    color:      [4]f32,
 
     last_frame : sdl.Time,
     last_title_change: sdl.Time,
@@ -29,114 +35,85 @@ GraphRenderCtx :: struct
     pipeline: ^sdl.GPUGraphicsPipeline,
 }
 
-@(private="file")
 render_ctx : RenderContext
 
-init_app :: proc()
+init_render :: proc(opts: AppOptions)
 {
+    windowed := !opts.headless
 
-    if !sdl.SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1")
+    if windowed && !sdl.SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1")
     {
         fmt.println("Failed to set SDL hint:", sdl.GetError())
     }
 
-    if !sdl.Init(sdl.INIT_VIDEO)
+    video_ok := sdl.Init(sdl.INIT_VIDEO)
+
+    // Retry with the offscreen driver for headless exports without a display server.
+    if !video_ok && !windowed
     {
-        fmt.println("Failed to init SDL:", sdl.GetError())
-        os.exit(1)
+        video_ok = sdl.SetHint("SDL_VIDEO_DRIVER", "offscreen") && sdl.Init(sdl.INIT_VIDEO)
     }
 
-    if !sdl.CreateWindowAndRenderer("Bundling thingy", 1600, 1600, nil, &render_ctx.window, &render_ctx.renderer)
+    if !video_ok
     {
-        fmt.println("Failed to create window:", sdl.GetError())
-        os.exit(1)
+        fail("Failed to init SDL:", sdl.GetError())
+    }
+
+    if windowed
+    {
+        ok := sdl.CreateWindowAndRenderer(
+            "Bundling thingy",
+            RENDER_SIZE, RENDER_SIZE,
+            nil,
+            &render_ctx.window,
+            &render_ctx.renderer,
+        )
+        if !ok do fail("Failed to create window:", sdl.GetError())
     }
 
     render_ctx.device = sdl.CreateGPUDevice({ .SPIRV }, true, nil)
     if render_ctx.device == nil
     {
-        fmt.println("Failed to create GPU device:", sdl.GetError())
-        os.exit(1)
+        fail("Failed to create GPU device:", sdl.GetError())
     }
 
-    if !sdl.ClaimWindowForGPUDevice(render_ctx.device, render_ctx.window)
+    if render_ctx.window != nil
     {
-        fmt.println("Failed to claim window for GPU device:", sdl.GetError())
-        os.exit(1)
+        ok := sdl.ClaimWindowForGPUDevice(render_ctx.device, render_ctx.window)
+        if !ok do fail("Failed to claim window for GPU device:", sdl.GetError())
     }
 
-    { // Graph drawing render ctx
-        render_ctx.graph.vert_shader = load_shader("points.vert", uniform_buffer_count = 1) or_else os.exit(1)
-        render_ctx.graph.frag_shader = load_shader("solid.frag") or_else os.exit(1)
-
-        pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
-            target_info = {
-                num_color_targets = 1,
-                color_target_descriptions = raw_data(&[?]sdl.GPUColorTargetDescription{
-                    {
-                        format = sdl.GetGPUSwapchainTextureFormat(render_ctx.device, render_ctx.window),
-                        blend_state = {
-                            enable_blend = true,
-                            color_blend_op = .ADD,
-                            alpha_blend_op = .ADD,
-                            src_color_blendfactor = .SRC_ALPHA,
-                            dst_color_blendfactor = .ONE_MINUS_SRC_ALPHA,
-                            src_alpha_blendfactor = .SRC_ALPHA,
-                            dst_alpha_blendfactor = .ONE_MINUS_SRC_ALPHA,
-                        },
-                    },
-                }),
-            },
-            vertex_input_state = {
-                num_vertex_buffers = 1,
-                vertex_buffer_descriptions = raw_data(&[?]sdl.GPUVertexBufferDescription{
-                    {
-                        slot  = 0,
-                        pitch = size_of(GraphVertex),
-                        input_rate = .VERTEX,
-                        instance_step_rate = 0,
-                    },
-                }),
-                num_vertex_attributes = 1,
-                vertex_attributes = raw_data(&[?]sdl.GPUVertexAttribute{
-                    {
-                        buffer_slot = 0,
-                        format      = .FLOAT2,
-                        location    = 0,
-                        offset      = 0,
-                    },
-                }),
-            },
-            primitive_type  = .TRIANGLELIST,
-            vertex_shader   = render_ctx.graph.vert_shader,
-            fragment_shader = render_ctx.graph.frag_shader,
-        }
-        pipeline_info.rasterizer_state.fill_mode = .FILL
-
-        render_ctx.graph.pipeline = sdl.CreateGPUGraphicsPipeline(render_ctx.device, pipeline_info)
-        if render_ctx.graph.pipeline == nil
-        {
-            fmt.println("Failed to create fill graphics pipeline:", sdl.GetError())
-            os.exit(1)
-        }
+    color_format: sdl.GPUTextureFormat = .R8G8B8A8_UNORM
+    if windowed
+    {
+        color_format = sdl.GetGPUSwapchainTextureFormat(render_ctx.device, render_ctx.window)
     }
+
+    if !init_graph_render_ctx(color_format)
+    {
+        fail("Failed to create graph render context:", sdl.GetError())
+    }
+
+    render_ctx.color = { 1, 0, 0, 0.05 }
 
     _ = sdl.GetCurrentTime(&render_ctx.last_frame)
     render_ctx.last_title_change = render_ctx.last_frame
 }
 
-deinit_app :: proc()
+deinit_render :: proc()
 {
-    sdl.ReleaseGPUBuffer(render_ctx.device, render_ctx.graph.vertex_buffer)
-    sdl.ReleaseGPUGraphicsPipeline(render_ctx.device, render_ctx.graph.pipeline)
+    if render_ctx.graph.vertex_buffer != nil do sdl.ReleaseGPUBuffer(render_ctx.device, render_ctx.graph.vertex_buffer)
+    if render_ctx.graph.pipeline != nil do sdl.ReleaseGPUGraphicsPipeline(render_ctx.device, render_ctx.graph.pipeline)
 
-    sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.frag_shader)
-    sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.vert_shader)
+    if render_ctx.graph.frag_shader != nil do sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.frag_shader)
+    if render_ctx.graph.vert_shader != nil do sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.vert_shader)
 
-    sdl.DestroyGPUDevice(render_ctx.device)
-    sdl.DestroyWindow(render_ctx.window)
+    if render_ctx.device != nil do sdl.DestroyGPUDevice(render_ctx.device)
+    if render_ctx.window != nil do sdl.DestroyWindow(render_ctx.window)
+
     sdl.Quit()
 
+    render_ctx = {}
 }
 
 begin_frame :: proc()
@@ -159,13 +136,8 @@ begin_frame :: proc()
     }
 }
 
-end_frame :: proc()
-{
-}
-
 upload_graph_to_gpu :: proc(mesh: []GraphVertex)
 {
-
     render_ctx.graph.vertex_count = u32(len(mesh))
     if render_ctx.graph.vertex_count == 0 do return
 
@@ -202,8 +174,7 @@ upload_graph_to_gpu :: proc(mesh: []GraphVertex)
     defer {
         if !sdl.SubmitGPUCommandBuffer(cmd_buffer)
         {
-            fmt.println("Failed to submit command buffer:", sdl.GetError())
-            os.exit(1)
+            fail("Failed to submit command buffer:", sdl.GetError())
         }
     }
 
@@ -218,49 +189,114 @@ upload_graph_to_gpu :: proc(mesh: []GraphVertex)
     )
 }
 
-render_current_graph :: proc()
+draw_graph :: proc()
 {
+    target_info := sdl.GPUColorTargetInfo{
+        clear_color = { 1, 1, 1, 1 },
+        texture  = render_ctx.target,
+        load_op  = .CLEAR,
+        store_op = .STORE
+    }
 
-    cmd_buffer := sdl.AcquireGPUCommandBuffer(render_ctx.device)
+    renderpass := sdl.BeginGPURenderPass(render_ctx.cmd_buffer, &target_info, 1, nil)
+    sdl.BindGPUGraphicsPipeline(renderpass, render_ctx.graph.pipeline)
+    sdl.BindGPUVertexBuffers(
+        renderpass,
+        0,
+        raw_data(&[?]sdl.GPUBufferBinding{ { buffer = render_ctx.graph.vertex_buffer } }),
+        1,
+    )
+
+    sdl.PushGPUVertexUniformData(render_ctx.cmd_buffer, 0, &render_ctx.color, size_of(render_ctx.color))
+    sdl.DrawGPUPrimitives(renderpass, render_ctx.graph.vertex_count, 1, 0, 0)
+    sdl.EndGPURenderPass(renderpass)
+}
+
+render_graph_to_surface :: proc()
+{
+    render_ctx.cmd_buffer = sdl.AcquireGPUCommandBuffer(render_ctx.device)
     defer {
-        if !sdl.SubmitGPUCommandBuffer(cmd_buffer)
+        ok := sdl.SubmitGPUCommandBuffer(render_ctx.cmd_buffer)
+        if !ok do fail("Failed to submit command buffer:", sdl.GetError())
+
+        render_ctx.cmd_buffer = nil
+        render_ctx.target = nil
+    }
+
+    ok := sdl.WaitAndAcquireGPUSwapchainTexture(render_ctx.cmd_buffer, render_ctx.window, &render_ctx.target, nil, nil)
+    if !ok do fail("Failed to acquire swapchain texture:", sdl.GetError())
+
+    if render_ctx.target != nil do draw_graph()
+}
+
+render_graph_to_image :: proc(output_dir: string, name: string)
+{
+    if render_ctx.graph.vertex_count == 0
+    {
+        fmt.println("Skipping empty mesh:", name)
+        return
+    }
+
+    render_ctx.target = sdl.CreateGPUTexture(
+        render_ctx.device,
         {
-            fmt.println("Failed to submit command buffer:", sdl.GetError())
-            os.exit(1)
-        }
+            type = .D2,
+            format = .R8G8B8A8_UNORM,
+            usage = { .COLOR_TARGET },
+            width = RENDER_SIZE,
+            height = RENDER_SIZE,
+            layer_count_or_depth = 1,
+            num_levels = 1,
+        },
+    )
+    if render_ctx.target == nil do fail("Failed to create render texture:", sdl.GetError())
+    defer {
+        sdl.ReleaseGPUTexture(render_ctx.device, render_ctx.target)
+        render_ctx.target = nil
     }
 
-    swapchain_tex: ^sdl.GPUTexture
-    if !sdl.WaitAndAcquireGPUSwapchainTexture(cmd_buffer, render_ctx.window, &swapchain_tex, nil, nil)
-    {
-        fmt.println("Failed to acquire swapchain texture:", sdl.GetError())
-        os.exit(1)
-    }
+    download_buffer := sdl.CreateGPUTransferBuffer(
+        render_ctx.device,
+        { usage = .DOWNLOAD, size = RENDER_SIZE * RENDER_SIZE * 4 },
+    )
+    if download_buffer == nil do fail("Failed to create download buffer:", sdl.GetError())
+    defer sdl.ReleaseGPUTransferBuffer(render_ctx.device, download_buffer)
 
-    if swapchain_tex != nil
-    {
-        target_info := sdl.GPUColorTargetInfo{
-            clear_color = { 1, 1, 1, 1 },
-            texture  = swapchain_tex,
-            load_op  = .CLEAR,
-            store_op = .STORE
-        }
+    render_ctx.cmd_buffer = sdl.AcquireGPUCommandBuffer(render_ctx.device)
+    if render_ctx.cmd_buffer == nil do fail("Failed to acquire command buffer:", sdl.GetError())
+    defer render_ctx.cmd_buffer = nil
 
-        renderpass := sdl.BeginGPURenderPass(cmd_buffer, &target_info, 1, nil)
-        defer sdl.EndGPURenderPass(renderpass)
+    draw_graph()
 
-        sdl.BindGPUGraphicsPipeline(renderpass, render_ctx.graph.pipeline)
-        sdl.BindGPUVertexBuffers(
-            renderpass,
-            0,
-            raw_data(&[?]sdl.GPUBufferBinding{ { buffer = render_ctx.graph.vertex_buffer } }),
-            1,
-        )
+    download_pass := sdl.BeginGPUCopyPass(render_ctx.cmd_buffer)
+    sdl.DownloadFromGPUTexture(
+        download_pass,
+        {
+            texture = render_ctx.target,
+            w = RENDER_SIZE,
+            h = RENDER_SIZE,
+            d = 1,
+        },
+        {
+            transfer_buffer = download_buffer,
+            offset = 0,
+            pixels_per_row = RENDER_SIZE,
+            rows_per_layer = RENDER_SIZE,
+        },
+    )
+    sdl.EndGPUCopyPass(download_pass)
 
-        color_uniform := [4]f32{ 1.0, 0.0, 0.0, 0.05 }
-        sdl.PushGPUVertexUniformData(cmd_buffer, 0, &color_uniform, size_of(type_of(color_uniform)))
-        sdl.DrawGPUPrimitives(renderpass, render_ctx.graph.vertex_count, 1, 0, 0)
-    }
+    if !sdl.SubmitGPUCommandBuffer(render_ctx.cmd_buffer) do fail("Failed to submit command buffer:", sdl.GetError())
+    if !sdl.WaitForGPUIdle(render_ctx.device) do fail("Failed to wait for the GPU:", sdl.GetError())
+
+    pixels := sdl.MapGPUTransferBuffer(render_ctx.device, download_buffer, false)
+    if pixels == nil do fail("Failed to map download buffer:", sdl.GetError())
+    defer sdl.UnmapGPUTransferBuffer(render_ctx.device, download_buffer)
+
+    path := fmt.tprintf("%s/%s.png", output_dir, name)
+    png_write(path, RENDER_SIZE, pixels)
+
+    fmt.println("wrote", path, "(vertices:", render_ctx.graph.vertex_count, ")")
 }
 
 load_shader :: proc(
@@ -319,4 +355,60 @@ load_shader :: proc(
     }
 
     return shader, true
+}
+
+init_graph_render_ctx :: proc(color_format: sdl.GPUTextureFormat) -> bool
+{
+    vert_shader, vert_ok := load_shader("points.vert", uniform_buffer_count = 1)
+    frag_shader, frag_ok := load_shader("solid.frag")
+    render_ctx.graph.vert_shader = vert_shader
+    render_ctx.graph.frag_shader = frag_shader
+    if !vert_ok || !frag_ok do return false
+
+    pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
+        target_info = {
+            num_color_targets = 1,
+            color_target_descriptions = raw_data(&[?]sdl.GPUColorTargetDescription{
+                {
+                    format = color_format,
+                    blend_state = {
+                        enable_blend = true,
+                        color_blend_op = .ADD,
+                        alpha_blend_op = .ADD,
+                        src_color_blendfactor = .SRC_ALPHA,
+                        dst_color_blendfactor = .ONE_MINUS_SRC_ALPHA,
+                        src_alpha_blendfactor = .ONE,
+                        dst_alpha_blendfactor = .ONE_MINUS_SRC_ALPHA,
+                    },
+                },
+            }),
+        },
+        vertex_input_state = {
+            num_vertex_buffers = 1,
+            vertex_buffer_descriptions = raw_data(&[?]sdl.GPUVertexBufferDescription{
+                {
+                    slot  = 0,
+                    pitch = size_of(GraphVertex),
+                    input_rate = .VERTEX,
+                    instance_step_rate = 0,
+                },
+            }),
+            num_vertex_attributes = 1,
+            vertex_attributes = raw_data(&[?]sdl.GPUVertexAttribute{
+                {
+                    buffer_slot = 0,
+                    format      = .FLOAT2,
+                    location    = 0,
+                    offset      = 0,
+                },
+            }),
+        },
+        primitive_type  = .TRIANGLELIST,
+        vertex_shader   = render_ctx.graph.vert_shader,
+        fragment_shader = render_ctx.graph.frag_shader,
+    }
+    pipeline_info.rasterizer_state.fill_mode = .FILL
+
+    render_ctx.graph.pipeline = sdl.CreateGPUGraphicsPipeline(render_ctx.device, pipeline_info)
+    return render_ctx.graph.pipeline != nil
 }
