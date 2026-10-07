@@ -6,6 +6,7 @@ import "core:strings"
 import sdl "vendor:sdl3"
 
 RENDER_SIZE :: 1600
+RENDER_SAMPLE_COUNT :: sdl.GPUSampleCount._4
 
 RenderContext :: struct
 {
@@ -13,9 +14,14 @@ RenderContext :: struct
     renderer: ^sdl.Renderer,
     device:   ^sdl.GPUDevice,
 
-    cmd_buffer: ^sdl.GPUCommandBuffer,
-    target:     ^sdl.GPUTexture,
-    color:      [4]f32,
+    cmd_buffer:    ^sdl.GPUCommandBuffer,
+    target:        ^sdl.GPUTexture,
+    target_size:   [2]u32,
+    target_format: sdl.GPUTextureFormat,
+    color:         [4]f32,
+
+    multisample_target: ^sdl.GPUTexture,
+    multisample_size:   [2]u32,
 
     last_frame : sdl.Time,
     last_title_change: sdl.Time,
@@ -88,6 +94,12 @@ init_render :: proc(opts: AppOptions)
     {
         color_format = sdl.GetGPUSwapchainTextureFormat(render_ctx.device, render_ctx.window)
     }
+    render_ctx.target_format = color_format
+
+    if !sdl.GPUTextureSupportsSampleCount(render_ctx.device, color_format, RENDER_SAMPLE_COUNT)
+    {
+        fail("GPU texture format does not support 4x MSAA")
+    }
 
     if !init_graph_render_ctx(color_format)
     {
@@ -107,6 +119,8 @@ deinit_render :: proc()
 
     if render_ctx.graph.frag_shader != nil do sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.frag_shader)
     if render_ctx.graph.vert_shader != nil do sdl.ReleaseGPUShader(render_ctx.device, render_ctx.graph.vert_shader)
+
+    if render_ctx.multisample_target != nil do sdl.ReleaseGPUTexture(render_ctx.device, render_ctx.multisample_target)
 
     if render_ctx.device != nil do sdl.DestroyGPUDevice(render_ctx.device)
     if render_ctx.window != nil do sdl.DestroyWindow(render_ctx.window)
@@ -191,11 +205,36 @@ upload_graph_to_gpu :: proc(mesh: []GraphVertex)
 
 draw_graph :: proc()
 {
+    if render_ctx.multisample_size != render_ctx.target_size
+    {
+        if render_ctx.multisample_target != nil do sdl.ReleaseGPUTexture(render_ctx.device, render_ctx.multisample_target)
+
+        render_ctx.multisample_target = sdl.CreateGPUTexture(
+            render_ctx.device,
+            {
+                type = .D2,
+                format = render_ctx.target_format,
+                usage = { .COLOR_TARGET },
+                width = render_ctx.target_size[0],
+                height = render_ctx.target_size[1],
+                layer_count_or_depth = 1,
+                num_levels = 1,
+                sample_count = RENDER_SAMPLE_COUNT,
+            },
+        )
+        if render_ctx.multisample_target == nil do fail("Failed to create multisample texture:", sdl.GetError())
+
+        render_ctx.multisample_size = render_ctx.target_size
+    }
+
+    // Resolve the multisample drawing into the window or PNG texture.
     target_info := sdl.GPUColorTargetInfo{
         clear_color = { 1, 1, 1, 1 },
-        texture  = render_ctx.target,
-        load_op  = .CLEAR,
-        store_op = .STORE
+        texture = render_ctx.multisample_target,
+        load_op = .CLEAR,
+        store_op = .RESOLVE,
+        resolve_texture = render_ctx.target,
+        cycle = true,
     }
 
     renderpass := sdl.BeginGPURenderPass(render_ctx.cmd_buffer, &target_info, 1, nil)
@@ -223,7 +262,13 @@ render_graph_to_surface :: proc()
         render_ctx.target = nil
     }
 
-    ok := sdl.WaitAndAcquireGPUSwapchainTexture(render_ctx.cmd_buffer, render_ctx.window, &render_ctx.target, nil, nil)
+    ok := sdl.WaitAndAcquireGPUSwapchainTexture(
+        render_ctx.cmd_buffer,
+        render_ctx.window,
+        &render_ctx.target,
+        &render_ctx.target_size[0],
+        &render_ctx.target_size[1],
+    )
     if !ok do fail("Failed to acquire swapchain texture:", sdl.GetError())
 
     if render_ctx.target != nil do draw_graph()
@@ -237,6 +282,7 @@ render_graph_to_image :: proc(output_dir: string, name: string)
         return
     }
 
+    render_ctx.target_size = { RENDER_SIZE, RENDER_SIZE }
     render_ctx.target = sdl.CreateGPUTexture(
         render_ctx.device,
         {
@@ -403,9 +449,10 @@ init_graph_render_ctx :: proc(color_format: sdl.GPUTextureFormat) -> bool
                 },
             }),
         },
-        primitive_type  = .TRIANGLELIST,
-        vertex_shader   = render_ctx.graph.vert_shader,
-        fragment_shader = render_ctx.graph.frag_shader,
+        primitive_type    = .TRIANGLELIST,
+        vertex_shader     = render_ctx.graph.vert_shader,
+        fragment_shader   = render_ctx.graph.frag_shader,
+        multisample_state = { sample_count = RENDER_SAMPLE_COUNT },
     }
     pipeline_info.rasterizer_state.fill_mode = .FILL
 
