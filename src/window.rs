@@ -27,7 +27,7 @@ struct Ready {
     window: Arc<Window>,
     gpu: Gpu,
 
-    graphs: Vec<Graph>,
+    graphs: Vec<(&'static str, Graph)>,
     index: usize,
     dirty: bool,
 }
@@ -50,7 +50,7 @@ impl Ready {
             graph.normalize()?;
             graph.resample(0.02)?;
 
-            graphs.push(graph);
+            graphs.push((input, graph));
         }
 
         window.request_redraw();
@@ -65,23 +65,19 @@ impl Ready {
     }
 
     fn draw(&mut self) -> Result<()> {
+        let (name, graph) = self
+            .graphs
+            .get(self.index)
+            .ok_or_eyre("invalid graph selection")?;
+
         if self.dirty {
-            self.gpu.upload(
-                &self
-                    .graphs
-                    .get(self.index)
-                    .ok_or_eyre("invalid graph selection")?
-                    .mesh(0.002)?,
-            )?;
+            self.gpu.upload(&graph.mesh(0.002)?)?;
 
             self.dirty = false;
         }
 
         self.gpu.present()?;
-        self.window.set_title(&format!(
-            "Bundling Thingy - {}",
-            INPUTS.get(self.index).ok_or_eyre("invalid graph title")?
-        ));
+        self.window.set_title(&format!("Bundling Thingy - {name}"));
         Ok(())
     }
 
