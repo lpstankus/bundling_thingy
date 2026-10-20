@@ -142,10 +142,7 @@ impl App {
                 if size.width == 0 || size.height == 0 {
                     return Ok(());
                 }
-                if let Err(e) = self.draw() {
-                    self.error = Some(e);
-                    event_loop.exit();
-                }
+                self.draw()?;
             }
             _ => {}
         }
