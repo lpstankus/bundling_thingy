@@ -37,42 +37,48 @@ impl Graph {
             min: [f32::MAX; 2],
             max: [f32::MIN; 2],
         };
+
         for (line_idx, line) in text.lines().enumerate() {
             // The Odin reader splits on literal spaces, discards the first token,
             // and skips tokens beginning with '(' or '<'. Preserve that grammar.
-            let mut tokens = SpaceTokens { rest: Some(line) };
+            let mut tokens = line.split(' ');
             tokens.next();
+
             let start = g.points.len();
-            while let Some(rest) = tokens.rest {
-                if rest.is_empty() || rest.starts_with([' ', '(', '<']) {
-                    tokens.next();
+            while let Some(token) = tokens.next() {
+                if token.is_empty() || token.starts_with(['(', '<']) {
                     continue;
                 }
+
                 let p: Point = [
-                    tokens
-                        .number()
+                    coordinate(Some(token))
                         .wrap_err_with(|| format!("line {} x", line_idx.saturating_add(1)))?,
-                    tokens
-                        .number()
+                    coordinate(tokens.next())
                         .wrap_err_with(|| format!("line {} y", line_idx.saturating_add(1)))?,
                 ];
+
                 ensure!(p.iter().all(|v| v.is_finite()), "non-finite TRL coordinate");
+
                 for ((min, max), v) in g.min.iter_mut().zip(&mut g.max).zip(p) {
                     *min = min.min(v);
                     *max = max.max(v);
                 }
+
                 g.points.push(p);
             }
+
             if start != g.points.len() {
                 g.starts.push(start);
             }
         }
+
         g.starts.push(g.points.len());
         if g.points.is_empty() {
             bail!("empty graph");
         }
         Ok(g)
     }
+
     pub fn normalize(&mut self) -> Result<()> {
         let range = sub(self.max, self.min);
         let span = range[0].max(range[1]);
@@ -183,31 +189,9 @@ impl Graph {
     }
 }
 
-struct SpaceTokens<'a> {
-    rest: Option<&'a str>,
-}
-impl<'a> Iterator for SpaceTokens<'a> {
-    type Item = &'a str;
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let rest = self.rest?;
-        if let Some(i) = rest.as_bytes().iter().position(|&b| b == b' ') {
-            let (token, tail) = rest.split_at(i);
-            self.rest = tail.strip_prefix(' ');
-            Some(token)
-        } else {
-            self.rest = None;
-            Some(rest)
-        }
-    }
-}
-
-impl SpaceTokens<'_> {
-    #[inline]
-    fn number(&mut self) -> Result<f32> {
-        self.next()
-            .ok_or_eyre("unexpected end of TRL line")?
-            .parse::<f32>()
-            .wrap_err("invalid coordinate")
-    }
+fn coordinate(token: Option<&str>) -> Result<f32> {
+    token
+        .ok_or_eyre("unexpected end of TRL line")?
+        .parse::<f32>()
+        .wrap_err("invalid coordinate")
 }
