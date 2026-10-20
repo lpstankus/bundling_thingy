@@ -13,17 +13,22 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub struct Gpu {
     pub device: wgpu::Device,
     queue: wgpu::Queue,
+
     pipeline: wgpu::RenderPipeline,
     color: wgpu::BindGroup,
+
     vertices: wgpu::Buffer,
     vertex_count: u32,
     capacity: u64,
+
     target: wgpu::Texture,
     msaa: wgpu::TextureView,
     download: wgpu::Buffer,
+
     pub surface: Option<wgpu::Surface<'static>>,
     pub config: Option<wgpu::SurfaceConfiguration>,
 }
+
 impl Gpu {
     pub async fn new(window: Option<Arc<Window>>, validation: bool) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -35,10 +40,12 @@ impl Gpu {
             },
             ..Default::default()
         });
+
         let surface = window
             .as_ref()
             .map(|w| instance.create_surface(w.clone()))
             .transpose()?;
+
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -46,17 +53,20 @@ impl Gpu {
                 compatible_surface: surface.as_ref(),
             })
             .await?;
+
         let info = adapter.get_info();
         ensure!(
             info.device_type != wgpu::DeviceType::Cpu,
             "software GPU is not permitted"
         );
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Bundling Thingy"),
                 ..Default::default()
             })
             .await?;
+
         let config = if let (Some(surface), Some(window)) = (&surface, &window) {
             let size = window.inner_size();
             let mut config = surface
@@ -73,6 +83,7 @@ impl Gpu {
         } else {
             None
         };
+
         let format = config.as_ref().map_or(FORMAT, |c| c.format);
         ensure!(
             adapter
@@ -81,13 +92,16 @@ impl Gpu {
                 .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4),
             "4x MSAA unsupported"
         );
+
         let (pipeline, color) = Self::pipeline(&device, format);
+
         let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
         let (width, height) = config
             .as_ref()
             .map_or((SIZE, SIZE), |c| (c.width, c.height));
         let msaa = Self::texture(&device, width, height, format, 4)
             .create_view(&wgpu::TextureViewDescriptor::default());
+
         let buffer = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -96,16 +110,19 @@ impl Gpu {
                 mapped_at_creation: false,
             })
         };
+
         let vertices = buffer(
             "vertices",
             8,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
+
         let download = buffer(
             "pixels",
             u64::from(SIZE * SIZE * 4),
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         );
+
         Ok(Self {
             device,
             queue,
@@ -121,6 +138,7 @@ impl Gpu {
             config,
         })
     }
+
     fn pipeline(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -129,6 +147,7 @@ impl Gpu {
             label: Some("graph"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("graph"),
             layout: None,
@@ -165,11 +184,13 @@ impl Gpu {
             multiview: None,
             cache: None,
         });
+
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("color"),
             contents: bytemuck::cast_slice(&[1.0_f32, 0.0, 0.0, 0.05]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+
         let color = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("color"),
             layout: &pipeline.get_bind_group_layout(0),
@@ -178,8 +199,10 @@ impl Gpu {
                 resource: uniform.as_entire_binding(),
             }],
         });
+
         (pipeline, color)
     }
+
     fn texture(
         device: &wgpu::Device,
         width: u32,
@@ -207,6 +230,7 @@ impl Gpu {
             view_formats: &[],
         })
     }
+
     pub fn wait(&self) -> Result<()> {
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -214,14 +238,17 @@ impl Gpu {
         })?;
         Ok(())
     }
+
     pub fn upload(&mut self, mesh: &[Point]) -> Result<()> {
         self.vertex_count = u32::try_from(mesh.len())?;
         let bytes = bytemuck::cast_slice(mesh);
+
         let byte_count = u64::try_from(bytes.len())?;
         ensure!(
             byte_count <= self.device.limits().max_buffer_size,
             "mesh exceeds GPU buffer limit"
         );
+
         if byte_count > self.capacity {
             self.capacity = byte_count;
             self.vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -231,12 +258,15 @@ impl Gpu {
                 mapped_at_creation: false,
             });
         }
+
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.vertices, 0, bytes);
         }
+
         self.queue.submit([]);
         self.wait()
     }
+
     fn encode_draw(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
         let mut encoder = self
             .device
@@ -262,26 +292,33 @@ impl Gpu {
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(0..self.vertex_count, 0..1);
         }
+
         encoder.finish()
     }
+
     pub fn render(&self) -> Result<()> {
         let view = self
             .target
             .create_view(&wgpu::TextureViewDescriptor::default());
+
         self.queue.submit([self.encode_draw(&view)]);
         self.wait()
     }
+
     fn map_copy(&self, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
         let (tx, rx) = mpsc::sync_channel(1);
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+
         self.wait()?;
         rx.recv()??;
+
         let result = buffer.slice(..).get_mapped_range().to_vec();
         buffer.unmap();
         Ok(result)
     }
+
     pub fn readback(&self) -> Result<Vec<u8>> {
         let mut encoder = self
             .device
@@ -302,13 +339,16 @@ impl Gpu {
                 depth_or_array_layers: 1,
             },
         );
+
         self.queue.submit([encoder.finish()]);
         self.map_copy(&self.download)
     }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
+
         if let (Some(surface), Some(config)) = (&self.surface, &mut self.config) {
             config.width = width;
             config.height = height;
@@ -317,12 +357,15 @@ impl Gpu {
                 .create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
+
     pub fn present(&self) -> Result<()> {
         let surface = self.surface.as_ref().ok_or_eyre("no window surface")?;
+
         let frame = surface.get_current_texture()?;
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
         self.queue.submit([self.encode_draw(&view)]);
         frame.present();
         self.wait()

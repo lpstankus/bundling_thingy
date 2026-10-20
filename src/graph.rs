@@ -6,30 +6,16 @@ pub type Point = [f32; 2];
 pub struct Graph {
     pub points: Vec<Point>,
     pub starts: Vec<usize>,
+
     min: Point,
     max: Point,
 }
-fn add(a: Point, b: Point) -> Point {
-    [a[0] + b[0], a[1] + b[1]]
-}
-fn sub(a: Point, b: Point) -> Point {
-    [a[0] - b[0], a[1] - b[1]]
-}
-fn mul(a: Point, k: f32) -> Point {
-    [a[0] * k, a[1] * k]
-}
-fn length(a: Point) -> f32 {
-    // Keep separate squared components and the original f32 reduction order.
-    // hypot uses different rounding, which changes resampling and rasterization.
-    a.map(|component| component * component)
-        .into_iter()
-        .sum::<f32>()
-        .sqrt()
-}
+
 impl Graph {
     pub fn load(path: &Path) -> Result<Self> {
         Self::parse(&fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?)
     }
+
     pub fn parse(text: &str) -> Result<Self> {
         let mut g = Self {
             points: vec![],
@@ -86,21 +72,25 @@ impl Graph {
             span > 0.0 && span.is_finite(),
             "graph has zero or invalid extent"
         );
+
         let scale = (1.0_f32 - 0.05) / span;
         let translation = [
             (1.0 - scale * range[0]) / 2.0,
             (1.0 - scale * range[1]) / 2.0,
         ];
+
         self.points.iter_mut().for_each(|p| {
             *p = mul(
                 sub(add(mul(sub(*p, self.min), scale), translation), [0.5; 2]),
                 2.0,
             );
         });
+
         self.min = [-1.0; 2];
         self.max = [1.0; 2];
         Ok(())
     }
+
     pub fn resample(&mut self, spacing: f32) -> Result<()> {
         ensure!(
             spacing > 0.0 && spacing.is_finite(),
@@ -164,6 +154,7 @@ impl Graph {
     pub fn mesh(&self, width: f32) -> Result<Vec<Point>> {
         let mut mesh = Vec::with_capacity(self.points.len().saturating_sub(1).saturating_mul(2));
         let half = width / 2.0;
+
         for &[start, end] in self.starts.array_windows::<2>() {
             for &[first, second] in self
                 .points
@@ -176,12 +167,14 @@ impl Graph {
                 if len == 0.0 {
                     continue;
                 }
+
                 let dir = [dir[0] / len, dir[1] / len];
                 let normal = mul([-dir[1], dir[0]], half);
                 let v0 = add(first, normal);
                 let v1 = sub(first, normal);
                 let v2 = add(second, normal);
                 let v3 = sub(second, normal);
+
                 mesh.extend([v0, v1, v2, v3, v2, v1]);
             }
         }
@@ -194,4 +187,25 @@ fn coordinate(token: Option<&str>) -> Result<f32> {
         .ok_or_eyre("unexpected end of TRL line")?
         .parse::<f32>()
         .wrap_err("invalid coordinate")
+}
+
+fn add(a: Point, b: Point) -> Point {
+    [a[0] + b[0], a[1] + b[1]]
+}
+
+fn sub(a: Point, b: Point) -> Point {
+    [a[0] - b[0], a[1] - b[1]]
+}
+
+fn mul(a: Point, k: f32) -> Point {
+    [a[0] * k, a[1] * k]
+}
+
+fn length(a: Point) -> f32 {
+    // Keep separate squared components and the original f32 reduction order.
+    // hypot uses different rounding, which changes resampling and rasterization.
+    a.map(|component| component * component)
+        .into_iter()
+        .sum::<f32>()
+        .sqrt()
 }

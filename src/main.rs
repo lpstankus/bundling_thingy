@@ -1,6 +1,7 @@
 mod gpu;
 mod graph;
 mod window;
+
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
@@ -20,31 +21,40 @@ pub struct Options {
     /// Export a PNG without opening a window.
     #[arg(long)]
     headless: bool,
+
     /// Resample paths before headless rendering.
     #[arg(long)]
     resample: bool,
+
     /// Enable GPU debugging and validation.
     #[arg(long)]
     validate_gpu: bool,
+
     /// TRL input for headless rendering.
     #[arg(long, default_value = "data/fr-airlines.trl")]
     input: PathBuf,
+
     /// Output directory for headless rendering.
     #[arg(long, default_value = "out/rust")]
     out: PathBuf,
 }
+
 fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
+
     let mut gpu = pollster::block_on(Gpu::new(None, opts.validate_gpu))?;
+
     let mut graph = Graph::load(&opts.input)?;
     graph.normalize()?;
     if opts.resample {
         graph.resample(0.02)?;
     }
+
     gpu.upload(&graph.mesh(0.002)?)?;
     gpu.render()?;
     let pixels = gpu.readback()?;
+
     let path = opts.out.join("original.png");
     let mut encoder = png::Encoder::new(
         BufWriter::new(File::create(&path).wrap_err_with(|| format!("create {}", path.display()))?),
@@ -57,12 +67,15 @@ fn headless(opts: &Options) -> Result<()> {
         .write_header()?
         .write_image_data(&pixels)
         .wrap_err_with(|| format!("write {}", path.display()))?;
+
     println!("wrote {}", path.display());
     Ok(())
 }
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     let opts = Options::parse();
+
     if opts.headless {
         headless(&opts)
     } else {
