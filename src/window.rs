@@ -18,78 +18,73 @@ const INPUTS: [&str; 5] = [
 ];
 struct App {
     opts: Options,
-    window: Option<Arc<Window>>,
-    gpu: Option<Gpu>,
+    ready: Option<Ready>,
+
+    error: Option<color_eyre::eyre::Report>,
+}
+
+struct Ready {
+    window: Arc<Window>,
+    gpu: Gpu,
+
     graphs: Vec<Graph>,
     index: usize,
     dirty: bool,
-    error: Option<color_eyre::eyre::Report>,
 }
-impl App {
+
+impl Ready {
+    fn new(event_loop: &ActiveEventLoop, validation: bool) -> Result<Self> {
+        let window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("Bundling Thingy")
+                    .with_inner_size(winit::dpi::PhysicalSize::new(1600, 1600)),
+            )?,
+        );
+
+        let gpu = pollster::block_on(Gpu::new(Some(window.clone()), validation))?;
+
+        let mut graphs = Vec::new();
+        for input in INPUTS {
+            let mut graph = Graph::load(input.as_ref())?;
+            graph.normalize()?;
+            graph.resample(0.02)?;
+
+            graphs.push(graph);
+        }
+
+        window.request_redraw();
+
+        Ok(Self {
+            window,
+            gpu,
+            graphs,
+            index: 0,
+            dirty: true,
+        })
+    }
+
     fn draw(&mut self) -> Result<()> {
-        let gpu = self.gpu.as_mut().ok_or_eyre("GPU is not initialized")?;
-        let window = self
-            .window
-            .as_ref()
-            .ok_or_eyre("window is not initialized")?;
         if self.dirty {
-            gpu.upload(
+            self.gpu.upload(
                 &self
                     .graphs
                     .get(self.index)
                     .ok_or_eyre("invalid graph selection")?
                     .mesh(0.002)?,
             )?;
+
             self.dirty = false;
         }
-        gpu.present()?;
-        window.set_title(&format!(
+
+        self.gpu.present()?;
+        self.window.set_title(&format!(
             "Bundling Thingy - {}",
             INPUTS.get(self.index).ok_or_eyre("invalid graph title")?
         ));
         Ok(())
     }
-}
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let result = (|| -> Result<()> {
-            let window = Arc::new(
-                event_loop.create_window(
-                    Window::default_attributes()
-                        .with_title("Bundling Thingy")
-                        .with_inner_size(winit::dpi::PhysicalSize::new(1600, 1600)),
-                )?,
-            );
-            self.gpu = Some(pollster::block_on(Gpu::new(
-                Some(window.clone()),
-                self.opts.validate_gpu,
-            ))?);
-            for input in INPUTS {
-                let mut g = Graph::load(input.as_ref())?;
-                g.normalize()?;
-                g.resample(0.02)?;
-                self.graphs.push(g);
-            }
-            window.request_redraw();
-            self.window = Some(window);
-            Ok(())
-        })();
-        if let Err(e) = result {
-            self.error = Some(e);
-            event_loop.exit();
-        }
-    }
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        if let Err(e) = self.handle_event(event_loop, event) {
-            self.error = Some(e);
-            event_loop.exit();
-        }
-    }
-}
-impl App {
+
     fn handle_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> Result<()> {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -115,30 +110,17 @@ impl App {
                     _ => {}
                 }
                 if self.dirty {
-                    self.window
-                        .as_ref()
-                        .ok_or_eyre("window is not initialized")?
-                        .request_redraw();
+                    self.window.request_redraw();
                 }
             }
             WindowEvent::Resized(size) => {
-                self.gpu
-                    .as_mut()
-                    .ok_or_eyre("GPU is not initialized")?
-                    .resize(size.width, size.height);
+                self.gpu.resize(size.width, size.height);
                 if size.width > 0 && size.height > 0 {
-                    self.window
-                        .as_ref()
-                        .ok_or_eyre("window is not initialized")?
-                        .request_redraw();
+                    self.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
-                let size = self
-                    .window
-                    .as_ref()
-                    .ok_or_eyre("window is not initialized")?
-                    .inner_size();
+                let size = self.window.inner_size();
                 if size.width == 0 || size.height == 0 {
                     return Ok(());
                 }
@@ -149,19 +131,46 @@ impl App {
         Ok(())
     }
 }
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.ready.is_some() {
+            return;
+        }
+
+        match Ready::new(event_loop, self.opts.validate_gpu) {
+            Ok(ready) => self.ready = Some(ready),
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let Some(ready) = &mut self.ready else {
+            return;
+        };
+
+        if let Err(e) = ready.handle_event(event_loop, event) {
+            self.error = Some(e);
+            event_loop.exit();
+        }
+    }
+}
+
 pub fn run(opts: Options) -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
+
     let mut app = App {
         opts,
-        window: None,
-        gpu: None,
-        graphs: vec![],
-        index: 0,
-        dirty: true,
+        ready: None,
         error: None,
     };
+
     event_loop.run_app(&mut app)?;
+
     if let Some(e) = app.error {
         return Err(e);
     }
