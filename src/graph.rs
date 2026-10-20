@@ -1,5 +1,4 @@
 use color_eyre::eyre::{OptionExt, Result, WrapErr, bail, ensure};
-use rayon::prelude::*;
 use std::{fs, path::Path};
 
 pub type Point = [f32; 2];
@@ -101,57 +100,61 @@ impl Graph {
             spacing > 0.0 && spacing.is_finite(),
             "invalid resample spacing"
         );
-        // Parallelize strictly above 1,024 edges; cheap edges may still favor serial work.
-        if self.starts.len().saturating_sub(1) > 1024 {
-            return self.resample_parallel(spacing);
-        }
+
         let mut points = Vec::new();
         let mut starts = Vec::new();
+
         for &[start, end] in self.starts.array_windows::<2>() {
             let edge = self
                 .points
                 .get(start..end)
                 .ok_or_eyre("invalid edge bounds")?;
+
             starts.push(points.len());
-            resample_edge(edge, spacing, &mut points)?;
+
+            let mut remaining = spacing;
+            let mut previous = *edge.first().ok_or_eyre("empty edge")?;
+            points.push(previous);
+
+            let mut pending = edge.iter().skip(1).peekable();
+            while let Some(&&current) = pending.peek() {
+                let distance = length(sub(previous, current));
+                if distance < remaining {
+                    remaining -= distance;
+                    previous = current;
+                    pending.next();
+                    continue;
+                }
+
+                let t = remaining / distance;
+                let next = add(mul(previous, 1.0 - t), mul(current, t));
+                // A tiny remainder may round to the previous point. Odin appends
+                // it, resets the spacing, then advances on the next iteration.
+                ensure!(
+                    next.iter()
+                        .zip(previous)
+                        .any(|(a, b)| a.partial_cmp(&b) != Some(std::cmp::Ordering::Equal))
+                        || remaining < spacing,
+                    "resampling made no progress"
+                );
+
+                previous = next;
+                remaining = spacing;
+                points.push(previous);
+            }
+
+            if remaining < spacing {
+                points.push(*edge.last().ok_or_eyre("empty edge")?);
+            }
         }
+
         starts.push(points.len());
+
         self.points = points;
         self.starts = starts;
         Ok(())
     }
-    fn resample_parallel(&mut self, spacing: f32) -> Result<()> {
-        let bounds: Vec<_> = self.starts.array_windows::<2>().copied().collect();
-        // Indexed collection preserves edge order, including which error is reported first.
-        let pieces: Vec<Result<Vec<Point>>> = bounds
-            .par_iter()
-            .map(|&[start, end]| {
-                let edge = self
-                    .points
-                    .get(start..end)
-                    .ok_or_eyre("invalid edge bounds")?;
-                let mut points = Vec::new();
-                resample_edge(edge, spacing, &mut points)?;
-                Ok(points)
-            })
-            .collect();
-        let pieces: Vec<_> = pieces.into_iter().collect::<Result<_>>()?;
-        let capacity = pieces.iter().try_fold(0_usize, |total, edge| {
-            total
-                .checked_add(edge.len())
-                .ok_or_eyre("resampled graph too large")
-        })?;
-        let mut points = Vec::with_capacity(capacity);
-        let mut starts = Vec::with_capacity(self.starts.len());
-        for edge in pieces {
-            starts.push(points.len());
-            points.extend(edge);
-        }
-        starts.push(points.len());
-        self.points = points;
-        self.starts = starts;
-        Ok(())
-    }
+
     pub fn mesh(&self, width: f32) -> Result<Vec<Point>> {
         let mut mesh = Vec::with_capacity(self.points.len().saturating_sub(1).saturating_mul(2));
         let half = width / 2.0;
@@ -207,38 +210,4 @@ impl SpaceTokens<'_> {
             .parse::<f32>()
             .wrap_err("invalid coordinate")
     }
-}
-
-fn resample_edge(edge: &[Point], spacing: f32, points: &mut Vec<Point>) -> Result<()> {
-    let mut remaining = spacing;
-    let mut previous = *edge.first().ok_or_eyre("empty edge")?;
-    points.push(previous);
-    let mut pending = edge.iter().skip(1).peekable();
-    while let Some(&&current) = pending.peek() {
-        let distance = length(sub(previous, current));
-        if distance < remaining {
-            remaining -= distance;
-            previous = current;
-            pending.next();
-            continue;
-        }
-        let t = remaining / distance;
-        let next = add(mul(previous, 1.0 - t), mul(current, t));
-        // A tiny remainder may round to the previous point. Odin appends
-        // it, resets the spacing, then advances on the next iteration.
-        ensure!(
-            next.iter()
-                .zip(previous)
-                .any(|(a, b)| a.partial_cmp(&b) != Some(std::cmp::Ordering::Equal))
-                || remaining < spacing,
-            "resampling made no progress"
-        );
-        previous = next;
-        remaining = spacing;
-        points.push(previous);
-    }
-    if remaining < spacing {
-        points.push(*edge.last().ok_or_eyre("empty edge")?);
-    }
-    Ok(())
 }
