@@ -1,6 +1,9 @@
 use crate::{Options, gpu::Gpu, graph::Graph};
 use color_eyre::eyre::{OptionExt, Result};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -30,6 +33,7 @@ struct Ready {
     graphs: Vec<(&'static str, Graph)>,
     index: usize,
     dirty: bool,
+    last_title_update: Instant,
 }
 
 impl Ready {
@@ -61,14 +65,17 @@ impl Ready {
             graphs,
             index: 0,
             dirty: true,
+            last_title_update: Instant::now(),
         })
     }
 
     fn draw(&mut self) -> Result<()> {
+        let started = Instant::now();
         let (name, graph) = self
             .graphs
             .get(self.index)
             .ok_or_eyre("invalid graph selection")?;
+        let update_title = self.dirty || self.last_title_update.elapsed() >= Duration::from_secs(1);
 
         if self.dirty {
             self.gpu.upload(&graph.mesh(0.002)?)?;
@@ -77,7 +84,14 @@ impl Ready {
         }
 
         self.gpu.present()?;
-        self.window.set_title(&format!("Bundling Thingy - {name}"));
+        if update_title {
+            // Measure the redraw itself, excluding time spent waiting for events.
+            self.window.set_title(&format!(
+                "Bundling Thingy - {name} ({:.2}ms)",
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+            self.last_title_update = Instant::now();
+        }
         Ok(())
     }
 

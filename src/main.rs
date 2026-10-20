@@ -51,7 +51,13 @@ fn headless(opts: &Options) -> Result<()> {
         graph.resample(0.02)?;
     }
 
-    gpu.upload(&graph.mesh(0.002)?)?;
+    let mesh = graph.mesh(0.002)?;
+    if mesh.is_empty() {
+        println!("Skipping empty mesh: original");
+        return Ok(());
+    }
+
+    gpu.upload(&mesh)?;
     gpu.render()?;
     let pixels = gpu.readback()?;
 
@@ -68,7 +74,7 @@ fn headless(opts: &Options) -> Result<()> {
         .write_image_data(&pixels)
         .wrap_err_with(|| format!("write {}", path.display()))?;
 
-    println!("wrote {}", path.display());
+    println!("wrote {} with {} vertices", path.display(), mesh.len());
     Ok(())
 }
 

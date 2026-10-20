@@ -13,7 +13,16 @@ pub struct Graph {
 
 impl Graph {
     pub fn load(path: &Path) -> Result<Self> {
-        Self::parse(&fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?)
+        let graph = Self::parse(
+            &fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?,
+        )?;
+        println!(
+            "Read {}: {} edges, {} control points",
+            path.display(),
+            graph.starts.len().saturating_sub(1),
+            graph.points.len()
+        );
+        Ok(graph)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -145,6 +154,14 @@ impl Graph {
         }
 
         starts.push(points.len());
+
+        println!(
+            "Resampled graph: {} -> {} edges, {} -> {} control points",
+            self.starts.len().saturating_sub(1),
+            starts.len().saturating_sub(1),
+            self.points.len(),
+            points.len()
+        );
 
         self.points = points;
         self.starts = starts;

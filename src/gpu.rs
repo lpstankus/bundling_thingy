@@ -241,6 +241,10 @@ impl Gpu {
 
     pub fn upload(&mut self, mesh: &[Point]) -> Result<()> {
         self.vertex_count = u32::try_from(mesh.len())?;
+        if mesh.is_empty() {
+            return Ok(());
+        }
+
         let bytes = bytemuck::cast_slice(mesh);
 
         let byte_count = u64::try_from(bytes.len())?;
@@ -259,9 +263,7 @@ impl Gpu {
             });
         }
 
-        if !bytes.is_empty() {
-            self.queue.write_buffer(&self.vertices, 0, bytes);
-        }
+        self.queue.write_buffer(&self.vertices, 0, bytes);
 
         self.queue.submit([]);
         self.wait()
