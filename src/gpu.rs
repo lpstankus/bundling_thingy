@@ -4,7 +4,11 @@ use std::{
     sync::{Arc, mpsc},
     time::Duration,
 };
-use wgpu::util::DeviceExt;
+use wgpu::{
+    SurfaceError::{Lost, Outdated, Timeout},
+    TextureFormat::{Bgra8Unorm, Rgb10a2Unorm, Rgba8Unorm},
+    util::DeviceExt,
+};
 use winit::window::Window;
 
 pub const SIZE: u32 = 1600;
@@ -19,14 +23,12 @@ pub struct Gpu {
 
     vertices: wgpu::Buffer,
     vertex_count: u32,
-    capacity: u64,
 
     target: wgpu::Texture,
     msaa: wgpu::TextureView,
     download: wgpu::Buffer,
 
-    pub surface: Option<wgpu::Surface<'static>>,
-    pub config: Option<wgpu::SurfaceConfiguration>,
+    surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
 }
 
 impl Gpu {
@@ -76,8 +78,8 @@ impl Gpu {
             config.format = *caps
                 .formats
                 .iter()
-                .find(|f| !f.is_srgb())
-                .ok_or_eyre("surface has no linear UNORM format")?;
+                .find(|f| matches!(f, Bgra8Unorm | Rgba8Unorm | Rgb10a2Unorm))
+                .ok_or_eyre("surface has no linear UNORM format with blending and 4x MSAA")?;
             surface.configure(&device, &config);
             Some(config)
         } else {
@@ -85,13 +87,6 @@ impl Gpu {
         };
 
         let format = config.as_ref().map_or(FORMAT, |c| c.format);
-        ensure!(
-            adapter
-                .get_texture_format_features(format)
-                .flags
-                .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4),
-            "4x MSAA unsupported"
-        );
 
         let (pipeline, color) = Self::pipeline(&device, format);
 
@@ -130,12 +125,10 @@ impl Gpu {
             color,
             vertices,
             vertex_count: 0,
-            capacity: 8,
             target,
             msaa,
             download,
-            surface,
-            config,
+            surface: surface.zip(config),
         })
     }
 
@@ -253,11 +246,10 @@ impl Gpu {
             "mesh exceeds GPU buffer limit"
         );
 
-        if byte_count > self.capacity {
-            self.capacity = byte_count;
+        if byte_count > self.vertices.size() {
             self.vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("vertices"),
-                size: self.capacity,
+                size: byte_count,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -307,20 +299,6 @@ impl Gpu {
         self.wait()
     }
 
-    fn map_copy(&self, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-
-        self.wait()?;
-        rx.recv()??;
-
-        let result = buffer.slice(..).get_mapped_range().to_vec();
-        buffer.unmap();
-        Ok(result)
-    }
-
     pub fn readback(&self) -> Result<Vec<u8>> {
         let mut encoder = self
             .device
@@ -343,7 +321,18 @@ impl Gpu {
         );
 
         self.queue.submit([encoder.finish()]);
-        self.map_copy(&self.download)
+        let (tx, rx) = mpsc::sync_channel(1);
+        let slice = self.download.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+
+        self.wait()?;
+        rx.recv()??;
+
+        let result = slice.get_mapped_range().to_vec();
+        self.download.unmap();
+        Ok(result)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -351,7 +340,7 @@ impl Gpu {
             return;
         }
 
-        if let (Some(surface), Some(config)) = (&self.surface, &mut self.config) {
+        if let Some((surface, config)) = &mut self.surface {
             config.width = width;
             config.height = height;
             surface.configure(&self.device, config);
@@ -360,10 +349,20 @@ impl Gpu {
         }
     }
 
-    pub fn present(&self) -> Result<()> {
-        let surface = self.surface.as_ref().ok_or_eyre("no window surface")?;
+    pub fn present(&self, window: &Window) -> Result<()> {
+        let (surface, config) = self.surface.as_ref().ok_or_eyre("no window surface")?;
 
-        let frame = surface.get_current_texture()?;
+        let frame = match surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(error @ (Lost | Outdated | Timeout)) => {
+                if error != Timeout {
+                    surface.configure(&self.device, config);
+                }
+                window.request_redraw();
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());

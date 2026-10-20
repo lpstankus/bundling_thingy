@@ -8,7 +8,6 @@ use gpu::{Gpu, SIZE};
 use graph::Graph;
 use std::{
     fs::{self, File},
-    io::BufWriter,
     path::PathBuf,
 };
 
@@ -63,15 +62,16 @@ fn headless(opts: &Options) -> Result<()> {
 
     let path = opts.out.join("original.png");
     let mut encoder = png::Encoder::new(
-        BufWriter::new(File::create(&path).wrap_err_with(|| format!("create {}", path.display()))?),
+        File::create(&path).wrap_err_with(|| format!("create {}", path.display()))?,
         SIZE,
         SIZE,
     );
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .write_header()?
+    let mut writer = encoder.write_header()?;
+    writer
         .write_image_data(&pixels)
+        .and_then(|()| writer.finish())
         .wrap_err_with(|| format!("write {}", path.display()))?;
 
     println!("wrote {} with {} vertices", path.display(), mesh.len());

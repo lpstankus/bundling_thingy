@@ -83,7 +83,7 @@ impl Ready {
             self.dirty = false;
         }
 
-        self.gpu.present()?;
+        self.gpu.present(&self.window)?;
         if update_title {
             // Measure the redraw itself, excluding time spent waiting for events.
             self.window.set_title(&format!(
