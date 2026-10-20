@@ -1,7 +1,8 @@
 mod gpu;
 mod graph;
 mod window;
-use color_eyre::eyre::{OptionExt, Result, WrapErr, bail};
+use clap::Parser;
+use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
 use graph::Graph;
 use std::{
@@ -10,42 +11,27 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(
+    args_override_self = true,
+    after_help = "Without --headless: Left/Right/Space switch graphs; Escape exits."
+)]
 pub struct Options {
+    /// Export a PNG without opening a window.
+    #[arg(long)]
     headless: bool,
+    /// Resample paths before headless rendering.
+    #[arg(long)]
     resample: bool,
+    /// Enable GPU debugging and validation.
+    #[arg(long)]
     validate_gpu: bool,
+    /// TRL input for headless rendering.
+    #[arg(long, default_value = "data/fr-airlines.trl")]
     input: PathBuf,
+    /// Output directory for headless rendering.
+    #[arg(long, default_value = "out/rust")]
     out: PathBuf,
-}
-impl Options {
-    fn parse() -> Result<Option<Self>> {
-        let mut o = Self {
-            headless: false,
-            resample: false,
-            validate_gpu: false,
-            input: "data/fr-airlines.trl".into(),
-            out: "out/rust".into(),
-        };
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--headless" => o.headless = true,
-                "--resample" => o.resample = true,
-                "--validate-gpu" => o.validate_gpu = true,
-                "--input" => o.input = args.next().ok_or_eyre("--input needs a path")?.into(),
-                "--out" => o.out = args.next().ok_or_eyre("--out needs a path")?.into(),
-                "--help" => {
-                    println!(
-                        "bundling-wgpu [--headless] [--input FILE] [--out DIR] [--resample] [--validate-gpu]\nWithout --headless: Left/Right/Space switch graphs; Escape exits."
-                    );
-                    return Ok(None);
-                }
-                _ => bail!("unknown option {arg}"),
-            }
-        }
-        Ok(Some(o))
-    }
 }
 fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
@@ -76,9 +62,7 @@ fn headless(opts: &Options) -> Result<()> {
 }
 fn main() -> Result<()> {
     color_eyre::install()?;
-    let Some(opts) = Options::parse()? else {
-        return Ok(());
-    };
+    let opts = Options::parse();
     if opts.headless {
         headless(&opts)
     } else {
