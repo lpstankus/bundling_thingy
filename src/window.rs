@@ -1,0 +1,188 @@
+use crate::{Options, gpu::Gpu, graph::Graph};
+use color_eyre::eyre::{OptionExt, Result};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use winit::{
+    application::ApplicationHandler,
+    event::{ElementState, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, NamedKey},
+    window::{Window, WindowId},
+};
+
+const INPUTS: [&str; 5] = [
+    "data/fr-airlines.trl",
+    "data/us-migrations.trl",
+    "data/us-airlines.trl",
+    "data/rj-notlocal-elective.trl",
+    "data/rj-2019.trl",
+];
+struct App {
+    opts: Options,
+    running: Option<Running>,
+
+    error: Option<color_eyre::eyre::Report>,
+}
+
+struct Running {
+    window: Arc<Window>,
+    gpu: Gpu,
+
+    graphs: Vec<(&'static str, Graph)>,
+    index: usize,
+    dirty: bool,
+    last_title_update: Instant,
+}
+
+impl Running {
+    fn new(event_loop: &ActiveEventLoop, validation: bool) -> Result<Self> {
+        let window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("Bundling Thingy")
+                    .with_inner_size(winit::dpi::PhysicalSize::new(1600, 1600)),
+            )?,
+        );
+
+        let gpu = pollster::block_on(Gpu::new(Some(window.clone()), validation))?;
+
+        let mut graphs = Vec::new();
+        for input in INPUTS {
+            let mut graph = Graph::load(input.as_ref())?;
+            graph.normalize()?;
+            graph.resample(0.02)?;
+
+            graphs.push((input, graph));
+        }
+
+        window.request_redraw();
+
+        Ok(Self {
+            window,
+            gpu,
+            graphs,
+            index: 0,
+            dirty: true,
+            last_title_update: Instant::now(),
+        })
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let (name, graph) = self
+            .graphs
+            .get(self.index)
+            .ok_or_eyre("invalid graph selection")?;
+        let update_title = self.dirty || self.last_title_update.elapsed() >= Duration::from_secs(1);
+
+        if self.dirty {
+            self.gpu.upload(&graph.mesh(0.002)?)?;
+
+            self.dirty = false;
+        }
+
+        self.gpu.present(&self.window)?;
+        if update_title {
+            // Measure the redraw itself, excluding time spent waiting for events.
+            self.window.set_title(&format!(
+                "Bundling Thingy - {name} ({:.2}ms)",
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+            self.last_title_update = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn handle_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> Result<()> {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match event.logical_key {
+                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Named(NamedKey::ArrowRight | NamedKey::Space) => {
+                        self.index = self
+                            .index
+                            .checked_add(1)
+                            .and_then(|i| i.checked_rem(self.graphs.len()))
+                            .ok_or_eyre("invalid graph selection")?;
+                        self.dirty = true;
+                    }
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        self.index = if self.index == 0 {
+                            self.graphs.len().checked_sub(1).ok_or_eyre("no graphs")?
+                        } else {
+                            self.index.saturating_sub(1)
+                        };
+                        self.dirty = true;
+                    }
+                    _ => {}
+                }
+                if self.dirty {
+                    self.window.request_redraw();
+                }
+            }
+            WindowEvent::Resized(size) => {
+                self.gpu.resize(size.width, size.height);
+                if size.width > 0 && size.height > 0 {
+                    self.window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let size = self.window.inner_size();
+                if size.width == 0 || size.height == 0 {
+                    return Ok(());
+                }
+                self.draw()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.running.is_some() {
+            return;
+        }
+
+        match Running::new(event_loop, self.opts.validate_gpu) {
+            Ok(running) => self.running = Some(running),
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let Some(running) = &mut self.running else {
+            return;
+        };
+
+        if let Err(e) = running.handle_event(event_loop, event) {
+            self.error = Some(e);
+            event_loop.exit();
+        }
+    }
+}
+
+pub fn run(opts: Options) -> Result<()> {
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = App {
+        opts,
+        running: None,
+        error: None,
+    };
+
+    event_loop.run_app(&mut app)?;
+
+    if let Some(e) = app.error {
+        return Err(e);
+    }
+    Ok(())
+}

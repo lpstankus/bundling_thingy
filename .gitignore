@@ -1,2 +1,8 @@
 *.bin
 out/
+
+
+benchmarks/loading/**/target/
+benchmarks/loading/**/__pycache__/
+
+/target/

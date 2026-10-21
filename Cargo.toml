@@ -1,0 +1,44 @@
+[package]
+name = "bundling-wgpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+color-eyre = "0.6"
+bytemuck = "1.25"
+pollster = "0.4"
+wgpu = { version = "27.0", default-features = false, features = ["std", "wgsl"] }
+winit = "0.30"
+png = "0.18"
+glam = { version = "0.34", features = ["bytemuck", "std"], default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "27.0", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "27.0", default-features = false, features = ["dx12"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "27.0", default-features = false, features = ["metal"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"
