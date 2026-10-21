@@ -21,12 +21,12 @@ const INPUTS: [&str; 5] = [
 ];
 struct App {
     opts: Options,
-    ready: Option<Ready>,
+    running: Option<Running>,
 
     error: Option<color_eyre::eyre::Report>,
 }
 
-struct Ready {
+struct Running {
     window: Arc<Window>,
     gpu: Gpu,
 
@@ -36,7 +36,7 @@ struct Ready {
     last_title_update: Instant,
 }
 
-impl Ready {
+impl Running {
     fn new(event_loop: &ActiveEventLoop, validation: bool) -> Result<Self> {
         let window = Arc::new(
             event_loop.create_window(
@@ -144,12 +144,12 @@ impl Ready {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.ready.is_some() {
+        if self.running.is_some() {
             return;
         }
 
-        match Ready::new(event_loop, self.opts.validate_gpu) {
-            Ok(ready) => self.ready = Some(ready),
+        match Running::new(event_loop, self.opts.validate_gpu) {
+            Ok(running) => self.running = Some(running),
             Err(e) => {
                 self.error = Some(e);
                 event_loop.exit();
@@ -158,11 +158,11 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        let Some(ready) = &mut self.ready else {
+        let Some(running) = &mut self.running else {
             return;
         };
 
-        if let Err(e) = ready.handle_event(event_loop, event) {
+        if let Err(e) = running.handle_event(event_loop, event) {
             self.error = Some(e);
             event_loop.exit();
         }
@@ -175,7 +175,7 @@ pub fn run(opts: Options) -> Result<()> {
 
     let mut app = App {
         opts,
-        ready: None,
+        running: None,
         error: None,
     };
 

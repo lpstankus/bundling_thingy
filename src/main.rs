@@ -25,10 +25,6 @@ pub struct Options {
     #[arg(long, requires = "headless")]
     resample: bool,
 
-    /// Enable GPU debugging and validation.
-    #[arg(long)]
-    validate_gpu: bool,
-
     /// TRL input for headless rendering.
     #[arg(long, default_value = "data/fr-airlines.trl", requires = "headless")]
     input: PathBuf,
@@ -36,6 +32,21 @@ pub struct Options {
     /// Output directory for headless rendering.
     #[arg(long, default_value = "out/rust", requires = "headless")]
     out: PathBuf,
+
+    /// Enable GPU debugging and validation.
+    #[arg(long)]
+    validate_gpu: bool,
+}
+
+fn main() -> Result<()> {
+    color_eyre::install()?;
+    let opts = Options::parse();
+
+    if opts.headless {
+        headless(&opts)
+    } else {
+        window::run(opts)
+    }
 }
 
 fn headless(opts: &Options) -> Result<()> {
@@ -76,15 +87,4 @@ fn headless(opts: &Options) -> Result<()> {
 
     println!("wrote {} with {} vertices", path.display(), mesh.len());
     Ok(())
-}
-
-fn main() -> Result<()> {
-    color_eyre::install()?;
-    let opts = Options::parse();
-
-    if opts.headless {
-        headless(&opts)
-    } else {
-        window::run(opts)
-    }
 }
