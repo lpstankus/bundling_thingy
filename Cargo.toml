@@ -11,6 +11,7 @@ pollster = "0.4"
 wgpu = { version = "27.0", default-features = false, features = ["std", "vulkan", "wgsl"] }
 winit = "0.30"
 png = "0.18"
+glam = { version = "0.34", features = ["bytemuck", "std"], default-features = false }
 
 [profile.release]
 lto = "thin"
