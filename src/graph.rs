@@ -90,10 +90,6 @@ impl Graph {
         Ok(())
     }
 
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "windows(2) yields exactly two entries"
-    )]
     pub fn resample(&mut self, spacing: f32) -> Result<()> {
         ensure!(
             spacing > 0.0 && spacing.is_finite(),
@@ -103,10 +99,10 @@ impl Graph {
         let mut points = Vec::new();
         let mut starts = Vec::new();
 
-        for bounds in self.starts.windows(2) {
+        for &[start, end] in self.starts.array_windows::<2>() {
             let edge = self
                 .points
-                .get(bounds[0]..bounds[1])
+                .get(start..end)
                 .ok_or_eyre("invalid edge bounds")?;
 
             starts.push(points.len());
@@ -160,22 +156,17 @@ impl Graph {
         Ok(())
     }
 
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "windows(2) yields exactly two entries"
-    )]
     pub fn mesh(&self, width: f32) -> Result<Vec<Point>> {
         let mut mesh = Vec::with_capacity(self.points.len().saturating_sub(1).saturating_mul(2));
         let half = width / 2.0;
 
-        for bounds in self.starts.windows(2) {
-            for segment in self
+        for &[start, end] in self.starts.array_windows::<2>() {
+            for &[first, second] in self
                 .points
-                .get(bounds[0]..bounds[1])
+                .get(start..end)
                 .ok_or_eyre("invalid edge bounds")?
-                .windows(2)
+                .array_windows::<2>()
             {
-                let (first, second) = (segment[0], segment[1]);
                 let dir = second - first;
                 let len = dir.length();
                 if len == 0.0 {

@@ -22,7 +22,7 @@ pub struct Options {
     headless: bool,
 
     /// Resample paths before headless rendering.
-    #[arg(long)]
+    #[arg(long, requires = "headless")]
     resample: bool,
 
     /// Enable GPU debugging and validation.
@@ -30,11 +30,11 @@ pub struct Options {
     validate_gpu: bool,
 
     /// TRL input for headless rendering.
-    #[arg(long, default_value = "data/fr-airlines.trl")]
+    #[arg(long, default_value = "data/fr-airlines.trl", requires = "headless")]
     input: PathBuf,
 
     /// Output directory for headless rendering.
-    #[arg(long, default_value = "out/rust")]
+    #[arg(long, default_value = "out/rust", requires = "headless")]
     out: PathBuf,
 }
 

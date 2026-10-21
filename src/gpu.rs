@@ -34,7 +34,6 @@ pub struct Gpu {
 impl Gpu {
     pub async fn new(window: Option<Arc<Window>>, validation: bool) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
             flags: if validation {
                 wgpu::InstanceFlags::debugging()
             } else {
@@ -108,7 +107,7 @@ impl Gpu {
 
         let vertices = buffer(
             "vertices",
-            8,
+            1024,
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
 
