@@ -22,9 +22,9 @@ pub struct Options {
     #[arg(long)]
     headless: bool,
 
-    /// Resample paths before headless rendering.
-    #[arg(long, requires = "headless")]
-    resample: bool,
+    /// Accepted for compatibility; headless exports always resample.
+    #[arg(long = "resample", requires = "headless", hide = true)]
+    _resample: bool,
 
     /// TRL input for headless rendering.
     #[arg(long, default_value = "data/fr-airlines.trl", requires = "headless")]
@@ -58,17 +58,9 @@ fn headless(opts: &Options) -> Result<()> {
 
     let mut graph = Graph::load(&opts.input)?;
     graph.normalize()?;
-    if opts.resample {
-        graph.resample(0.02)?;
-    }
-
-    let mesh = graph.mesh(0.002)?;
-    if mesh.is_empty() {
-        println!("Skipping empty mesh: original");
-        return Ok(());
-    }
-
-    gpu.upload(&mesh, &graph)?;
+    let [width, height] = gpu.dimensions();
+    let graph = graph.resample(width, height)?;
+    gpu.upload(&graph)?;
     gpu.render()?;
     let pixels = gpu.readback()?;
 
@@ -86,6 +78,10 @@ fn headless(opts: &Options) -> Result<()> {
         .and_then(|()| writer.finish())
         .wrap_err_with(|| format!("write {}", path.display()))?;
 
-    println!("wrote {} with {} vertices", path.display(), mesh.len());
+    println!(
+        "wrote {} with {} samples",
+        path.display(),
+        graph.points().len()
+    );
     Ok(())
 }

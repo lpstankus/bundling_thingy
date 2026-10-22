@@ -1,7 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use super::{Density, DensityInput};
-use crate::graph::{Graph, Point};
+use crate::graph::{Graph, Point, ResampledGraph};
 use color_eyre::eyre::{Result, ensure};
 use std::{fmt::Write, sync::mpsc, time::Duration};
 
@@ -48,7 +48,11 @@ fn gpu_density_matches_direct_gaussian_convolution() -> Result<()> {
         points.extend(std::iter::repeat_n(point, usize::from(copies)));
         expected_counts[cell_y * width + cell_x] += 2 * u32::from(copies);
     }
-    let input = DensityInput::new(&device, &short_edges(&points)?)?;
+    let sampled = short_edges(&points)?;
+    let mut input = DensityInput::new(&device, &sampled)?;
+    verify(&device, &queue, &density, Some(&input), &expected_counts)?;
+    // Exercise the two dimensional dispatch used by large point buffers.
+    input.workgroups = [2, u32::try_from(sampled.points().len())?.div_ceil(512)];
     verify(&device, &queue, &density, Some(&input), &expected_counts)?;
 
     // Reusing the map must clear both counts and the previous, larger maximum.
@@ -62,19 +66,19 @@ fn gpu_density_matches_direct_gaussian_convolution() -> Result<()> {
     verify_renderable_edges(&device, &queue)
 }
 
-fn short_edges(points: &[Point]) -> Result<Graph> {
-    let mut graph = Graph::parse("0: 0 0")?;
-    graph.points.clear();
-    graph.starts.clear();
-    // Both endpoint samples land in the same cell, but the segment is renderable.
-    for &point in points {
-        graph.starts.push(graph.points.len());
-        graph
-            .points
-            .extend([point, point + Point::new(0.0001, 0.0)]);
+fn short_edges(points: &[Point]) -> Result<ResampledGraph> {
+    let mut text = String::new();
+    for (index, &point) in points.iter().enumerate() {
+        writeln!(
+            text,
+            "{index}: {} {} {} {}",
+            point.x,
+            point.y,
+            point.x + 0.0001,
+            point.y
+        )?;
     }
-    graph.starts.push(graph.points.len());
-    Ok(graph)
+    Graph::parse(&text)?.resample(WIDTH, HEIGHT)
 }
 
 fn verify_renderable_edges(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
@@ -84,27 +88,17 @@ fn verify_renderable_edges(device: &wgpu::Device, queue: &wgpu::Queue) -> Result
         writeln!(text, "{}: 0 0.75", index * 2 + 1)?;
         writeln!(text, "{}: 0 0.75 0 0.75 0 0.75", index * 2 + 2)?;
     }
-    let graph = Graph::parse(&text)?;
+    let sampled = Graph::parse(&text)?.resample(33, 33)?;
     ensure!(
-        graph.mesh(0.002)?.len() == 6,
-        "expected one rendered segment"
+        sampled.points().len() == 33,
+        "degenerate edges survived graph construction"
     );
-    let input = DensityInput::new(device, &graph)?;
+    let input = DensityInput::new(device, &sampled)?;
     let mut expected = vec![0_u32; 33 * 33];
     expected[28 * 33..29 * 33].fill(1);
     verify(device, queue, &density, Some(&input), &expected)?;
-
     expected.fill(0);
-    for text in ["0: 0 0", "0: 0 0 0 0 0 0"] {
-        let graph = Graph::parse(text)?;
-        ensure!(
-            graph.mesh(0.002)?.is_empty(),
-            "expected no rendered segments"
-        );
-        let input = DensityInput::new(device, &graph)?;
-        verify(device, queue, &density, Some(&input), &expected)?;
-    }
-    Ok(())
+    verify(device, queue, &density, None, &expected)
 }
 
 fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
@@ -115,23 +109,27 @@ fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         "0: -1 0 -1 0 1 0 1 0",
     ] {
         let graph = Graph::parse(text)?;
-        let input = DensityInput::new(device, &graph)?;
-        // Reuse the uploaded geometry at different render dimensions.
+        // Rebuild samples for each render resolution.
         for (width, height) in [(29, 23), (57, 45), (1, 23), (29, 1), (1, 1)] {
             let density = Density::new(device, width, height)?;
+            let input = DensityInput::new(device, &graph.resample(width, height)?)?;
             let width = usize::try_from(width)?;
             let height = usize::try_from(height)?;
             let mut expected = vec![0_u32; width * height];
-            expected[height / 2 * width..(height / 2 + 1) * width].fill(1);
+            expected[height / 2 * width..(height / 2 + 1) * width].fill(if width == 1 {
+                2
+            } else {
+                1
+            });
             verify(device, queue, &density, Some(&input), &expected)?;
         }
     }
 
     // A 3:4:5 diagonal has an exact integer length, with no rounding ties.
     let graph = Graph::parse("0: -1 -1 1 1")?;
-    let input = DensityInput::new(device, &graph)?;
     for (width, height, length) in [(25, 33, 40), (49, 65, 80)] {
         let density = Density::new(device, width, height)?;
+        let input = DensityInput::new(device, &graph.resample(width, height)?)?;
         let width = usize::try_from(width)?;
         let height = usize::try_from(height)?;
         let mut expected = vec![0_u32; width * height];
@@ -147,10 +145,9 @@ fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     for (text, ranges) in [
         ("0: -1 0 -0.5 0\n1: 0.5 0 1 0", vec![(0, 8), (24, 32)]),
         ("0: -0.734375 0 0.734375 0", vec![(4, 28)]),
-        ("0: 0 0 0 0 0 0", vec![]),
     ] {
         let graph = Graph::parse(text)?;
-        let input = DensityInput::new(device, &graph)?;
+        let input = DensityInput::new(device, &graph.resample(33, 17)?)?;
         let mut expected = vec![0_u32; 33 * 17];
         for (start, end) in ranges {
             for x in start..=end {
@@ -162,6 +159,14 @@ fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     ensure!(
         Density::new(device, 0, 17).is_err(),
         "accepted a zero-width map"
+    );
+    let sampled = Graph::parse("0: -1 0 1 0")?.resample(33, 17)?;
+    let input = DensityInput::new(device, &sampled)?;
+    let resized = Density::new(device, 34, 17)?;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    ensure!(
+        resized.encode(device, &mut encoder, Some(&input)).is_err(),
+        "accepted samples from another render resolution"
     );
     Ok(())
 }
@@ -186,7 +191,7 @@ fn verify(
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    density.encode(device, &mut encoder, input);
+    density.encode(device, &mut encoder, input)?;
     encoder.copy_buffer_to_buffer(&density.counts, 0, &download, 0, count_bytes);
     encoder.copy_texture_to_buffer(
         density.texture.as_image_copy(),

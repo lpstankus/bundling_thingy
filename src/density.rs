@@ -1,4 +1,4 @@
-use crate::graph::Graph;
+use crate::graph::ResampledGraph;
 use color_eyre::eyre::{Result, ensure};
 use wgpu::util::DeviceExt;
 
@@ -15,8 +15,8 @@ pub struct Density {
 
 pub struct DensityInput {
     points: wgpu::Buffer,
-    starts: wgpu::Buffer,
-    workgroups: u32,
+    dimensions: [u32; 2],
+    workgroups: [u32; 2],
 }
 
 struct Stage {
@@ -78,7 +78,7 @@ impl Density {
             label: Some("density"),
             source: wgpu::ShaderSource::Wgsl(include_str!("density.wgsl").into()),
         });
-        let count_pipeline = pipeline(device, &shader, "count_edges", size);
+        let count_pipeline = pipeline(device, &shader, "count_points", size);
         let stages = [
             Stage::new(
                 device,
@@ -121,62 +121,63 @@ impl Density {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         input: Option<&DensityInput>,
-    ) {
+    ) -> Result<()> {
+        let size = self.texture.size();
+        if let Some(input) = input {
+            ensure!(
+                input.dimensions == [size.width, size.height],
+                "resampled graph dimensions differ from density map"
+            );
+        }
         encoder.clear_buffer(&self.counts, 0, None);
         encoder.clear_buffer(&self.maximum, 0, None);
-        if let Some(input) = input
-            && input.workgroups > 0
-        {
+        if let Some(input) = input {
             let stage = Stage::new(
                 device,
                 self.count_pipeline.clone(),
                 &[
                     buffer_entry(0, &input.points),
                     buffer_entry(1, &self.counts),
-                    buffer_entry(6, &input.starts),
                 ],
             );
-            stage.encode(encoder, input.workgroups, 1);
+            let [x, y] = input.workgroups;
+            stage.encode(encoder, x, y);
         }
 
-        let size = self.texture.size();
         for stage in &self.stages {
             stage.encode(encoder, size.width.div_ceil(16), size.height.div_ceil(16));
         }
+        Ok(())
     }
 }
 
 impl DensityInput {
-    pub fn new(device: &wgpu::Device, graph: &Graph) -> Result<Self> {
-        let edge_count = u32::try_from(graph.starts.len().saturating_sub(1))?;
-        let workgroups = edge_count.div_ceil(256);
+    pub fn new(device: &wgpu::Device, graph: &ResampledGraph) -> Result<Self> {
+        let count = u32::try_from(graph.points().len())?;
+        let groups = count.div_ceil(256);
+        let limit = device.limits().max_compute_workgroups_per_dimension;
+        let x = groups.min(limit);
+        let y = groups.div_ceil(x);
+        ensure!(y <= limit, "density samples exceed GPU dispatch limit");
+        let contents = bytemuck::cast_slice(graph.points());
         ensure!(
-            workgroups <= device.limits().max_compute_workgroups_per_dimension,
-            "density edges exceed GPU dispatch limit"
+            u64::try_from(contents.len())?
+                <= u64::from(device.limits().max_storage_buffer_binding_size),
+            "resampled points exceed GPU storage buffer limit"
         );
-        let mut starts = Vec::with_capacity(graph.starts.len());
-        for &start in &graph.starts {
-            starts.push(u32::try_from(start)?);
-        }
-        let upload = |label, contents: &[u8]| -> Result<wgpu::Buffer> {
-            ensure!(
-                u64::try_from(contents.len())?
-                    <= u64::from(device.limits().max_storage_buffer_binding_size),
-                "density input exceeds GPU storage buffer limit"
-            );
-            Ok(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents,
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
-            )
-        };
         Ok(Self {
-            points: upload("density input points", bytemuck::cast_slice(&graph.points))?,
-            starts: upload("density edge starts", bytemuck::cast_slice(&starts))?,
-            workgroups,
+            points: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resampled graph points"),
+                contents,
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+            dimensions: graph.dimensions(),
+            workgroups: [x, y],
         })
+    }
+
+    pub const fn points(&self) -> &wgpu::Buffer {
+        &self.points
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::{
     density::{Density, DensityInput},
-    graph::{Graph, Point},
+    graph::ResampledGraph,
 };
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use std::{
@@ -10,6 +10,7 @@ use std::{
 use wgpu::{
     SurfaceError::{Lost, Outdated, Timeout},
     TextureFormat::{Bgra8Unorm, Rgb10a2Unorm, Rgba8Unorm},
+    util::DeviceExt,
 };
 use winit::window::Window;
 
@@ -22,17 +23,19 @@ pub struct Gpu {
 
     pipeline: wgpu::RenderPipeline,
     density: Density,
-    density_input: Option<DensityInput>,
     density_binding: wgpu::BindGroup,
-
-    vertices: wgpu::Buffer,
-    vertex_count: u32,
+    graph: Option<UploadedGraph>,
 
     target: wgpu::Texture,
     msaa: wgpu::TextureView,
     download: wgpu::Buffer,
 
     surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
+}
+
+struct UploadedGraph {
+    bindings: wgpu::BindGroup,
+    segment_count: u32,
 }
 
 impl Gpu {
@@ -65,9 +68,15 @@ impl Gpu {
             "software GPU is not permitted"
         );
 
+        let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Bundling Thingy"),
+                required_limits: wgpu::Limits {
+                    max_buffer_size: limits.max_buffer_size,
+                    max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await?;
@@ -110,12 +119,6 @@ impl Gpu {
             })
         };
 
-        let vertices = buffer(
-            "vertices",
-            1024,
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        );
-
         let download = buffer(
             "pixels",
             u64::from(SIZE * SIZE * 4),
@@ -127,10 +130,8 @@ impl Gpu {
             queue,
             pipeline,
             density,
-            density_input: None,
             density_binding,
-            vertices,
-            vertex_count: 0,
+            graph: None,
             target,
             msaa,
             download,
@@ -151,11 +152,7 @@ impl Gpu {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 8,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
-                }],
+                buffers: &[],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -248,38 +245,48 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn upload(&mut self, mesh: &[Point], graph: &Graph) -> Result<()> {
-        self.vertex_count = u32::try_from(mesh.len())?;
+    pub fn dimensions(&self) -> [u32; 2] {
+        [self.density.texture.width(), self.density.texture.height()]
+    }
 
-        let bytes = bytemuck::cast_slice(mesh);
-
-        let byte_count = u64::try_from(bytes.len())?;
+    pub fn upload(&mut self, graph: &ResampledGraph) -> Result<()> {
         ensure!(
-            byte_count <= self.device.limits().max_buffer_size,
-            "mesh exceeds GPU buffer limit"
+            graph.dimensions() == self.dimensions(),
+            "resampled graph dimensions differ from render target"
         );
-
-        if byte_count > self.vertices.size() {
-            self.vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("vertices"),
-                size: byte_count,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
+        let segment_count = u32::try_from(graph.segments().len())?;
+        let input = DensityInput::new(&self.device, graph)?;
+        let segments = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resampled graph segments"),
+                contents: bytemuck::cast_slice(graph.segments()),
+                usage: wgpu::BufferUsages::STORAGE,
             });
-        }
-
-        if !mesh.is_empty() {
-            self.queue.write_buffer(&self.vertices, 0, bytes);
-        }
-
+        let bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resampled graph rendering"),
+            layout: &self.pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.points().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: segments.as_entire_binding(),
+                },
+            ],
+        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let input = DensityInput::new(&self.device, graph)?;
         self.density
-            .encode(&self.device, &mut encoder, Some(&input));
+            .encode(&self.device, &mut encoder, Some(&input))?;
         self.queue.submit([encoder.finish()]);
-        self.density_input = Some(input);
+        self.graph = Some(UploadedGraph {
+            bindings,
+            segment_count,
+        });
         self.wait()
     }
 
@@ -308,10 +315,12 @@ impl Gpu {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.density_binding, &[]);
-            pass.set_vertex_buffer(0, self.vertices.slice(..));
-            pass.draw(0..self.vertex_count, 0..1);
+            if let Some(graph) = &self.graph {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.density_binding, &[]);
+                pass.set_bind_group(1, &graph.bindings, &[]);
+                pass.draw(0..6, 0..graph.segment_count);
+            }
         }
 
         encoder.finish()
@@ -373,13 +382,9 @@ impl Gpu {
             }
             let density = Density::new(&self.device, width, height)?;
             let binding = Self::density_binding(&self.device, &self.pipeline, &density.texture);
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            density.encode(&self.device, &mut encoder, self.density_input.as_ref());
-            self.queue.submit([encoder.finish()]);
             self.density = density;
             self.density_binding = binding;
+            self.graph = None;
 
             config.width = width;
             config.height = height;

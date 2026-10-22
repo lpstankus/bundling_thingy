@@ -5,8 +5,14 @@ struct VertexOutput {
 
 @group(0) @binding(0) var density: texture_2d<f32>;
 @group(0) @binding(1) var density_sampler: sampler;
+@group(1) @binding(0) var<storage, read> points: array<vec2<f32>>;
+@group(1) @binding(1) var<storage, read> segments: array<u32>;
 
 const PATH_OPACITY: f32 = 0.1;
+const CORNERS = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 1.0), vec2<f32>(0.0, -1.0), vec2<f32>(1.0, 1.0),
+    vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, -1.0),
+);
 
 // Sixteen evenly spaced samples of Matplotlib's cividis colormap.
 // Nuñez, Anderton, and Renslow, https://doi.org/10.1371/journal.pone.0199239
@@ -30,7 +36,14 @@ const CIVIDIS = array<vec3<f32>, 16>(
 );
 
 @vertex
-fn vs_main(@location(0) position: vec2<f32>) -> VertexOutput {
+fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> VertexOutput {
+    let index = segments[instance];
+    let first = points[index];
+    let second = points[index + 1u];
+    let direction = normalize(second - first);
+    let normal = vec2<f32>(-direction.y, direction.x) * 0.001;
+    let corner = CORNERS[vertex];
+    let position = mix(first, second, corner.x) + normal * corner.y;
     var out: VertexOutput;
     out.position = vec4<f32>(position, 0.0, 1.0);
     out.uv = vec2<f32>(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);

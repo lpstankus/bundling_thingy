@@ -1,8 +1,6 @@
 override map_width: u32;
 override map_height: u32;
 
-const SAMPLE_SPACING: f32 = 1.0; // Density samples are one texel apart at every resolution.
-
 // Normalized Gaussian, sigma = 6 texels, truncated at radius 18.
 const GAUSSIAN = array<f32, 19>(
     0.0666251319, 0.0657061792, 0.0630246744, 0.0587964725, 0.0533492351,
@@ -17,7 +15,6 @@ const GAUSSIAN = array<f32, 19>(
 @group(0) @binding(3) var<storage, read_write> blurred: array<f32>;
 @group(0) @binding(4) var<storage, read_write> maximum: atomic<u32>;
 @group(0) @binding(5) var density: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(6) var<storage, read> starts: array<u32>;
 
 var<workgroup> local_maximum: array<f32, 256>;
 
@@ -33,44 +30,15 @@ fn count_sample(position: vec2<f32>) {
 }
 
 @compute @workgroup_size(256)
-fn count_edges(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x + 1u >= arrayLength(&starts) {
+fn count_points(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = id.y * groups.x * 256u + id.x;
+    if index >= arrayLength(&points) {
         return;
     }
-    let start = starts[id.x];
-    let end = starts[id.x + 1u];
-    if start >= end {
-        return;
-    }
-
-    // Match Graph::mesh: an edge needs at least one nonzero segment to render.
-    var first_segment = start + 1u;
-    while first_segment < end && length(points[first_segment] - points[first_segment - 1u]) == 0.0 {
-        first_segment += 1u;
-    }
-    if first_segment >= end {
-        return;
-    }
-
-    // Keep sampling phase across segment boundaries and restart at each edge.
-    var previous = grid_position(points[first_segment - 1u]);
-    var remaining = SAMPLE_SPACING;
-    count_sample(previous);
-    for (var index = first_segment; index < end; index += 1u) {
-        let current = grid_position(points[index]);
-        let delta = current - previous;
-        let distance = length(delta);
-        var along = remaining;
-        while along <= distance {
-            count_sample(previous + delta * (along / distance));
-            along += SAMPLE_SPACING;
-        }
-        remaining = along - distance;
-        previous = current;
-    }
-    if remaining < SAMPLE_SPACING {
-        count_sample(previous);
-    }
+    count_sample(grid_position(points[index]));
 }
 
 @compute @workgroup_size(16, 16)

@@ -31,3 +31,6 @@ jobs:
 
       - name: Validate Clippy
         run: cargo clippy --locked -- -D warnings
+
+      - name: Test graph construction and resampling
+        run: cargo test --locked

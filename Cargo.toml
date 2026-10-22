@@ -11,7 +11,7 @@ pollster = "0.4"
 wgpu = { version = "27.0", default-features = false, features = ["std", "wgsl"] }
 winit = "0.30"
 png = "0.18"
-glam = { version = "0.34", features = ["bytemuck", "std"], default-features = false }
+glam = { version = "0.34", features = ["bytemuck", "std", "f64"], default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { version = "27.0", default-features = false, features = ["vulkan"] }
