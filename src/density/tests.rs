@@ -3,7 +3,7 @@
 use super::{Density, DensityInput};
 use crate::graph::{Graph, Point};
 use color_eyre::eyre::{Result, ensure};
-use std::{sync::mpsc, time::Duration};
+use std::{fmt::Write, sync::mpsc, time::Duration};
 
 const WIDTH: u32 = 29;
 const HEIGHT: u32 = 23;
@@ -46,26 +46,65 @@ fn gpu_density_matches_direct_gaussian_convolution() -> Result<()> {
     ] {
         let point = Point::new((x / 28.0).mul_add(2.0, -1.0), (y / 22.0).mul_add(-2.0, 1.0));
         points.extend(std::iter::repeat_n(point, usize::from(copies)));
-        expected_counts[cell_y * width + cell_x] += u32::from(copies);
+        expected_counts[cell_y * width + cell_x] += 2 * u32::from(copies);
     }
-    let input = DensityInput::new(&device, &singletons(&points)?)?;
+    let input = DensityInput::new(&device, &short_edges(&points)?)?;
     verify(&device, &queue, &density, Some(&input), &expected_counts)?;
 
     // Reusing the map must clear both counts and the previous, larger maximum.
     expected_counts.fill(0);
-    expected_counts[11 * width + 14] = 1;
-    let input = DensityInput::new(&device, &singletons(&[Point::ZERO])?)?;
+    expected_counts[11 * width + 14] = 2;
+    let input = DensityInput::new(&device, &short_edges(&[Point::ZERO])?)?;
     verify(&device, &queue, &density, Some(&input), &expected_counts)?;
     expected_counts.fill(0);
     verify(&device, &queue, &density, None, &expected_counts)?;
-    verify_spacing(&device, &queue)
+    verify_spacing(&device, &queue)?;
+    verify_renderable_edges(&device, &queue)
 }
 
-fn singletons(points: &[Point]) -> Result<Graph> {
+fn short_edges(points: &[Point]) -> Result<Graph> {
     let mut graph = Graph::parse("0: 0 0")?;
-    graph.points = points.to_vec();
-    graph.starts = (0..=points.len()).collect();
+    graph.points.clear();
+    graph.starts.clear();
+    // Both endpoint samples land in the same cell, but the segment is renderable.
+    for &point in points {
+        graph.starts.push(graph.points.len());
+        graph
+            .points
+            .extend([point, point + Point::new(0.0001, 0.0)]);
+    }
+    graph.starts.push(graph.points.len());
     Ok(graph)
+}
+
+fn verify_renderable_edges(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let density = Density::new(device, 33, 33)?;
+    let mut text = String::from("0: -1 -0.75 1 -0.75\n");
+    for index in 0..513 {
+        writeln!(text, "{}: 0 0.75", index * 2 + 1)?;
+        writeln!(text, "{}: 0 0.75 0 0.75 0 0.75", index * 2 + 2)?;
+    }
+    let graph = Graph::parse(&text)?;
+    ensure!(
+        graph.mesh(0.002)?.len() == 6,
+        "expected one rendered segment"
+    );
+    let input = DensityInput::new(device, &graph)?;
+    let mut expected = vec![0_u32; 33 * 33];
+    expected[28 * 33..29 * 33].fill(1);
+    verify(device, queue, &density, Some(&input), &expected)?;
+
+    expected.fill(0);
+    for text in ["0: 0 0", "0: 0 0 0 0 0 0"] {
+        let graph = Graph::parse(text)?;
+        ensure!(
+            graph.mesh(0.002)?.is_empty(),
+            "expected no rendered segments"
+        );
+        let input = DensityInput::new(device, &graph)?;
+        verify(device, queue, &density, Some(&input), &expected)?;
+    }
+    Ok(())
 }
 
 fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
@@ -73,6 +112,7 @@ fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         "0: -1 0 1 0",
         "0: -1 0 -0.25 0 0 0 0.5 0 1 0",
         "0: -1 0 -1 0 1 0",
+        "0: -1 0 -1 0 1 0 1 0",
     ] {
         let graph = Graph::parse(text)?;
         let input = DensityInput::new(device, &graph)?;
@@ -107,7 +147,7 @@ fn verify_spacing(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     for (text, ranges) in [
         ("0: -1 0 -0.5 0\n1: 0.5 0 1 0", vec![(0, 8), (24, 32)]),
         ("0: -0.734375 0 0.734375 0", vec![(4, 28)]),
-        ("0: 0 0 0 0 0 0", vec![(16, 16)]),
+        ("0: 0 0 0 0 0 0", vec![]),
     ] {
         let graph = Graph::parse(text)?;
         let input = DensityInput::new(device, &graph)?;

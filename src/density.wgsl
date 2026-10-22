@@ -43,11 +43,20 @@ fn count_edges(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
+    // Match Graph::mesh: an edge needs at least one nonzero segment to render.
+    var first_segment = start + 1u;
+    while first_segment < end && length(points[first_segment] - points[first_segment - 1u]) == 0.0 {
+        first_segment += 1u;
+    }
+    if first_segment >= end {
+        return;
+    }
+
     // Keep sampling phase across segment boundaries and restart at each edge.
-    var previous = grid_position(points[start]);
+    var previous = grid_position(points[first_segment - 1u]);
     var remaining = SAMPLE_SPACING;
     count_sample(previous);
-    for (var index = start + 1u; index < end; index += 1u) {
+    for (var index = first_segment; index < end; index += 1u) {
         let current = grid_position(points[index]);
         let delta = current - previous;
         let distance = length(delta);
