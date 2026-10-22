@@ -1,4 +1,7 @@
-use crate::graph::Point;
+use crate::{
+    density::{Density, DensityInput},
+    graph::{Graph, Point},
+};
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use std::{
     sync::{Arc, mpsc},
@@ -7,7 +10,6 @@ use std::{
 use wgpu::{
     SurfaceError::{Lost, Outdated, Timeout},
     TextureFormat::{Bgra8Unorm, Rgb10a2Unorm, Rgba8Unorm},
-    util::DeviceExt,
 };
 use winit::window::Window;
 
@@ -19,7 +21,9 @@ pub struct Gpu {
     queue: wgpu::Queue,
 
     pipeline: wgpu::RenderPipeline,
-    color: wgpu::BindGroup,
+    density: Density,
+    density_input: Option<DensityInput>,
+    density_binding: wgpu::BindGroup,
 
     vertices: wgpu::Buffer,
     vertex_count: u32,
@@ -86,13 +90,14 @@ impl Gpu {
         };
 
         let format = config.as_ref().map_or(FORMAT, |c| c.format);
-
-        let (pipeline, color) = Self::pipeline(&device, format);
-
-        let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
         let (width, height) = config
             .as_ref()
             .map_or((SIZE, SIZE), |c| (c.width, c.height));
+        let density = Density::new(&device, width, height)?;
+        let pipeline = Self::pipeline(&device, format);
+        let density_binding = Self::density_binding(&device, &pipeline, &density.texture);
+
+        let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
         let msaa = Self::texture(&device, width, height, format, 4)
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -121,7 +126,9 @@ impl Gpu {
             device,
             queue,
             pipeline,
-            color,
+            density,
+            density_input: None,
+            density_binding,
             vertices,
             vertex_count: 0,
             target,
@@ -131,16 +138,13 @@ impl Gpu {
         })
     }
 
-    fn pipeline(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-    ) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+    fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("graph"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("graph"),
             layout: None,
             vertex: wgpu::VertexState {
@@ -175,24 +179,37 @@ impl Gpu {
             }),
             multiview: None,
             cache: None,
-        });
+        })
+    }
 
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("color"),
-            contents: bytemuck::cast_slice(&[1.0_f32, 0.0, 0.0, 0.05]),
-            usage: wgpu::BufferUsages::UNIFORM,
+    fn density_binding(
+        device: &wgpu::Device,
+        pipeline: &wgpu::RenderPipeline,
+        density: &wgpu::Texture,
+    ) -> wgpu::BindGroup {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("bilinear density"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
-
-        let color = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("color"),
+        let view = density.create_view(&wgpu::TextureViewDescriptor::default());
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("density rendering"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
-
-        (pipeline, color)
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        })
     }
 
     fn texture(
@@ -231,11 +248,8 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn upload(&mut self, mesh: &[Point]) -> Result<()> {
+    pub fn upload(&mut self, mesh: &[Point], graph: &Graph) -> Result<()> {
         self.vertex_count = u32::try_from(mesh.len())?;
-        if mesh.is_empty() {
-            return Ok(());
-        }
 
         let bytes = bytemuck::cast_slice(mesh);
 
@@ -254,9 +268,18 @@ impl Gpu {
             });
         }
 
-        self.queue.write_buffer(&self.vertices, 0, bytes);
+        if !mesh.is_empty() {
+            self.queue.write_buffer(&self.vertices, 0, bytes);
+        }
 
-        self.queue.submit([]);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let input = DensityInput::new(&self.device, graph)?;
+        self.density
+            .encode(&self.device, &mut encoder, Some(&input));
+        self.queue.submit([encoder.finish()]);
+        self.density_input = Some(input);
         self.wait()
     }
 
@@ -272,7 +295,12 @@ impl Gpu {
                     depth_slice: None,
                     resolve_target: Some(view),
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.025,
+                            g: 0.025,
+                            b: 0.035,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Discard,
                     },
                 })],
@@ -281,7 +309,7 @@ impl Gpu {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.color, &[]);
+            pass.set_bind_group(0, &self.density_binding, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(0..self.vertex_count, 0..1);
         }
@@ -334,18 +362,32 @@ impl Gpu {
         Ok(result)
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         if width == 0 || height == 0 {
-            return;
+            return Ok(());
         }
 
         if let Some((surface, config)) = &mut self.surface {
+            if config.width == width && config.height == height {
+                return Ok(());
+            }
+            let density = Density::new(&self.device, width, height)?;
+            let binding = Self::density_binding(&self.device, &self.pipeline, &density.texture);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            density.encode(&self.device, &mut encoder, self.density_input.as_ref());
+            self.queue.submit([encoder.finish()]);
+            self.density = density;
+            self.density_binding = binding;
+
             config.width = width;
             config.height = height;
             surface.configure(&self.device, config);
             self.msaa = Self::texture(&self.device, width, height, config.format, 4)
                 .create_view(&wgpu::TextureViewDescriptor::default());
         }
+        Ok(())
     }
 
     pub fn present(&self, window: &Window) -> Result<()> {

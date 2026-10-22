@@ -78,7 +78,7 @@ impl Running {
         let update_title = self.dirty || self.last_title_update.elapsed() >= Duration::from_secs(1);
 
         if self.dirty {
-            self.gpu.upload(&graph.mesh(0.002)?)?;
+            self.gpu.upload(&graph.mesh(0.002)?, graph)?;
 
             self.dirty = false;
         }
@@ -124,7 +124,7 @@ impl Running {
                 }
             }
             WindowEvent::Resized(size) => {
-                self.gpu.resize(size.width, size.height);
+                self.gpu.resize(size.width, size.height)?;
                 if size.width > 0 && size.height > 0 {
                     self.window.request_redraw();
                 }

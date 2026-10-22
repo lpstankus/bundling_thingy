@@ -1,3 +1,4 @@
+mod density;
 mod gpu;
 mod graph;
 mod window;
@@ -67,7 +68,7 @@ fn headless(opts: &Options) -> Result<()> {
         return Ok(());
     }
 
-    gpu.upload(&mesh)?;
+    gpu.upload(&mesh, &graph)?;
     gpu.render()?;
     let pixels = gpu.readback()?;
 
