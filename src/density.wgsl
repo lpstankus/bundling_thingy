@@ -9,11 +9,23 @@ const GAUSSIAN = array<f32, 19>(
     0.0029273040, 0.0019031803, 0.0012034507, 0.0007401384,
 );
 
+// Resampled path positions in normalized device coordinates, shared with rendering.
 @group(0) @binding(0) var<storage, read> points: array<vec2<f32>>;
+
+// Row-major grid of sample counts, incremented atomically at the nearest texel.
 @group(0) @binding(1) var<storage, read_write> counts: array<atomic<u32>>;
+
+// Row-major density after the horizontal Gaussian pass.
 @group(0) @binding(2) var<storage, read_write> horizontal: array<f32>;
+
+// Row-major density after both Gaussian passes, before normalization.
 @group(0) @binding(3) var<storage, read_write> blurred: array<f32>;
+
+// Largest blurred density, stored as f32 bits for an integer atomic maximum.
+// Nonnegative finite f32 values retain their ordering when bitcast to u32.
 @group(0) @binding(4) var<storage, read_write> maximum: atomic<u32>;
+
+// Final density in [0, 1], stored in the red channel for fragment shader sampling.
 @group(0) @binding(5) var density: texture_storage_2d<rgba16float, write>;
 
 var<workgroup> local_maximum: array<f32, 256>;
