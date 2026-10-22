@@ -6,7 +6,7 @@ pub struct Density {
     counts: wgpu::Buffer,
     maximum: wgpu::Buffer,
     count_pipeline: wgpu::ComputePipeline,
-    stages: [Stage; 3],
+    stages: [Stage; 5],
     pub texture: wgpu::Texture,
 }
 
@@ -48,8 +48,8 @@ impl Density {
             })
         };
         let counts = buffer("density counts", bytes);
-        let horizontal = buffer("horizontal density blur", bytes);
-        let blurred = buffer("blurred density", bytes);
+        let image_a = buffer("density image A", bytes);
+        let image_b = buffer("density image B", bytes);
         let maximum = buffer("density maximum", 4);
         let size = wgpu::Extent3d {
             width,
@@ -67,34 +67,46 @@ impl Density {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("density"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("density.wgsl").into()),
-        });
-        let count_pipeline = pipeline(device, &shader, "count_points", size);
+        let build = |source, entry| pipeline(device, source, entry, size, &[]);
+        let gaussian = |axis| {
+            pipeline(
+                device,
+                include_str!("gaussian.wgsl"),
+                "blur",
+                size,
+                &[("axis", axis)],
+            )
+        };
+        let count_pipeline = build(include_str!("density.wgsl"), "count_points");
         let stages = [
             Stage::new(
                 device,
-                pipeline(device, &shader, "blur_x", size),
-                &[buffer_entry(1, &counts), buffer_entry(2, &horizontal)],
+                build(include_str!("density_resolve.wgsl"), "resolve_counts"),
+                &[buffer_entry(0, &counts), buffer_entry(1, &image_a)],
             ),
             Stage::new(
                 device,
-                pipeline(device, &shader, "blur_y", size),
-                &[
-                    buffer_entry(2, &horizontal),
-                    buffer_entry(3, &blurred),
-                    buffer_entry(4, &maximum),
-                ],
+                gaussian(0.0),
+                &[buffer_entry(0, &image_a), buffer_entry(1, &image_b)],
             ),
             Stage::new(
                 device,
-                pipeline(device, &shader, "normalize", size),
+                gaussian(1.0),
+                &[buffer_entry(0, &image_b), buffer_entry(1, &image_a)],
+            ),
+            Stage::new(
+                device,
+                build(include_str!("density_maximum.wgsl"), "find_maximum"),
+                &[buffer_entry(0, &image_a), buffer_entry(1, &maximum)],
+            ),
+            Stage::new(
+                device,
+                build(include_str!("density_normalize.wgsl"), "normalize"),
                 &[
-                    buffer_entry(3, &blurred),
-                    buffer_entry(4, &maximum),
+                    buffer_entry(0, &image_a),
+                    buffer_entry(1, &maximum),
                     wgpu::BindGroupEntry {
-                        binding: 5,
+                        binding: 2,
                         resource: wgpu::BindingResource::TextureView(&view),
                     },
                 ],
@@ -197,20 +209,27 @@ impl Stage {
 
 fn pipeline(
     device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
+    source: &str,
     entry: &str,
     size: wgpu::Extent3d,
+    constants: &[(&str, f64)],
 ) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(entry),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let mut overrides = vec![
+        ("map_width", f64::from(size.width)),
+        ("map_height", f64::from(size.height)),
+    ];
+    overrides.extend_from_slice(constants);
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(entry),
         layout: None,
-        module: shader,
+        module: &shader,
         entry_point: Some(entry),
         compilation_options: wgpu::PipelineCompilationOptions {
-            constants: &[
-                ("map_width", f64::from(size.width)),
-                ("map_height", f64::from(size.height)),
-            ],
+            constants: &overrides,
             ..Default::default()
         },
         cache: None,
