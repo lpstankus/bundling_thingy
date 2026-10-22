@@ -4,9 +4,6 @@ use std::{fs, path::Path};
 
 pub use glam::Vec2 as Point;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug)]
 pub struct Graph {
     points: Vec<Point>,

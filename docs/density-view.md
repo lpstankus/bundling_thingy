@@ -20,8 +20,4 @@ Resampling measures path length in the target texture's coordinates and places s
 
 The density map matches the output dimensions. Resizing the window rebuilds both the samples and the map; uploads reject samples built for a different size. Each compute invocation rounds one existing sample to its nearest grid cell and increments one shared counter grid atomically. Two Gaussian blur passes smooth the counts, then normalization divides the field by its blurred maximum. The fragment shader samples that texture with bilinear filtering.
 
-These crops show ten overlapping visible paths alongside 1,026 degenerate paths. Before the fix, the invisible paths raised the normalization maximum and darkened the visible paths. Excluding them restores the visible paths' peak density color. Both renders use the same blur and opacity.
-
-![Cropped visible paths before and after excluding degenerate edges from density](images/density-degenerate-edges.webp)
-
 Higher resolutions increase map memory, CPU resampling, and sample upload sizes. Buffer allocation uses the adapter's reported limits and rejects graphs that exceed them. Dense bundles can contend on the shared counters. Colors show density relative to each graph's own maximum, so they do not give an absolute comparison between graphs.

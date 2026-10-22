@@ -280,8 +280,7 @@ impl Gpu {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        self.density
-            .encode(&self.device, &mut encoder, Some(&input))?;
+        self.density.encode(&self.device, &mut encoder, &input)?;
         self.queue.submit([encoder.finish()]);
         self.graph = Some(UploadedGraph {
             bindings,

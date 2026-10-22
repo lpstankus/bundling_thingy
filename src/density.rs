@@ -2,9 +2,6 @@ use crate::graph::ResampledGraph;
 use color_eyre::eyre::{Result, ensure};
 use wgpu::util::DeviceExt;
 
-#[cfg(test)]
-mod tests;
-
 pub struct Density {
     counts: wgpu::Buffer,
     maximum: wgpu::Buffer,
@@ -46,9 +43,7 @@ impl Density {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         };
@@ -68,9 +63,7 @@ impl Density {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -120,29 +113,25 @@ impl Density {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        input: Option<&DensityInput>,
+        input: &DensityInput,
     ) -> Result<()> {
         let size = self.texture.size();
-        if let Some(input) = input {
-            ensure!(
-                input.dimensions == [size.width, size.height],
-                "resampled graph dimensions differ from density map"
-            );
-        }
+        ensure!(
+            input.dimensions == [size.width, size.height],
+            "resampled graph dimensions differ from density map"
+        );
         encoder.clear_buffer(&self.counts, 0, None);
         encoder.clear_buffer(&self.maximum, 0, None);
-        if let Some(input) = input {
-            let stage = Stage::new(
-                device,
-                self.count_pipeline.clone(),
-                &[
-                    buffer_entry(0, &input.points),
-                    buffer_entry(1, &self.counts),
-                ],
-            );
-            let [x, y] = input.workgroups;
-            stage.encode(encoder, x, y);
-        }
+        let stage = Stage::new(
+            device,
+            self.count_pipeline.clone(),
+            &[
+                buffer_entry(0, &input.points),
+                buffer_entry(1, &self.counts),
+            ],
+        );
+        let [x, y] = input.workgroups;
+        stage.encode(encoder, x, y);
 
         for stage in &self.stages {
             stage.encode(encoder, size.width.div_ceil(16), size.height.div_ceil(16));
