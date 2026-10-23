@@ -26,6 +26,9 @@ jobs:
       - name: Install Clippy
         run: rustup component add clippy
 
+      - name: Check duplicated code
+        run: mise run dupes
+
       - name: Validate types
         run: cargo check --locked
 
