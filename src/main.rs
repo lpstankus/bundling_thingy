@@ -1,12 +1,14 @@
 mod density;
 mod gpu;
 mod graph;
+mod palette;
 mod window;
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
 use graph::Graph;
+use palette::Palette;
 use std::{
     fs::{self, File},
     path::PathBuf,
@@ -34,6 +36,10 @@ pub struct Options {
     #[arg(long, default_value = "out/rust", requires = "headless")]
     out: PathBuf,
 
+    /// Color palette for normalized path density.
+    #[arg(long, value_enum, default_value_t = Palette::default())]
+    palette: Palette,
+
     /// Enable GPU debugging and validation.
     #[arg(long)]
     validate_gpu: bool,
@@ -54,7 +60,7 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
-    let mut gpu = pollster::block_on(Gpu::new(None, opts.validate_gpu))?;
+    let mut gpu = pollster::block_on(Gpu::new(None, opts.validate_gpu, opts.palette))?;
 
     let mut graph = Graph::load(&opts.input)?;
     graph.normalize()?;
