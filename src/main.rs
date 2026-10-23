@@ -2,6 +2,7 @@ mod density;
 mod gpu;
 mod graph;
 mod palette;
+mod profiling;
 mod window;
 
 use clap::Parser;
@@ -47,6 +48,7 @@ pub struct Options {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    profiling::init()?;
     let opts = Options::parse();
 
     if opts.headless {
@@ -56,6 +58,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[tracing::instrument(name = "headless", skip_all, fields(input = %opts.input.display()), err)]
 fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
@@ -71,6 +74,7 @@ fn headless(opts: &Options) -> Result<()> {
     let pixels = gpu.readback()?;
 
     let path = opts.out.join("original.png");
+    let timing = tracing::info_span!("png.write", output = %path.display()).entered();
     let mut encoder = png::Encoder::new(
         File::create(&path).wrap_err_with(|| format!("create {}", path.display()))?,
         SIZE,
@@ -83,6 +87,7 @@ fn headless(opts: &Options) -> Result<()> {
         .write_image_data(&pixels)
         .and_then(|()| writer.finish())
         .wrap_err_with(|| format!("write {}", path.display()))?;
+    drop(timing);
 
     println!(
         "wrote {} with {} samples",

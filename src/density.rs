@@ -1,6 +1,15 @@
-use crate::graph::ResampledGraph;
+use crate::{graph::ResampledGraph, profiling::GpuTimings};
 use color_eyre::eyre::{Result, ensure};
 use wgpu::util::DeviceExt;
+
+pub const TIMING_STAGES: [&str; 6] = [
+    "density.count",
+    "density.resolve",
+    "density.blur_horizontal",
+    "density.blur_vertical",
+    "density.maximum",
+    "density.normalize",
+];
 
 pub struct Density {
     counts: wgpu::Buffer,
@@ -16,12 +25,20 @@ pub struct DensityInput {
     workgroups: [u32; 2],
 }
 
+pub struct DensityEncoder<'a> {
+    device: &'a wgpu::Device,
+    commands: &'a mut wgpu::CommandEncoder,
+    timings: &'a GpuTimings,
+    next_query: u32,
+}
+
 struct Stage {
     pipeline: wgpu::ComputePipeline,
     bindings: wgpu::BindGroup,
 }
 
 impl Density {
+    #[tracing::instrument(name = "density.init", skip_all, fields(width = width, height = height), err)]
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self> {
         let limits = device.limits();
         ensure!(
@@ -107,33 +124,29 @@ impl Density {
         })
     }
 
-    pub fn encode(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        input: &DensityInput,
-    ) -> Result<()> {
+    pub fn encode(&self, mut encoder: DensityEncoder<'_>, input: &DensityInput) -> Result<()> {
         let size = self.texture.size();
         ensure!(
             input.dimensions == [size.width, size.height],
             "resampled graph dimensions differ from density map"
         );
-        encoder.clear_buffer(&self.counts, 0, None);
-        encoder.clear_buffer(&self.maximum, 0, None);
+        encoder.commands.clear_buffer(&self.counts, 0, None);
+        encoder.commands.clear_buffer(&self.maximum, 0, None);
         let stage = Stage::new(
-            device,
+            encoder.device,
             self.count_pipeline.clone(),
             &[
                 buffer_entry(0, &input.points),
                 buffer_entry(1, &self.counts),
             ],
         );
-        let [x, y] = input.workgroups;
-        stage.encode(encoder, x, y);
+        encoder.dispatch(&stage, input.workgroups);
 
+        let workgroups = [size.width.div_ceil(32), size.height.div_ceil(4)];
         for stage in &self.stages {
-            stage.encode(encoder, size.width.div_ceil(32), size.height.div_ceil(4));
+            encoder.dispatch(stage, workgroups);
         }
+        encoder.timings.resolve(encoder.commands);
         Ok(())
     }
 }
@@ -181,14 +194,33 @@ impl Stage {
         });
         Self { pipeline, bindings }
     }
+}
 
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder, x: u32, y: u32) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("density"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bindings, &[]);
+impl<'a> DensityEncoder<'a> {
+    pub const fn new(
+        device: &'a wgpu::Device,
+        commands: &'a mut wgpu::CommandEncoder,
+        timings: &'a GpuTimings,
+    ) -> Self {
+        Self {
+            device,
+            commands,
+            timings,
+            next_query: 0,
+        }
+    }
+
+    fn dispatch(&mut self, stage: &Stage, [x, y]: [u32; 2]) {
+        let timestamp_writes = self.timings.compute_pass(self.next_query);
+        self.next_query = self.next_query.saturating_add(1);
+        let mut pass = self
+            .commands
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("density"),
+                timestamp_writes,
+            });
+        pass.set_pipeline(&stage.pipeline);
+        pass.set_bind_group(0, &stage.bindings, &[]);
         pass.dispatch_workgroups(x, y, 1);
     }
 }

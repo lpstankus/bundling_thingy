@@ -1,7 +1,8 @@
 use crate::{
-    density::{Density, DensityInput},
+    density::{self, Density, DensityEncoder, DensityInput},
     graph::ResampledGraph,
     palette::Palette,
+    profiling::GpuTimings,
 };
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use std::{
@@ -26,6 +27,8 @@ pub struct Gpu {
     density: Density,
     density_binding: wgpu::BindGroup,
     palette: wgpu::Buffer,
+    density_timings: GpuTimings,
+    render_timings: GpuTimings,
     graph: Option<UploadedGraph>,
 
     target: wgpu::Texture,
@@ -41,6 +44,7 @@ struct UploadedGraph {
 }
 
 impl Gpu {
+    #[tracing::instrument(name = "gpu.init", skip_all, fields(validation = validation), err)]
     pub async fn new(
         window: Option<Arc<Window>>,
         validation: bool,
@@ -75,9 +79,11 @@ impl Gpu {
         );
 
         let limits = adapter.limits();
+        let timing_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Bundling Thingy"),
+                required_features: timing_features,
                 required_limits: wgpu::Limits {
                     max_buffer_size: limits.max_buffer_size,
                     max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
@@ -116,25 +122,19 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let density_binding = Self::density_binding(&device, &pipeline, &density.texture, &palette);
+        let density_timings = GpuTimings::new(&device, &queue, &density::TIMING_STAGES)?;
+        let render_timings = GpuTimings::new(&device, &queue, &["render.draw"])?;
 
         let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
         let msaa = Self::texture(&device, width, height, format, 4)
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let buffer = |label, size, usage| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage,
-                mapped_at_creation: false,
-            })
-        };
-
-        let download = buffer(
-            "pixels",
-            u64::from(SIZE * SIZE * 4),
-            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        );
+        let download = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pixels"),
+            size: u64::from(SIZE * SIZE * 4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         Ok(Self {
             device,
@@ -143,6 +143,8 @@ impl Gpu {
             density,
             density_binding,
             palette,
+            density_timings,
+            render_timings,
             graph: None,
             target,
             msaa,
@@ -266,7 +268,9 @@ impl Gpu {
         [self.density.texture.width(), self.density.texture.height()]
     }
 
+    #[tracing::instrument(name = "gpu.upload_and_density", skip_all, err)]
     pub fn upload(&mut self, graph: &ResampledGraph) -> Result<()> {
+        let upload_timing = tracing::info_span!("gpu.upload").entered();
         ensure!(
             graph.dimensions() == self.dimensions(),
             "resampled graph dimensions differ from render target"
@@ -294,10 +298,15 @@ impl Gpu {
                 },
             ],
         });
+        drop(upload_timing);
+
+        let _density_timing = tracing::info_span!("density.compute").entered();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        self.density.encode(&self.device, &mut encoder, &input)?;
+        let density_encoder =
+            DensityEncoder::new(&self.device, &mut encoder, &self.density_timings);
+        self.density.encode(density_encoder, &input)?;
         self.queue.submit([encoder.finish()]);
         self.graph = Some(UploadedGraph {
             bindings,
@@ -329,7 +338,7 @@ impl Gpu {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
-                timestamp_writes: None,
+                timestamp_writes: self.render_timings.render_pass(),
             });
             if let Some(graph) = &self.graph {
                 pass.set_pipeline(&self.pipeline);
@@ -339,9 +348,11 @@ impl Gpu {
             }
         }
 
+        self.render_timings.resolve(&mut encoder);
         encoder.finish()
     }
 
+    #[tracing::instrument(name = "render.offscreen", skip_all, err)]
     pub fn render(&self) -> Result<()> {
         let view = self
             .target
@@ -351,6 +362,7 @@ impl Gpu {
         self.wait()
     }
 
+    #[tracing::instrument(name = "pixels.readback", skip_all, err)]
     pub fn readback(&self) -> Result<Vec<u8>> {
         let mut encoder = self
             .device
@@ -396,6 +408,7 @@ impl Gpu {
             if config.width == width && config.height == height {
                 return Ok(());
             }
+            let _timing = tracing::info_span!("gpu.resize", width, height).entered();
             let density = Density::new(&self.device, width, height)?;
             let binding = Self::density_binding(
                 &self.device,
@@ -416,6 +429,7 @@ impl Gpu {
         Ok(())
     }
 
+    #[tracing::instrument(name = "render.present", skip_all, err)]
     pub fn present(&self, window: &Window) -> Result<()> {
         let (surface, config) = self.surface.as_ref().ok_or_eyre("no window surface")?;
 
