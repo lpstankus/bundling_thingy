@@ -1,14 +1,23 @@
-use color_eyre::eyre::{OptionExt, Result, WrapErr, bail, ensure};
+use color_eyre::eyre::{OptionExt, Result, WrapErr, ensure};
+use glam::DVec2;
 use std::{fs, path::Path};
 
 pub use glam::Vec2 as Point;
+
 #[derive(Debug)]
 pub struct Graph {
-    pub points: Vec<Point>,
-    pub starts: Vec<usize>,
-
+    points: Vec<Point>,
+    starts: Vec<usize>,
     min: Point,
     max: Point,
+}
+
+/// Only `Graph::resample` can construct the geometry accepted by GPU uploads.
+#[derive(Debug)]
+pub struct ResampledGraph {
+    points: Vec<Point>,
+    segments: Vec<u32>,
+    dimensions: [u32; 2],
 }
 
 impl Graph {
@@ -17,7 +26,7 @@ impl Graph {
             &fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?,
         )?;
         println!(
-            "Read {}: {} edges, {} control points",
+            "Read {}: {} drawable edges, {} control points",
             path.display(),
             graph.starts.len().saturating_sub(1),
             graph.points.len()
@@ -26,164 +35,157 @@ impl Graph {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let mut g = Self {
-            points: vec![],
-            starts: vec![],
+        let mut graph = Self {
+            points: Vec::new(),
+            starts: Vec::new(),
             min: Point::MAX,
             max: Point::MIN,
         };
-
-        for (line_idx, line) in text.lines().enumerate() {
-            // Each line is "edge-index x y [x y ...]", separated by spaces.
-            // Tokens beginning with '(' or '<' are metadata.
-            let mut tokens = line.split(' ');
+        for (line, text) in text.lines().enumerate() {
+            let mut tokens = text.split(' ');
             tokens.next();
-
-            let start = g.points.len();
+            let start = graph.points.len();
             while let Some(token) = tokens.next() {
                 if token.is_empty() || token.starts_with(['(', '<']) {
                     continue;
                 }
-
-                let p = Point::new(
-                    coordinate(Some(token), line_idx, 'x')?,
-                    coordinate(tokens.next(), line_idx, 'y')?,
+                let point = Point::new(
+                    coordinate(Some(token), line, 'x')?,
+                    coordinate(tokens.next(), line, 'y')?,
                 );
-
-                ensure!(p.is_finite(), "non-finite TRL coordinate");
-
-                g.min = Point::min(g.min, p);
-                g.max = Point::max(g.max, p);
-
-                g.points.push(p);
+                ensure!(point.is_finite(), "non-finite TRL coordinate");
+                let previous = graph.points.get(start..).and_then(|edge| edge.last());
+                if previous != Some(&point) {
+                    graph.points.push(point);
+                }
             }
-
-            if start != g.points.len() {
-                g.starts.push(start);
+            if graph.points.len().saturating_sub(start) < 2 {
+                graph.points.truncate(start);
+                continue;
+            }
+            graph.starts.push(start);
+            for &point in graph
+                .points
+                .get(start..)
+                .ok_or_eyre("invalid edge bounds")?
+            {
+                graph.min = graph.min.min(point);
+                graph.max = graph.max.max(point);
             }
         }
-
-        g.starts.push(g.points.len());
-        if g.points.is_empty() {
-            bail!("empty graph");
-        }
-        Ok(g)
+        graph.starts.push(graph.points.len());
+        ensure!(!graph.points.is_empty(), "graph has no drawable edges");
+        Ok(graph)
     }
 
     pub fn normalize(&mut self) -> Result<()> {
         let range = self.max - self.min;
-        let span = f32::max(range.x, range.y);
-        ensure!(
-            span > 0.0 && span.is_finite(),
-            "graph has zero or invalid extent"
-        );
-
-        let scale = (1.0_f32 - 0.05) / span;
+        let span = range.max_element();
+        ensure!(span > 0.0 && span.is_finite(), "graph has invalid extent");
+        let scale = 0.95 / span;
+        ensure!(scale.is_finite(), "graph normalization scale is not finite");
         let translation = (Point::ONE - scale * range) / 2.0;
-
         for point in &mut self.points {
             *point = ((*point - self.min) * scale + translation - Point::splat(0.5)) * 2.0;
         }
-
         self.min = Point::NEG_ONE;
         self.max = Point::ONE;
         Ok(())
     }
 
-    pub fn resample(&mut self, spacing: f32) -> Result<()> {
-        ensure!(
-            spacing > 0.0 && spacing.is_finite(),
-            "invalid resample spacing"
+    /// Sample at intervals of one texel, retaining each edge's final endpoint.
+    #[expect(
+        clippy::while_float,
+        reason = "Each segment has at most u32::MAX unit steps, which f64 represents exactly."
+    )]
+    pub fn resample(&self, width: u32, height: u32) -> Result<ResampledGraph> {
+        ensure!(width > 0 && height > 0, "render dimensions must be nonzero");
+        let scale = DVec2::new(
+            f64::from(width.saturating_sub(1)) / 2.0,
+            f64::from(height.saturating_sub(1)) / 2.0,
         );
-
         let mut points = Vec::new();
-        let mut starts = Vec::new();
-
+        let mut segments = Vec::new();
         for &[start, end] in self.starts.array_windows::<2>() {
             let edge = self
                 .points
                 .get(start..end)
                 .ok_or_eyre("invalid edge bounds")?;
-
-            starts.push(points.len());
-
-            let mut remaining = spacing;
-            let mut previous = *edge.first().ok_or_eyre("empty edge")?;
-            points.push(previous);
-
-            let mut pending = edge.iter().skip(1).peekable();
-            while let Some(&&current) = pending.peek() {
-                // Keep the squared-component sum; hypot changes f32 rounding.
-                let distance = (previous - current).length();
-                if distance < remaining {
-                    remaining -= distance;
-                    previous = current;
-                    pending.next();
-                    continue;
-                }
-
-                let t = remaining / distance;
-                let next = previous * (1.0 - t) + current * t;
-                // A tiny remainder may round to the previous point. Append it,
-                // reset the spacing, then advance on the next iteration.
+            let first = *edge.first().ok_or_eyre("empty edge")?;
+            let output_start = points.len();
+            points.push(first);
+            let mut previous = first;
+            let mut remaining = 1.0;
+            for &current in edge.iter().skip(1) {
+                let delta = current.as_dvec2() - previous.as_dvec2();
+                let distance = (delta * scale).length();
                 ensure!(
-                    next != previous || remaining < spacing,
-                    "resampling made no progress"
+                    distance <= f64::from(u32::MAX),
+                    "edge exceeds the resampled point index limit"
                 );
-
-                previous = next;
-                remaining = spacing;
-                points.push(previous);
+                let mut along = remaining;
+                while along <= distance {
+                    let next = (previous.as_dvec2() + delta * (along / distance)).as_vec2();
+                    push_distinct(&mut points, next);
+                    along += 1.0;
+                }
+                remaining = along - distance;
+                previous = current;
             }
-
-            if remaining < spacing {
-                points.push(*edge.last().ok_or_eyre("empty edge")?);
+            push_distinct(&mut points, previous);
+            // Keep short closed paths drawable when regular samples coincide.
+            if points.len().saturating_sub(output_start) == 1
+                && let Some(&next) = edge.iter().find(|&&point| (point - first).length() > 0.0)
+            {
+                push_distinct(&mut points, next);
+                push_distinct(&mut points, previous);
+            }
+            if points.len().saturating_sub(output_start) < 2 {
+                points.truncate(output_start);
+                continue;
+            }
+            for index in output_start..points.len().saturating_sub(1) {
+                segments.push(u32::try_from(index)?);
             }
         }
-
-        starts.push(points.len());
-
-        println!(
-            "Resampled graph: {} -> {} edges, {} -> {} control points",
-            self.starts.len().saturating_sub(1),
-            starts.len().saturating_sub(1),
-            self.points.len(),
-            points.len()
+        ensure!(
+            !segments.is_empty(),
+            "resampled graph has no drawable edges"
         );
+        println!(
+            "Resampled for {width}x{height}: {} control points -> {} samples, {} segments",
+            self.points.len(),
+            points.len(),
+            segments.len()
+        );
+        Ok(ResampledGraph {
+            points,
+            segments,
+            dimensions: [width, height],
+        })
+    }
+}
 
-        self.points = points;
-        self.starts = starts;
-        Ok(())
+impl ResampledGraph {
+    pub fn points(&self) -> &[Point] {
+        &self.points
     }
 
-    pub fn mesh(&self, width: f32) -> Result<Vec<Point>> {
-        let mut mesh = Vec::with_capacity(self.points.len().saturating_sub(1).saturating_mul(2));
-        let half = width / 2.0;
+    pub fn segments(&self) -> &[u32] {
+        &self.segments
+    }
 
-        for &[start, end] in self.starts.array_windows::<2>() {
-            for &[first, second] in self
-                .points
-                .get(start..end)
-                .ok_or_eyre("invalid edge bounds")?
-                .array_windows::<2>()
-            {
-                let dir = second - first;
-                let len = dir.length();
-                if len == 0.0 {
-                    continue;
-                }
+    pub const fn dimensions(&self) -> [u32; 2] {
+        self.dimensions
+    }
+}
 
-                let dir = dir / len;
-                let normal = Point::new(-dir.y, dir.x) * half;
-                let v0 = first + normal;
-                let v1 = first - normal;
-                let v2 = second + normal;
-                let v3 = second - normal;
-
-                mesh.extend([v0, v1, v2, v3, v2, v1]);
-            }
-        }
-        Ok(mesh)
+fn push_distinct(points: &mut Vec<Point>, point: Point) {
+    if points
+        .last()
+        .is_none_or(|&previous| (point - previous).length() > 0.0)
+    {
+        points.push(point);
     }
 }
 

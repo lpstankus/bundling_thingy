@@ -52,8 +52,6 @@ impl Running {
         for input in INPUTS {
             let mut graph = Graph::load(input.as_ref())?;
             graph.normalize()?;
-            graph.resample(0.02)?;
-
             graphs.push((input, graph));
         }
 
@@ -78,7 +76,8 @@ impl Running {
         let update_title = self.dirty || self.last_title_update.elapsed() >= Duration::from_secs(1);
 
         if self.dirty {
-            self.gpu.upload(&graph.mesh(0.002)?)?;
+            let [width, height] = self.gpu.dimensions();
+            self.gpu.upload(&graph.resample(width, height)?)?;
 
             self.dirty = false;
         }
@@ -124,8 +123,9 @@ impl Running {
                 }
             }
             WindowEvent::Resized(size) => {
-                self.gpu.resize(size.width, size.height);
+                self.gpu.resize(size.width, size.height)?;
                 if size.width > 0 && size.height > 0 {
+                    self.dirty = true;
                     self.window.request_redraw();
                 }
             }
