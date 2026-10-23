@@ -136,7 +136,8 @@ impl GpuTimings {
                     let data = readback.get_mapped_range(..);
                     for (timestamps, stage) in data.as_chunks::<16>().0.iter().zip(stages) {
                         let [start, end] = bytemuck::pod_read_unaligned::<[u64; 2]>(timestamps);
-                        let elapsed = std::time::Duration::from_nanos(end.wrapping_sub(start))
+                        // A backwards timestamp cannot be recovered without the counter width.
+                        let elapsed = std::time::Duration::from_nanos(end.saturating_sub(start))
                             .mul_f64(f64::from(period));
                         tracing::info!(
                             stage,
