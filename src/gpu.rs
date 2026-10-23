@@ -1,6 +1,7 @@
 use crate::{
     density::{Density, DensityInput},
     graph::ResampledGraph,
+    palette::Palette,
 };
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use std::{
@@ -24,6 +25,7 @@ pub struct Gpu {
     pipeline: wgpu::RenderPipeline,
     density: Density,
     density_binding: wgpu::BindGroup,
+    palette: wgpu::Buffer,
     graph: Option<UploadedGraph>,
 
     target: wgpu::Texture,
@@ -39,7 +41,11 @@ struct UploadedGraph {
 }
 
 impl Gpu {
-    pub async fn new(window: Option<Arc<Window>>, validation: bool) -> Result<Self> {
+    pub async fn new(
+        window: Option<Arc<Window>>,
+        validation: bool,
+        palette: Palette,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             flags: if validation {
                 wgpu::InstanceFlags::debugging()
@@ -104,7 +110,12 @@ impl Gpu {
             .map_or((SIZE, SIZE), |c| (c.width, c.height));
         let density = Density::new(&device, width, height)?;
         let pipeline = Self::pipeline(&device, format);
-        let density_binding = Self::density_binding(&device, &pipeline, &density.texture);
+        let palette = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("density palette"),
+            contents: bytemuck::cast_slice(&palette.colors()),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let density_binding = Self::density_binding(&device, &pipeline, &density.texture, &palette);
 
         let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
         let msaa = Self::texture(&device, width, height, format, 4)
@@ -131,6 +142,7 @@ impl Gpu {
             pipeline,
             density,
             density_binding,
+            palette,
             graph: None,
             target,
             msaa,
@@ -183,6 +195,7 @@ impl Gpu {
         device: &wgpu::Device,
         pipeline: &wgpu::RenderPipeline,
         density: &wgpu::Texture,
+        palette: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bilinear density"),
@@ -204,6 +217,10 @@ impl Gpu {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: palette.as_entire_binding(),
                 },
             ],
         })
@@ -380,7 +397,12 @@ impl Gpu {
                 return Ok(());
             }
             let density = Density::new(&self.device, width, height)?;
-            let binding = Self::density_binding(&self.device, &self.pipeline, &density.texture);
+            let binding = Self::density_binding(
+                &self.device,
+                &self.pipeline,
+                &density.texture,
+                &self.palette,
+            );
             self.density = density;
             self.density_binding = binding;
             self.graph = None;
