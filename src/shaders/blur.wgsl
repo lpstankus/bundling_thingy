@@ -13,7 +13,7 @@ const GAUSSIAN = array<f32, 19>(
 @group(0) @binding(0) var<storage, read> input_image: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output_image: array<f32>;
 
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(32, 4)
 fn blur(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = vec2<u32>(map_width, map_height);
     if any(id.xy >= size) {

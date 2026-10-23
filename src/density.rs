@@ -39,18 +39,11 @@ impl Density {
             bytes <= u64::from(limits.max_storage_buffer_binding_size),
             "density map exceeds GPU storage buffer limit"
         );
-        let buffer = |label, bytes| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let counts = buffer("density counts", bytes);
-        let image_a = buffer("density image A", bytes);
-        let image_b = buffer("density image B", bytes);
-        let maximum = buffer("density maximum", 4);
+
+        let counts = create_buffer(device, "density counts", bytes);
+        let image_a = create_buffer(device, "density image A", bytes);
+        let image_b = create_buffer(device, "density image B", bytes);
+        let maximum = create_buffer(device, "density maximum", 4);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -67,41 +60,34 @@ impl Density {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let build = |source, entry| pipeline(device, source, entry, size, &[]);
-        let gaussian = |axis| {
-            pipeline(
-                device,
-                include_str!("gaussian.wgsl"),
-                "blur",
-                size,
-                &[("axis", axis)],
-            )
-        };
-        let count_pipeline = build(include_str!("density.wgsl"), "count_points");
+
+        let density_source = include_str!("shaders/density.wgsl");
+        let normalization_source = include_str!("shaders/normalization.wgsl");
+        let count_pipeline = build_pipeline(device, density_source, "count_points", size);
         let stages = [
             Stage::new(
                 device,
-                build(include_str!("density_resolve.wgsl"), "resolve_counts"),
-                &[buffer_entry(0, &counts), buffer_entry(1, &image_a)],
+                build_pipeline(device, density_source, "resolve_counts", size),
+                &[buffer_entry(1, &counts), buffer_entry(2, &image_a)],
             ),
             Stage::new(
                 device,
-                gaussian(0.0),
+                build_gaussian_pipeline(device, size, 0.0),
                 &[buffer_entry(0, &image_a), buffer_entry(1, &image_b)],
             ),
             Stage::new(
                 device,
-                gaussian(1.0),
+                build_gaussian_pipeline(device, size, 1.0),
                 &[buffer_entry(0, &image_b), buffer_entry(1, &image_a)],
             ),
             Stage::new(
                 device,
-                build(include_str!("density_maximum.wgsl"), "find_maximum"),
+                build_pipeline(device, normalization_source, "find_maximum", size),
                 &[buffer_entry(0, &image_a), buffer_entry(1, &maximum)],
             ),
             Stage::new(
                 device,
-                build(include_str!("density_normalize.wgsl"), "normalize"),
+                build_pipeline(device, normalization_source, "normalize", size),
                 &[
                     buffer_entry(0, &image_a),
                     buffer_entry(1, &maximum),
@@ -146,7 +132,7 @@ impl Density {
         stage.encode(encoder, x, y);
 
         for stage in &self.stages {
-            stage.encode(encoder, size.width.div_ceil(16), size.height.div_ceil(16));
+            stage.encode(encoder, size.width.div_ceil(32), size.height.div_ceil(4));
         }
         Ok(())
     }
@@ -207,7 +193,39 @@ impl Stage {
     }
 }
 
-fn pipeline(
+fn create_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn build_pipeline(
+    device: &wgpu::Device,
+    source: &str,
+    entry: &str,
+    size: wgpu::Extent3d,
+) -> wgpu::ComputePipeline {
+    create_pipeline(device, source, entry, size, &[])
+}
+
+fn build_gaussian_pipeline(
+    device: &wgpu::Device,
+    size: wgpu::Extent3d,
+    axis: f64,
+) -> wgpu::ComputePipeline {
+    create_pipeline(
+        device,
+        include_str!("shaders/blur.wgsl"),
+        "blur",
+        size,
+        &[("axis", axis)],
+    )
+}
+
+fn create_pipeline(
     device: &wgpu::Device,
     source: &str,
     entry: &str,

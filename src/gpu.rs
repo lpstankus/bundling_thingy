@@ -142,7 +142,7 @@ impl Gpu {
     fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("graph"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/render_paths.wgsl").into()),
         });
 
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
