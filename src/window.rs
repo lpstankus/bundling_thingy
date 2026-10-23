@@ -37,6 +37,7 @@ struct Running {
 }
 
 impl Running {
+    #[tracing::instrument(name = "viewer.init", skip_all, err)]
     fn new(event_loop: &ActiveEventLoop, validation: bool, palette: Palette) -> Result<Self> {
         let window = Arc::new(
             event_loop.create_window(
@@ -73,6 +74,7 @@ impl Running {
             .graphs
             .get(self.index)
             .ok_or_eyre("invalid graph selection")?;
+        let _timing = tracing::info_span!("viewer.redraw", input = %name).entered();
         let update_title = self.dirty || self.last_title_update.elapsed() >= Duration::from_secs(1);
 
         if self.dirty {

@@ -21,6 +21,7 @@ pub struct ResampledGraph {
 }
 
 impl Graph {
+    #[tracing::instrument(name = "graph.load", skip_all, fields(input = %path.display()), err)]
     pub fn load(path: &Path) -> Result<Self> {
         let graph = Self::parse(
             &fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?,
@@ -78,6 +79,7 @@ impl Graph {
         Ok(graph)
     }
 
+    #[tracing::instrument(name = "graph.normalize", skip_all, fields(points = self.points.len()), err)]
     pub fn normalize(&mut self) -> Result<()> {
         let range = self.max - self.min;
         let span = range.max_element();
@@ -98,6 +100,7 @@ impl Graph {
         clippy::while_float,
         reason = "Each segment has at most u32::MAX unit steps, which f64 represents exactly."
     )]
+    #[tracing::instrument(name = "graph.resample", skip_all, fields(width = width, height = height), err)]
     pub fn resample(&self, width: u32, height: u32) -> Result<ResampledGraph> {
         ensure!(width > 0 && height > 0, "render dimensions must be nonzero");
         let scale = DVec2::new(
