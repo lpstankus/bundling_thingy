@@ -1,2 +1,7 @@
 [tools]
 rust = "1.98.0"
+"cargo:cargo-dupes" = "0.2.1"
+
+[tasks.dupes]
+description = "Check for duplicated Rust functions of 10 lines or more"
+run = "cargo dupes check --min-lines 10 --max-exact 0 --max-near 0"
