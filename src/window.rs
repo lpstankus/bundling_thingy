@@ -1,4 +1,8 @@
-use crate::{Options, gpu::Gpu, graph::Graph};
+use crate::{
+    Options,
+    gpu::Gpu,
+    graph::{Graph, GraphLog},
+};
 use color_eyre::eyre::{OptionExt, Result};
 use std::{
     sync::Arc,
@@ -50,9 +54,9 @@ impl Running {
 
         let mut graphs = Vec::new();
         for input in INPUTS {
-            let mut graph = Graph::load(input.as_ref())?;
+            let mut graph = Graph::load(input.as_ref(), GraphLog::Summary)?;
             graph.normalize()?;
-            graph.resample(0.02)?;
+            graph.resample(0.02, GraphLog::Summary)?;
 
             graphs.push((input, graph));
         }

@@ -2,6 +2,13 @@ use color_eyre::eyre::{OptionExt, Result, WrapErr, bail, ensure};
 use std::{fs, path::Path};
 
 pub use glam::Vec2 as Point;
+
+#[derive(Clone, Copy)]
+pub enum GraphLog {
+    Summary,
+    Silent,
+}
+
 #[derive(Debug)]
 pub struct Graph {
     pub points: Vec<Point>,
@@ -12,16 +19,18 @@ pub struct Graph {
 }
 
 impl Graph {
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, log: GraphLog) -> Result<Self> {
         let graph = Self::parse(
             &fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?,
         )?;
-        println!(
-            "Read {}: {} edges, {} control points",
-            path.display(),
-            graph.starts.len().saturating_sub(1),
-            graph.points.len()
-        );
+        if matches!(log, GraphLog::Summary) {
+            println!(
+                "Read {}: {} edges, {} control points",
+                path.display(),
+                graph.starts.len().saturating_sub(1),
+                graph.points.len()
+            );
+        }
         Ok(graph)
     }
 
@@ -90,7 +99,7 @@ impl Graph {
         Ok(())
     }
 
-    pub fn resample(&mut self, spacing: f32) -> Result<()> {
+    pub fn resample(&mut self, spacing: f32, log: GraphLog) -> Result<()> {
         ensure!(
             spacing > 0.0 && spacing.is_finite(),
             "invalid resample spacing"
@@ -143,13 +152,15 @@ impl Graph {
 
         starts.push(points.len());
 
-        println!(
-            "Resampled graph: {} -> {} edges, {} -> {} control points",
-            self.starts.len().saturating_sub(1),
-            starts.len().saturating_sub(1),
-            self.points.len(),
-            points.len()
-        );
+        if matches!(log, GraphLog::Summary) {
+            println!(
+                "Resampled graph: {} -> {} edges, {} -> {} control points",
+                self.starts.len().saturating_sub(1),
+                starts.len().saturating_sub(1),
+                self.points.len(),
+                points.len()
+            );
+        }
 
         self.points = points;
         self.starts = starts;
