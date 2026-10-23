@@ -3,9 +3,9 @@ use clap::ValueEnum;
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum Palette {
     /// Blue to yellow, optimized for red-green color vision deficiencies.
-    #[default]
     Cividis,
     /// Purple through teal to yellow.
+    #[default]
     Viridis,
     /// Purple through orange to yellow.
     Plasma,
