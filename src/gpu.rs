@@ -24,6 +24,9 @@ pub struct Gpu {
     queue: wgpu::Queue,
 
     pipeline: wgpu::RenderPipeline,
+    endpoint_outline_pipeline: wgpu::RenderPipeline,
+    endpoint_pipeline: wgpu::RenderPipeline,
+    endpoint_dots: bool,
     density: Density,
     density_binding: wgpu::BindGroup,
     palette: wgpu::Buffer,
@@ -41,6 +44,7 @@ pub struct Gpu {
 struct UploadedGraph {
     bindings: wgpu::BindGroup,
     segment_count: u32,
+    endpoint_count: u32,
 }
 
 impl Gpu {
@@ -49,6 +53,7 @@ impl Gpu {
         window: Option<Arc<Window>>,
         validation: bool,
         palette: Palette,
+        endpoint_dots: bool,
     ) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             flags: if validation {
@@ -115,12 +120,9 @@ impl Gpu {
             .as_ref()
             .map_or((SIZE, SIZE), |c| (c.width, c.height));
         let density = Density::new(&device, width, height)?;
-        let pipeline = Self::pipeline(&device, format);
-        let palette = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("density palette"),
-            contents: bytemuck::cast_slice(&palette.colors()),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let [pipeline, endpoint_outline_pipeline, endpoint_pipeline] =
+            Self::pipelines(&device, format);
+        let palette = Self::palette_buffer(&device, palette);
         let density_binding = Self::density_binding(&device, &pipeline, &density.texture, &palette);
         let density_timings = GpuTimings::new(&device, &queue, &density::TIMING_STAGES)?;
         let render_timings = GpuTimings::new(&device, &queue, &["render.draw"])?;
@@ -140,6 +142,9 @@ impl Gpu {
             device,
             queue,
             pipeline,
+            endpoint_outline_pipeline,
+            endpoint_pipeline,
+            endpoint_dots,
             density,
             density_binding,
             palette,
@@ -153,15 +158,74 @@ impl Gpu {
         })
     }
 
-    fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    fn palette_buffer(device: &wgpu::Device, palette: Palette) -> wgpu::Buffer {
+        let mut colors = Vec::from(palette.colors());
+        colors.push(palette.endpoint_color());
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("path and endpoint colors"),
+            contents: bytemuck::cast_slice(&colors),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    }
+
+    fn pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> [wgpu::RenderPipeline; 3] {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("graph"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/render_paths.wgsl").into()),
         });
+        let density_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("density and palette"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let graph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("resampled points, segments, and endpoints"),
+            entries: &[0, 1, 2].map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("paths and endpoints"),
+            bind_group_layouts: &[&density_layout, &graph_layout],
+            push_constant_ranges: &[],
+        });
 
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let mut descriptor = wgpu::RenderPipelineDescriptor {
             label: Some("graph"),
-            layout: None,
+            layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -190,7 +254,20 @@ impl Gpu {
             }),
             multiview: None,
             cache: None,
-        })
+        };
+        let paths = device.create_render_pipeline(&descriptor);
+        descriptor.label = Some("endpoint outlines");
+        descriptor.vertex.entry_point = Some("vs_endpoint");
+        if let Some(fragment) = &mut descriptor.fragment {
+            fragment.entry_point = Some("fs_endpoint_outline");
+        }
+        let endpoint_outlines = device.create_render_pipeline(&descriptor);
+        descriptor.label = Some("endpoints");
+        if let Some(fragment) = &mut descriptor.fragment {
+            fragment.entry_point = Some("fs_endpoint");
+        }
+        let endpoints = device.create_render_pipeline(&descriptor);
+        [paths, endpoint_outlines, endpoints]
     }
 
     fn density_binding(
@@ -276,7 +353,15 @@ impl Gpu {
             "resampled graph dimensions differ from render target"
         );
         let segment_count = u32::try_from(graph.segments().len())?;
+        let endpoint_count = u32::try_from(graph.endpoints().len())?;
         let input = DensityInput::new(&self.device, graph)?;
+        let endpoints = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("path endpoint indices"),
+                contents: bytemuck::cast_slice(graph.endpoints()),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let segments = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -296,6 +381,10 @@ impl Gpu {
                     binding: 1,
                     resource: segments.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: endpoints.as_entire_binding(),
+                },
             ],
         });
         drop(upload_timing);
@@ -311,6 +400,7 @@ impl Gpu {
         self.graph = Some(UploadedGraph {
             bindings,
             segment_count,
+            endpoint_count,
         });
         self.wait()
     }
@@ -345,6 +435,13 @@ impl Gpu {
                 pass.set_bind_group(0, &self.density_binding, &[]);
                 pass.set_bind_group(1, &graph.bindings, &[]);
                 pass.draw(0..6, 0..graph.segment_count);
+                if self.endpoint_dots {
+                    // Draw all outlines first so shared endpoints keep their colored centers.
+                    pass.set_pipeline(&self.endpoint_outline_pipeline);
+                    pass.draw(0..6, 0..graph.endpoint_count);
+                    pass.set_pipeline(&self.endpoint_pipeline);
+                    pass.draw(0..6, 0..graph.endpoint_count);
+                }
             }
         }
 

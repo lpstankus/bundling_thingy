@@ -1,4 +1,4 @@
-use crate::{Options, gpu::Gpu, graph::Graph, palette::Palette};
+use crate::{Options, gpu::Gpu, graph::Graph};
 use color_eyre::eyre::{OptionExt, Result};
 use std::{
     sync::Arc,
@@ -38,7 +38,7 @@ struct Running {
 
 impl Running {
     #[tracing::instrument(name = "viewer.init", skip_all, err)]
-    fn new(event_loop: &ActiveEventLoop, validation: bool, palette: Palette) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, opts: &Options) -> Result<Self> {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -47,7 +47,12 @@ impl Running {
             )?,
         );
 
-        let gpu = pollster::block_on(Gpu::new(Some(window.clone()), validation, palette))?;
+        let gpu = pollster::block_on(Gpu::new(
+            Some(window.clone()),
+            opts.validate_gpu,
+            opts.palette,
+            opts.endpoint_dots,
+        ))?;
 
         let mut graphs = Vec::new();
         for input in INPUTS {
@@ -150,7 +155,7 @@ impl ApplicationHandler for App {
             return;
         }
 
-        match Running::new(event_loop, self.opts.validate_gpu, self.opts.palette) {
+        match Running::new(event_loop, &self.opts) {
             Ok(running) => self.running = Some(running),
             Err(e) => {
                 self.error = Some(e);
