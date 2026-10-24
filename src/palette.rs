@@ -14,6 +14,15 @@ pub enum Palette {
 }
 
 impl Palette {
+    pub const fn endpoint_color(self) -> [f32; 4] {
+        match self {
+            Self::Cividis => [1.0, 0.35, 0.75, 1.0],
+            Self::Viridis => [1.0, 0.4, 0.7, 1.0],
+            Self::Plasma => [0.15, 0.9, 1.0, 1.0],
+            Self::Batlow => [0.1, 0.85, 1.0, 1.0],
+        }
+    }
+
     // Sixteen evenly spaced samples per palette, interpolated by the shader.
     // Viridis and plasma by Smith and van der Walt, https://bids.github.io/colormap/
     // Cividis by Nuñez, Anderton, and Renslow, https://doi.org/10.1371/journal.pone.0199239

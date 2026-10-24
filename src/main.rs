@@ -16,6 +16,10 @@ use std::{
 };
 
 #[derive(Debug, Parser)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Clap parses independent CLI switches."
+)]
 #[command(
     args_override_self = true,
     after_help = "Without --headless: Left/Right/Space switch graphs; Escape exits."
@@ -37,9 +41,13 @@ pub struct Options {
     #[arg(long, default_value = "out/rust", requires = "headless")]
     out: PathBuf,
 
-    /// Color palette for normalized path density.
+    /// Color palette for normalized path density and endpoint dots.
     #[arg(long, value_enum, default_value_t = Palette::default())]
     palette: Palette,
+
+    /// Draw dots at the start and end of each path.
+    #[arg(long)]
+    endpoint_dots: bool,
 
     /// Enable GPU debugging and validation.
     #[arg(long)]
@@ -63,7 +71,12 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
-    let mut gpu = pollster::block_on(Gpu::new(None, opts.validate_gpu, opts.palette))?;
+    let mut gpu = pollster::block_on(Gpu::new(
+        None,
+        opts.validate_gpu,
+        opts.palette,
+        opts.endpoint_dots,
+    ))?;
 
     let mut graph = Graph::load(&opts.input)?;
     graph.normalize()?;
