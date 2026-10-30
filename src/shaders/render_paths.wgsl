@@ -23,9 +23,9 @@ struct Palette {
 const PATH_OPACITY: f32 = 0.1;
 const ENDPOINT_RADIUS: f32 = 3.0;
 const ENDPOINT_OUTLINE_WIDTH: f32 = 1.0;
-const CORNERS = array<vec2<f32>, 6>(
-    vec2<f32>(0.0, 1.0), vec2<f32>(0.0, -1.0), vec2<f32>(1.0, 1.0),
-    vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, -1.0),
+const CORNERS = array<vec2<f32>, 4>(
+    vec2<f32>(0.0, 1.0), vec2<f32>(0.0, -1.0),
+    vec2<f32>(1.0, 1.0), vec2<f32>(1.0, -1.0),
 );
 
 @vertex
@@ -46,7 +46,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Grid coordinates span [0, size - 1]. Align them with texel centers.
-    let size = vec2<f32>(textureDimensions(density));
+    let size = vec2<f32>(map.size);
     let uv = (in.uv * (size - 1.0) + 0.5) / size;
     let value = clamp(textureSample(density, density_sampler, uv).r, 0.0, 1.0);
     let stop = value * 15.0;
@@ -60,7 +60,7 @@ fn vs_endpoint(@builtin(vertex_index) vertex: u32, @builtin(instance_index) inst
     let center = points[endpoints[instance]];
     let corner = CORNERS[vertex];
     let offset = vec2<f32>(corner.x * 2.0 - 1.0, corner.y);
-    let size = vec2<f32>(textureDimensions(density));
+    let size = vec2<f32>(map.size);
     var out: EndpointOutput;
     out.position = vec4<f32>(center + offset * ENDPOINT_RADIUS * 2.0 / size, 0.0, 1.0);
     out.offset = offset;

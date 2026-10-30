@@ -3,6 +3,8 @@ mod gpu;
 mod graph;
 mod palette;
 mod profiling;
+mod resampling;
+mod shader;
 mod window;
 
 use clap::Parser;
@@ -49,9 +51,17 @@ pub struct Options {
     #[arg(long)]
     endpoint_dots: bool,
 
+    /// MSAA samples. Use 2 for speed or 4 for smoother edges.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(2..=4))]
+    msaa: u32,
+
     /// Enable GPU debugging and validation.
     #[arg(long)]
     validate_gpu: bool,
+
+    /// Maximum graph buffer memory in MiB, excluding density and render targets.
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    max_graph_memory_mib: u64,
 }
 
 fn main() -> Result<()> {
@@ -71,18 +81,10 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
-    let mut gpu = pollster::block_on(Gpu::new(
-        None,
-        opts.validate_gpu,
-        opts.palette,
-        opts.endpoint_dots,
-    ))?;
+    let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
 
-    let mut graph = Graph::load(&opts.input)?;
-    graph.normalize()?;
-    let [width, height] = gpu.dimensions();
-    let graph = graph.resample(width, height)?;
-    gpu.upload(&graph)?;
+    let graph = Graph::load(&opts.input)?;
+    let samples = gpu.upload(&graph)?;
     gpu.render()?;
     let pixels = gpu.readback()?;
 
@@ -102,10 +104,6 @@ fn headless(opts: &Options) -> Result<()> {
         .wrap_err_with(|| format!("write {}", path.display()))?;
     drop(timing);
 
-    println!(
-        "wrote {} with {} samples",
-        path.display(),
-        graph.points().len()
-    );
+    println!("wrote {} with {} samples", path.display(), samples);
     Ok(())
 }

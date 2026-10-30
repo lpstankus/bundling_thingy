@@ -47,17 +47,11 @@ impl Running {
             )?,
         );
 
-        let gpu = pollster::block_on(Gpu::new(
-            Some(window.clone()),
-            opts.validate_gpu,
-            opts.palette,
-            opts.endpoint_dots,
-        ))?;
+        let gpu = pollster::block_on(Gpu::new(Some(window.clone()), opts))?;
 
         let mut graphs = Vec::new();
         for input in INPUTS {
-            let mut graph = Graph::load(input.as_ref())?;
-            graph.normalize()?;
+            let graph = Graph::load(input.as_ref())?;
             graphs.push((input, graph));
         }
 
@@ -83,8 +77,7 @@ impl Running {
         let update_title = self.dirty || self.last_title_update.elapsed() >= Duration::from_secs(1);
 
         if self.dirty {
-            let [width, height] = self.gpu.dimensions();
-            self.gpu.upload(&graph.resample(width, height)?)?;
+            self.gpu.upload(graph)?;
 
             self.dirty = false;
         }

@@ -1,5 +1,4 @@
 use color_eyre::eyre::{OptionExt, Result, WrapErr, ensure};
-use glam::DVec2;
 use std::{fs, path::Path};
 
 pub use glam::Vec2 as Point;
@@ -7,18 +6,15 @@ pub use glam::Vec2 as Point;
 #[derive(Debug)]
 pub struct Graph {
     points: Vec<Point>,
-    starts: Vec<usize>,
+    starts: Vec<u32>,
     min: Point,
     max: Point,
 }
 
-/// Only `Graph::resample` can construct the geometry accepted by GPU uploads.
-#[derive(Debug)]
-pub struct ResampledGraph {
-    points: Vec<Point>,
-    segments: Vec<u32>,
-    endpoints: Vec<u32>,
-    dimensions: [u32; 2],
+pub struct Normalization {
+    pub minimum: Point,
+    pub scale: f32,
+    pub translation: Point,
 }
 
 impl Graph {
@@ -65,7 +61,7 @@ impl Graph {
                 graph.points.truncate(start);
                 continue;
             }
-            graph.starts.push(start);
+            graph.starts.push(u32::try_from(start)?);
             for &point in graph
                 .points
                 .get(start..)
@@ -75,129 +71,31 @@ impl Graph {
                 graph.max = graph.max.max(point);
             }
         }
-        graph.starts.push(graph.points.len());
+        graph.starts.push(u32::try_from(graph.points.len())?);
         ensure!(!graph.points.is_empty(), "graph has no drawable edges");
         Ok(graph)
     }
 
-    #[tracing::instrument(name = "graph.normalize", skip_all, fields(points = self.points.len()), err)]
-    pub fn normalize(&mut self) -> Result<()> {
+    pub fn normalization(&self) -> Result<Normalization> {
         let range = self.max - self.min;
         let span = range.max_element();
         ensure!(span > 0.0 && span.is_finite(), "graph has invalid extent");
         let scale = 0.95 / span;
         ensure!(scale.is_finite(), "graph normalization scale is not finite");
         let translation = (Point::ONE - scale * range) / 2.0;
-        for point in &mut self.points {
-            *point = ((*point - self.min) * scale + translation - Point::splat(0.5)) * 2.0;
-        }
-        self.min = Point::NEG_ONE;
-        self.max = Point::ONE;
-        Ok(())
-    }
-
-    /// Sample at intervals of one texel, retaining each edge's final endpoint.
-    #[expect(
-        clippy::while_float,
-        reason = "Each segment has at most u32::MAX unit steps, which f64 represents exactly."
-    )]
-    #[tracing::instrument(name = "graph.resample", skip_all, fields(width = width, height = height), err)]
-    pub fn resample(&self, width: u32, height: u32) -> Result<ResampledGraph> {
-        ensure!(width > 0 && height > 0, "render dimensions must be nonzero");
-        let scale = DVec2::new(
-            f64::from(width.saturating_sub(1)) / 2.0,
-            f64::from(height.saturating_sub(1)) / 2.0,
-        );
-        let mut points = Vec::new();
-        let mut segments = Vec::new();
-        let mut endpoints = Vec::new();
-        for &[start, end] in self.starts.array_windows::<2>() {
-            let edge = self
-                .points
-                .get(start..end)
-                .ok_or_eyre("invalid edge bounds")?;
-            let first = *edge.first().ok_or_eyre("empty edge")?;
-            let output_start = points.len();
-            points.push(first);
-            let mut previous = first;
-            let mut remaining = 1.0;
-            for &current in edge.iter().skip(1) {
-                let delta = current.as_dvec2() - previous.as_dvec2();
-                let distance = (delta * scale).length();
-                ensure!(
-                    distance <= f64::from(u32::MAX),
-                    "edge exceeds the resampled point index limit"
-                );
-                let mut along = remaining;
-                while along <= distance {
-                    let next = (previous.as_dvec2() + delta * (along / distance)).as_vec2();
-                    push_distinct(&mut points, next);
-                    along += 1.0;
-                }
-                remaining = along - distance;
-                previous = current;
-            }
-            push_distinct(&mut points, previous);
-            // Keep short closed paths drawable when regular samples coincide.
-            if points.len().saturating_sub(output_start) == 1
-                && let Some(&next) = edge.iter().find(|&&point| (point - first).length() > 0.0)
-            {
-                push_distinct(&mut points, next);
-                push_distinct(&mut points, previous);
-            }
-            if points.len().saturating_sub(output_start) < 2 {
-                points.truncate(output_start);
-                continue;
-            }
-            endpoints.push(u32::try_from(output_start)?);
-            endpoints.push(u32::try_from(points.len().saturating_sub(1))?);
-            for index in output_start..points.len().saturating_sub(1) {
-                segments.push(u32::try_from(index)?);
-            }
-        }
-        ensure!(
-            !segments.is_empty(),
-            "resampled graph has no drawable edges"
-        );
-        println!(
-            "Resampled for {width}x{height}: {} control points -> {} samples, {} segments",
-            self.points.len(),
-            points.len(),
-            segments.len()
-        );
-        Ok(ResampledGraph {
-            points,
-            segments,
-            endpoints,
-            dimensions: [width, height],
+        Ok(Normalization {
+            minimum: self.min,
+            scale,
+            translation,
         })
     }
-}
 
-impl ResampledGraph {
     pub fn points(&self) -> &[Point] {
         &self.points
     }
 
-    pub fn segments(&self) -> &[u32] {
-        &self.segments
-    }
-
-    pub fn endpoints(&self) -> &[u32] {
-        &self.endpoints
-    }
-
-    pub const fn dimensions(&self) -> [u32; 2] {
-        self.dimensions
-    }
-}
-
-fn push_distinct(points: &mut Vec<Point>, point: Point) {
-    if points
-        .last()
-        .is_none_or(|&previous| (point - previous).length() > 0.0)
-    {
-        points.push(point);
+    pub fn starts(&self) -> &[u32] {
+        &self.starts
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::shader;
 use color_eyre::eyre::Result;
 use std::io::{self, IsTerminal};
 use tracing_subscriber::fmt::{format::FmtSpan, time::Uptime};
@@ -116,39 +117,22 @@ impl GpuTimings {
             timestamps.readback.size(),
         );
 
-        let readback = timestamps.readback.clone();
         let stages = self.stages;
         let period = timestamps.period;
-        encoder.map_buffer_on_submit(
-            &timestamps.readback,
-            wgpu::MapMode::Read,
-            ..,
-            move |result| {
-                if let Err(error) = result {
-                    tracing::warn!(
-                        %error,
-                        "GPU timestamp readback failed. GPU durations default to zero."
-                    );
-                    Self::log_unavailable(stages);
-                    return;
-                }
-                {
-                    let data = readback.get_mapped_range(..);
-                    for (timestamps, stage) in data.as_chunks::<16>().0.iter().zip(stages) {
-                        let [start, end] = bytemuck::pod_read_unaligned::<[u64; 2]>(timestamps);
-                        // A backwards timestamp cannot be recovered without the counter width.
-                        let elapsed = std::time::Duration::from_nanos(end.saturating_sub(start))
-                            .mul_f64(f64::from(period));
-                        tracing::info!(
-                            stage,
-                            gpu_ms = elapsed.as_secs_f64() * 1000.0,
-                            "GPU timing"
-                        );
-                    }
-                }
-                readback.unmap();
-            },
-        );
+        let _ = shader::readback(encoder, &timestamps.readback, move |result| {
+            let data = result.inspect_err(|error| {
+                tracing::warn!(%error, "GPU timestamp readback failed. GPU durations default to zero.");
+                Self::log_unavailable(stages);
+            })?;
+            for (timestamps, stage) in data.as_chunks::<16>().0.iter().zip(stages) {
+                let [start, end] = bytemuck::pod_read_unaligned::<[u64; 2]>(timestamps);
+                // A backwards timestamp cannot be recovered without the counter width.
+                let elapsed = std::time::Duration::from_nanos(end.saturating_sub(start))
+                    .mul_f64(f64::from(period));
+                tracing::info!(stage, gpu_ms = elapsed.as_secs_f64() * 1000.0, "GPU timing");
+            }
+            Ok(())
+        });
     }
 
     fn log_unavailable(stages: &[&str]) {
