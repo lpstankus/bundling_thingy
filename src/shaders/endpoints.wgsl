@@ -2,13 +2,13 @@ override block_size: u32;
 
 // Reuse control-point memory after resampling. Four slots per path hold at most two endpoints.
 @group(0) @binding(0) var<storage, read_write> table: array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read_write> paths: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> paths: array<Path>;
 @group(0) @binding(3) var<storage, read_write> state: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> points: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read_write> points: array<Point>;
 @group(0) @binding(7) var<storage, read_write> endpoints: array<u32>;
 
 fn insert(index: u32) {
-    let point = points[index];
+    let point = point_position(points[index]);
     let bits = bitcast<vec2<u32>>(select(point, vec2<f32>(0.0), point == vec2<f32>(0.0)));
     var hash = bits.x * 0x9e3779b9u ^ bits.y;
     hash = (hash ^ (hash >> 16u)) * 0x7feb352du;
@@ -17,7 +17,7 @@ fn insert(index: u32) {
     loop {
         let old = atomicLoad(&table[slot]);
         if old != 0u {
-            if all(points[old - 1u] == point) {
+            if all(point_position(points[old - 1u]) == point) {
                 return;
             }
             slot = (slot + 1u) % arrayLength(&table);
@@ -41,9 +41,9 @@ fn deduplicate(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgr
         return;
     }
     let path = paths[index];
-    if path.w < 2u {
+    if path.count < 2u {
         return;
     }
-    insert(path.x);
-    insert(path.x + path.w - 1u);
+    insert(path.point_offset);
+    insert(path.point_offset + path.count - 1u);
 }

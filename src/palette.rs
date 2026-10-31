@@ -1,5 +1,14 @@
 use clap::ValueEnum;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ColorBy {
+    /// Sample the normalized density map.
+    #[default]
+    Density,
+    /// Map input edge IDs across the palette, with one color per edge.
+    EdgeId,
+}
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum Palette {
     /// Blue to yellow, optimized for red-green color vision deficiencies.

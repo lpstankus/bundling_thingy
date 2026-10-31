@@ -1,4 +1,5 @@
 override block_size: u32;
+override accumulate_density: bool;
 
 struct Parameters {
     minimum: vec2<f32>,
@@ -7,13 +8,6 @@ struct Parameters {
     translation: vec2<f32>,
     capacity: u32,
     padding: u32,
-}
-
-struct Path {
-    point_offset: u32,
-    segment_offset: u32,
-    endpoint_offset: u32,
-    count: u32,
 }
 
 struct Draw {
@@ -35,6 +29,7 @@ struct State {
 struct Cursor {
     count: u32,
     last: vec2<f32>,
+    edge_id: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> control_points: array<vec2<f32>>;
@@ -42,9 +37,9 @@ struct Cursor {
 @group(0) @binding(2) var<storage, read_write> paths: array<Path>;
 @group(0) @binding(3) var<storage, read_write> state: State;
 @group(0) @binding(4) var<uniform> parameters: Parameters;
-@group(0) @binding(5) var<storage, read_write> points: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read_write> points: array<Point>;
 @group(0) @binding(6) var<storage, read_write> segments: array<u32>;
-@group(0) @binding(7) var<storage, read_write> endpoints: array<u32>;
+@group(0) @binding(7) var<storage, read_write> edges: array<Edge>;
 @group(0) @binding(8) var<storage, read_write> density: array<atomic<u32>>;
 
 fn normalized(index: u32) -> vec2<f32> {
@@ -67,15 +62,17 @@ fn push_sample(cursor: ptr<function, Cursor>, point: vec2<f32>, path: Path, writ
             return;
         }
         let index = path.point_offset + (*cursor).count;
-        points[index] = point;
+        points[index] = Point(point.x, point.y, (*cursor).edge_id);
         if (*cursor).count > 0u {
             segments[path.segment_offset + (*cursor).count - 1u] = index - 1u;
         }
-        // Normalization keeps every sample inside the map.
-        let uv = vec2<f32>(point.x * 0.5 + 0.5, 0.5 - point.y * 0.5);
-        let last = vec2<f32>(map.size - vec2<u32>(1u));
-        let cell = vec2<u32>(round(uv * last));
-        atomicAdd(&density[cell.y * map.size.x + cell.x], 1u);
+        if accumulate_density {
+            // Normalization keeps every sample inside the map.
+            let uv = vec2<f32>(point.x * 0.5 + 0.5, 0.5 - point.y * 0.5);
+            let last = vec2<f32>(map.size - vec2<u32>(1u));
+            let cell = vec2<u32>(round(uv * last));
+            atomicAdd(&density[cell.y * map.size.x + cell.x], 1u);
+        }
     }
     (*cursor).last = point;
     (*cursor).count += 1u;
@@ -88,7 +85,7 @@ fn resample(path_index: u32, write: bool) -> u32 {
     let path = paths[path_index];
     let first = normalized(start);
     let texel_scale = vec2<f32>(map.size - vec2<u32>(1u)) * 0.5;
-    var cursor = Cursor(0u, first);
+    var cursor = Cursor(0u, first, path_index);
     push_sample(&cursor, first, path, write);
     var previous = first;
     var remaining = 1.0;
@@ -119,6 +116,9 @@ fn resample(path_index: u32, write: bool) -> u32 {
             remaining = remaining + f32(steps) - distance;
         }
         previous = current;
+    }
+    if !write {
+        edges[path_index] = Edge(first, previous);
     }
     push_sample(&cursor, previous, path, write);
     // A short closed path still needs its excursion and returning endpoint.
@@ -154,8 +154,8 @@ fn count_paths(
         atomicStore(&state.overflow, 1u);
         return;
     }
-    paths[index] = Path(offset, atomicAdd(&state.segments, count - 1u),
-        atomicAdd(&state.endpoints, 2u), count);
+    paths[index] = Path(offset, atomicAdd(&state.segments, count - 1u), count);
+    atomicAdd(&state.endpoints, 2u);
 }
 
 @compute @workgroup_size(block_size)
@@ -180,6 +180,4 @@ fn emit_paths(
     if written != path.count {
         atomicStore(&state.overflow, 2u);
     }
-    endpoints[path.endpoint_offset] = path.point_offset;
-    endpoints[path.endpoint_offset + 1u] = path.point_offset + path.count - 1u;
 }

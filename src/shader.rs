@@ -82,7 +82,12 @@ pub fn module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderM
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(
-            format!("{}\n{source}", include_str!("shaders/map.wgsl")).into(),
+            format!(
+                "{}\n{}\n{source}",
+                include_str!("shaders/map.wgsl"),
+                include_str!("shaders/graph.wgsl")
+            )
+            .into(),
         ),
     })
 }

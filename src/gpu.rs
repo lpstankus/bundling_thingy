@@ -2,7 +2,7 @@ use crate::{
     Options,
     density::{self, Density},
     graph::Graph,
-    palette::Palette,
+    palette::{ColorBy, Palette},
     profiling::GpuTimings,
     resampling::{self, Resampler},
     shader,
@@ -29,6 +29,7 @@ pub struct Gpu {
     endpoint_outline_pipeline: wgpu::RenderPipeline,
     endpoint_pipeline: wgpu::RenderPipeline,
     endpoint_dots: bool,
+    color_by: ColorBy,
     density: Density,
     density_binding: wgpu::BindGroup,
     palette: wgpu::Buffer,
@@ -48,7 +49,7 @@ pub struct Gpu {
 
 struct UploadedGraph {
     bindings: wgpu::BindGroup,
-    commands: wgpu::Buffer,
+    geometry: resampling::Geometry,
 }
 
 impl Gpu {
@@ -117,13 +118,13 @@ impl Gpu {
         );
         let density = Density::new(&device, [width, height], &map)?;
         let [pipeline, endpoint_outline_pipeline, endpoint_pipeline] =
-            Self::pipelines(&device, &adapter, format, opts.msaa)?;
+            Self::pipelines(&device, &adapter, format, opts.msaa, opts.color_by)?;
         let palette = Self::palette_buffer(&device, opts.palette);
         let density_binding =
             Self::density_binding(&device, &pipeline, &density.texture, &palette, &map);
         let density_timings = GpuTimings::new(&device, &queue, &density::TIMING_STAGES)?;
         let render_timings = GpuTimings::new(&device, &queue, &["render.draw"])?;
-        let resampler = Resampler::new(&device, opts.max_graph_memory_mib, opts.endpoint_dots)?;
+        let resampler = Resampler::new(&device, opts)?;
         let resampling_timings = GpuTimings::new(&device, &queue, resampler.timing_stages())?;
         tracing::info!(adapter = %info.name, max_buffer_bytes = limits.max_buffer_size, max_storage_binding_bytes = limits.max_storage_buffer_binding_size, "GPU graph processing");
 
@@ -145,6 +146,7 @@ impl Gpu {
             endpoint_outline_pipeline,
             endpoint_pipeline,
             endpoint_dots: opts.endpoint_dots,
+            color_by: opts.color_by,
             density,
             density_binding,
             palette,
@@ -196,6 +198,7 @@ impl Gpu {
         adapter: &wgpu::Adapter,
         format: wgpu::TextureFormat,
         samples: u32,
+        color_by: ColorBy,
     ) -> Result<[wgpu::RenderPipeline; 3]> {
         let flags = adapter.get_texture_format_features(format).flags;
         ensure!(
@@ -225,8 +228,8 @@ impl Gpu {
             }),
         });
         let graph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("resampled points, segments, and endpoints"),
-            entries: &[0, 1, 2].map(|binding| wgpu::BindGroupLayoutEntry {
+            label: Some("resampled points, segments, endpoint dots, and edges"),
+            entries: &[0, 1, 2, 3].map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
@@ -243,6 +246,10 @@ impl Gpu {
             push_constant_ranges: &[],
         });
 
+        let constants = [(
+            "color_by_edge",
+            f64::from(u8::from(color_by == ColorBy::EdgeId)),
+        )];
         let pipeline = |vertex, fragment| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fragment),
@@ -250,7 +257,10 @@ impl Gpu {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vertex),
-                    compilation_options: PipelineCompilationOptions::default(),
+                    compilation_options: PipelineCompilationOptions {
+                        constants: &constants,
+                        ..Default::default()
+                    },
                     buffers: &[],
                 },
                 primitive: wgpu::PrimitiveState {
@@ -265,7 +275,10 @@ impl Gpu {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some(fragment),
-                    compilation_options: PipelineCompilationOptions::default(),
+                    compilation_options: PipelineCompilationOptions {
+                        constants: &constants,
+                        ..Default::default()
+                    },
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -353,7 +366,9 @@ impl Gpu {
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
-        self.density.clear(&mut encoder);
+        if self.color_by == ColorBy::Density {
+            self.density.clear(&mut encoder);
+        }
         let pending = self.resampler.encode(
             &self.device,
             &mut encoder,
@@ -362,7 +377,9 @@ impl Gpu {
             &self.map,
             &self.resampling_timings,
         )?;
-        self.density.encode(&mut encoder, &self.density_timings);
+        if self.color_by == ColorBy::Density {
+            self.density.encode(&mut encoder, &self.density_timings);
+        }
         self.queue.submit([encoder.finish()]);
         self.wait()?;
         let (geometry, samples) = pending.finish()?;
@@ -373,12 +390,10 @@ impl Gpu {
                 (0, geometry.points.as_entire_binding()),
                 (1, geometry.segments.as_entire_binding()),
                 (2, geometry.endpoints.as_entire_binding()),
+                (3, geometry.edges.as_entire_binding()),
             ],
         );
-        self.graph = Some(UploadedGraph {
-            bindings,
-            commands: geometry.commands,
-        });
+        self.graph = Some(UploadedGraph { bindings, geometry });
         Ok(samples)
     }
 
@@ -410,13 +425,13 @@ impl Gpu {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.density_binding, &[]);
                 pass.set_bind_group(1, &graph.bindings, &[]);
-                pass.draw_indirect(&graph.commands, resampling::PATH_DRAW_OFFSET);
+                pass.draw_indirect(&graph.geometry.commands, resampling::PATH_DRAW_OFFSET);
                 if self.endpoint_dots {
                     // Draw all outlines first so shared endpoints keep their colored centers.
                     pass.set_pipeline(&self.endpoint_outline_pipeline);
-                    pass.draw_indirect(&graph.commands, resampling::ENDPOINT_DRAW_OFFSET);
+                    pass.draw_indirect(&graph.geometry.commands, resampling::ENDPOINT_DRAW_OFFSET);
                     pass.set_pipeline(&self.endpoint_pipeline);
-                    pass.draw_indirect(&graph.commands, resampling::ENDPOINT_DRAW_OFFSET);
+                    pass.draw_indirect(&graph.geometry.commands, resampling::ENDPOINT_DRAW_OFFSET);
                 }
             }
         }

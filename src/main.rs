@@ -11,7 +11,7 @@ use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
 use graph::Graph;
-use palette::Palette;
+use palette::{ColorBy, Palette};
 use std::{
     fs::{self, File},
     path::PathBuf,
@@ -43,9 +43,13 @@ pub struct Options {
     #[arg(long, default_value = "out/rust", requires = "headless")]
     out: PathBuf,
 
-    /// Color palette for normalized path density and endpoint dots.
+    /// Color palette for paths and endpoint dots.
     #[arg(long, value_enum, default_value_t = Palette::default())]
     palette: Palette,
+
+    /// Value used to select each path's gradient color.
+    #[arg(long, value_enum, default_value_t = ColorBy::default())]
+    color_by: ColorBy,
 
     /// Draw dots at the start and end of each path.
     #[arg(long)]

@@ -1,12 +1,8 @@
-use crate::{graph::Graph, profiling::GpuTimings, shader};
+use crate::{Options, graph::Graph, palette::ColorBy, profiling::GpuTimings, shader};
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use wgpu::util::DeviceExt;
 
-const TIMING_STAGES: [&str; 3] = [
-    "graph.count",
-    "graph.emit_and_density",
-    "graph.deduplicate_endpoints",
-];
+const TIMING_STAGES: [&str; 3] = ["graph.count", "graph.emit", "graph.deduplicate_endpoints"];
 pub const PATH_DRAW_OFFSET: u64 = 16;
 pub const ENDPOINT_DRAW_OFFSET: u64 = 32;
 
@@ -14,6 +10,10 @@ const MIB: u64 = 1024 * 1024;
 const WORKGROUP_SIZE: u32 = 8;
 const STATE_BYTES: u64 = 48;
 const STATISTICS_BYTES: u64 = 16;
+const POINT_BYTES: u64 = 12;
+const EDGE_BYTES: u64 = 16;
+const PATH_BYTES: u64 = 12;
+const SAMPLE_BYTES: u64 = POINT_BYTES.saturating_add(4);
 
 pub struct Resampler {
     layout: wgpu::BindGroupLayout,
@@ -43,6 +43,8 @@ struct Parameters {
 
 pub struct Geometry {
     pub points: wgpu::Buffer,
+    pub edges: wgpu::Buffer,
+    pub paths: wgpu::Buffer,
     pub segments: wgpu::Buffer,
     pub endpoints: wgpu::Buffer,
     pub commands: wgpu::Buffer,
@@ -55,12 +57,9 @@ pub struct PendingGraph {
 }
 
 impl Resampler {
-    pub fn new(
-        device: &wgpu::Device,
-        budget_mib: u64,
-        deduplicate_endpoints: bool,
-    ) -> Result<Self> {
-        let budget = budget_mib
+    pub fn new(device: &wgpu::Device, opts: &Options) -> Result<Self> {
+        let budget = opts
+            .max_graph_memory_mib
             .checked_mul(MIB)
             .ok_or_eyre("graph memory budget is too large")?;
         ensure!(budget > 0, "graph memory budget must be nonzero");
@@ -95,10 +94,23 @@ impl Resampler {
             include_str!("shaders/resampling.wgsl"),
         );
         let constants = [("block_size", f64::from(WORKGROUP_SIZE))];
+        let resampling_constants = [
+            ("block_size", f64::from(WORKGROUP_SIZE)),
+            (
+                "accumulate_density",
+                f64::from(u8::from(opts.color_by == ColorBy::Density)),
+            ),
+        ];
         let [count, emit] = ["count_paths", "emit_paths"].map(|entry| {
-            shader::compute(device, &module, entry, Some(&pipeline_layout), &constants)
+            shader::compute(
+                device,
+                &module,
+                entry,
+                Some(&pipeline_layout),
+                &resampling_constants,
+            )
         });
-        let deduplicate = if deduplicate_endpoints {
+        let deduplicate = if opts.endpoint_dots {
             let module =
                 shader::module(device, "endpoints", include_str!("shaders/endpoints.wgsl"));
             Some(shader::compute(
@@ -154,7 +166,7 @@ impl Resampler {
             points: shader::storage(
                 device,
                 "GPU resampled points",
-                u64::from(capacity).saturating_mul(8),
+                u64::from(capacity).saturating_mul(POINT_BYTES),
             ),
             segments: shader::storage(
                 device,
@@ -163,7 +175,7 @@ impl Resampler {
             ),
             capacity,
         });
-        let (bindings, geometry, source) = bind_graph(
+        let ([bindings, endpoint_bindings], geometry, source) = bind_graph(
             device,
             &self.layout,
             graph,
@@ -193,7 +205,15 @@ impl Resampler {
                 timestamp_writes: timings.compute_pass(stage),
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bindings, &[]);
+            pass.set_bind_group(
+                0,
+                if stage == 2 {
+                    &endpoint_bindings
+                } else {
+                    &bindings
+                },
+                &[],
+            );
             pass.dispatch_workgroups(allocation.workgroups[0], allocation.workgroups[1], 1);
         }
         timings.resolve(encoder);
@@ -245,6 +265,7 @@ impl PendingGraph {
 struct Allocation {
     parameters: Parameters,
     path_bytes: u64,
+    edge_bytes: u64,
     endpoint_bytes: u64,
     workgroups: [u32; 2],
     reserved_bytes: u64,
@@ -256,11 +277,13 @@ impl Allocation {
         let path_count = u32::try_from(graph.starts().len().saturating_sub(1))?;
         let point_bytes = u64::try_from(std::mem::size_of_val(graph.points()))?;
         let start_bytes = u64::try_from(std::mem::size_of_val(graph.starts()))?;
-        let path_bytes = u64::from(path_count).saturating_mul(16);
+        let path_bytes = u64::from(path_count).saturating_mul(PATH_BYTES);
+        let edge_bytes = u64::from(path_count).saturating_mul(EDGE_BYTES);
         let endpoint_bytes = u64::from(path_count).saturating_mul(8);
         let fixed_bytes = point_bytes
             .saturating_add(start_bytes)
             .saturating_add(path_bytes)
+            .saturating_add(edge_bytes)
             .saturating_add(endpoint_bytes)
             .saturating_add(u64::try_from(std::mem::size_of::<Parameters>())?)
             .saturating_add(shader::MAP_UNIFORM_BYTES)
@@ -277,12 +300,17 @@ impl Allocation {
             ("control points", point_bytes),
             ("path starts", start_bytes),
             ("path metadata", path_bytes),
+            ("edge endpoints", edge_bytes),
             ("endpoints", endpoint_bytes),
         ] {
             ensure!(bytes <= binding_limit, "{name} exceed GPU buffer limits");
         }
-        // Every sample needs an eight-byte point and at most one four-byte segment index.
-        let capacity = u32::try_from(available.saturating_div(12).min(binding_limit / 8))?;
+        // Every sample needs a packed point and at most one four-byte segment index.
+        let capacity = u32::try_from(
+            available
+                .saturating_div(SAMPLE_BYTES)
+                .min(binding_limit / POINT_BYTES),
+        )?;
         ensure!(
             capacity >= 3,
             "graph memory budget has no room for resampled geometry"
@@ -305,9 +333,11 @@ impl Allocation {
                 padding: 0,
             },
             path_bytes,
+            edge_bytes,
             endpoint_bytes,
             workgroups: [x, y],
-            reserved_bytes: fixed_bytes.saturating_add(u64::from(capacity).saturating_mul(12)),
+            reserved_bytes: fixed_bytes
+                .saturating_add(u64::from(capacity).saturating_mul(SAMPLE_BYTES)),
         })
     }
 }
@@ -320,7 +350,7 @@ fn bind_graph(
     output: &OutputBuffers,
     allocation: &Allocation,
     map: &wgpu::Buffer,
-) -> (wgpu::BindGroup, Geometry, wgpu::Buffer) {
+) -> ([wgpu::BindGroup; 2], Geometry, wgpu::Buffer) {
     let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("graph control points"),
         contents: bytemuck::cast_slice(graph.points()),
@@ -331,8 +361,6 @@ fn bind_graph(
         contents: bytemuck::cast_slice(graph.starts()),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let paths = shader::storage(device, "GPU path reservations", allocation.path_bytes);
-    let endpoints = shader::storage(device, "GPU endpoint indices", allocation.endpoint_bytes);
     let commands = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("GPU graph counts and draw commands"),
         size: STATE_BYTES,
@@ -347,30 +375,32 @@ fn bind_graph(
         "GPU graph normalization and capacity",
         bytemuck::bytes_of(&allocation.parameters),
     );
-    let bindings = shader::bindings(
-        device,
-        layout,
-        [
-            (0, source.as_entire_binding()),
-            (1, starts.as_entire_binding()),
-            (2, paths.as_entire_binding()),
-            (3, commands.as_entire_binding()),
-            (4, parameters.as_entire_binding()),
-            (5, output.points.as_entire_binding()),
-            (6, output.segments.as_entire_binding()),
-            (7, endpoints.as_entire_binding()),
-            (8, counts.as_entire_binding()),
-            (9, map.as_entire_binding()),
-        ],
-    );
-    (
-        bindings,
-        Geometry {
-            points: output.points.clone(),
-            segments: output.segments.clone(),
-            endpoints,
-            commands,
-        },
-        source,
-    )
+    let geometry = Geometry {
+        points: output.points.clone(),
+        edges: shader::storage(device, "GPU edge endpoints", allocation.edge_bytes),
+        paths: shader::storage(device, "GPU path reservations", allocation.path_bytes),
+        segments: output.segments.clone(),
+        endpoints: shader::storage(device, "GPU endpoint indices", allocation.endpoint_bytes),
+        commands,
+    };
+    // Resampling writes edge coordinates; the later deduplication pass writes dot indices.
+    let bindings = [&geometry.edges, &geometry.endpoints].map(|endpoints| {
+        shader::bindings(
+            device,
+            layout,
+            [
+                (0, source.as_entire_binding()),
+                (1, starts.as_entire_binding()),
+                (2, geometry.paths.as_entire_binding()),
+                (3, geometry.commands.as_entire_binding()),
+                (4, parameters.as_entire_binding()),
+                (5, geometry.points.as_entire_binding()),
+                (6, geometry.segments.as_entire_binding()),
+                (7, endpoints.as_entire_binding()),
+                (8, counts.as_entire_binding()),
+                (9, map.as_entire_binding()),
+            ],
+        )
+    });
+    (bindings, geometry, source)
 }
