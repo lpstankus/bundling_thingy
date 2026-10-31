@@ -56,7 +56,7 @@ pub struct Options {
     endpoint_dots: bool,
 
     /// MSAA samples. Use 2 for speed or 4 for smoother edges.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(2..=4))]
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(2..=4))]
     msaa: u32,
 
     /// Enable GPU debugging and validation.
