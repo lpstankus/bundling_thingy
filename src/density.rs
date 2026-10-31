@@ -1,45 +1,67 @@
-use crate::{graph::ResampledGraph, profiling::GpuTimings};
+use crate::{profiling::GpuTimings, shader};
 use color_eyre::eyre::{Result, ensure};
-use wgpu::util::DeviceExt;
+use wgpu::TextureViewDescriptor;
 
-pub const TIMING_STAGES: [&str; 6] = [
-    "density.count",
-    "density.resolve",
+pub const TIMING_STAGES: [&str; 3] = [
     "density.blur_horizontal",
-    "density.blur_vertical",
-    "density.maximum",
+    "density.blur_vertical_and_maximum",
     "density.normalize",
 ];
 
 pub struct Density {
     counts: wgpu::Buffer,
     maximum: wgpu::Buffer,
-    count_pipeline: wgpu::ComputePipeline,
-    stages: [Stage; 5],
+    stages: [Stage; 3],
+    blur_directions: [wgpu::Buffer; 2],
     pub texture: wgpu::Texture,
-}
-
-pub struct DensityInput {
-    points: wgpu::Buffer,
-    dimensions: [u32; 2],
-    workgroups: [u32; 2],
-}
-
-pub struct DensityEncoder<'a> {
-    device: &'a wgpu::Device,
-    commands: &'a mut wgpu::CommandEncoder,
-    timings: &'a GpuTimings,
-    next_query: u32,
 }
 
 struct Stage {
     pipeline: wgpu::ComputePipeline,
     bindings: wgpu::BindGroup,
+    workgroups: [u32; 2],
 }
 
 impl Density {
-    #[tracing::instrument(name = "density.init", skip_all, fields(width = width, height = height), err)]
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self> {
+    pub fn new(device: &wgpu::Device, size: [u32; 2], map: &wgpu::Buffer) -> Result<Self> {
+        let blur = shader::module(device, "blur", include_str!("shaders/blur.wgsl"));
+        let normalization = shader::module(
+            device,
+            "normalization",
+            include_str!("shaders/normalization.wgsl"),
+        );
+        let blur = shader::compute(device, &blur, "blur", None, &[]);
+        let blur_directions = [[1_u32, 0, 0, 0], [0, 1, 0, 0]].map(|direction| {
+            shader::uniform(device, "blur direction", bytemuck::cast_slice(&direction))
+        });
+        let pipelines = [
+            blur.clone(),
+            blur,
+            shader::compute(device, &normalization, "normalize", None, &[]),
+        ];
+        Self::with_pipelines(device, size, pipelines, blur_directions, map)
+    }
+
+    pub fn resize(
+        &self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        map: &wgpu::Buffer,
+    ) -> Result<Self> {
+        let pipelines = self.stages.each_ref().map(|stage| stage.pipeline.clone());
+        Self::with_pipelines(device, size, pipelines, self.blur_directions.clone(), map)
+    }
+
+    #[tracing::instrument(name = "density.allocate", skip_all, fields(width = size[0], height = size[1]), err)]
+    fn with_pipelines(
+        device: &wgpu::Device,
+        size: [u32; 2],
+        pipelines: [wgpu::ComputePipeline; 3],
+        blur_directions: [wgpu::Buffer; 2],
+        map: &wgpu::Buffer,
+    ) -> Result<Self> {
+        let [width, height] = size;
+        let [horizontal, vertical, normalize] = pipelines;
         let limits = device.limits();
         ensure!(
             width > 0 && height > 0,
@@ -57,10 +79,9 @@ impl Density {
             "density map exceeds GPU storage buffer limit"
         );
 
-        let counts = create_buffer(device, "density counts", bytes);
-        let image_a = create_buffer(device, "density image A", bytes);
-        let image_b = create_buffer(device, "density image B", bytes);
-        let maximum = create_buffer(device, "density maximum", 4);
+        let counts = shader::storage(device, "density counts", bytes);
+        let image = shader::storage(device, "horizontal density", bytes);
+        let maximum = shader::storage(device, "density maximum", 4);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -76,219 +97,88 @@ impl Density {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = texture.create_view(&TextureViewDescriptor::default());
 
-        let density_source = include_str!("shaders/density.wgsl");
-        let normalization_source = include_str!("shaders/normalization.wgsl");
-        let count_pipeline = build_pipeline(device, density_source, "count_points", size);
+        let blur_groups = [width.div_ceil(32), height.div_ceil(32)];
+        let [horizontal, vertical] = [
+            (horizontal, &counts, &image, &blur_directions[0]),
+            (vertical, &image, &counts, &blur_directions[1]),
+        ]
+        .map(|(pipeline, input, output, direction)| {
+            Stage::new(
+                device,
+                pipeline,
+                blur_groups,
+                [
+                    (0, input.as_entire_binding()),
+                    (1, output.as_entire_binding()),
+                    (2, direction.as_entire_binding()),
+                    (3, maximum.as_entire_binding()),
+                    (9, map.as_entire_binding()),
+                ],
+            )
+        });
         let stages = [
+            horizontal,
+            vertical,
             Stage::new(
                 device,
-                build_pipeline(device, density_source, "resolve_counts", size),
-                &[buffer_entry(1, &counts), buffer_entry(2, &image_a)],
-            ),
-            Stage::new(
-                device,
-                build_gaussian_pipeline(device, size, 0.0),
-                &[buffer_entry(0, &image_a), buffer_entry(1, &image_b)],
-            ),
-            Stage::new(
-                device,
-                build_gaussian_pipeline(device, size, 1.0),
-                &[buffer_entry(0, &image_b), buffer_entry(1, &image_a)],
-            ),
-            Stage::new(
-                device,
-                build_pipeline(device, normalization_source, "find_maximum", size),
-                &[buffer_entry(0, &image_a), buffer_entry(1, &maximum)],
-            ),
-            Stage::new(
-                device,
-                build_pipeline(device, normalization_source, "normalize", size),
-                &[
-                    buffer_entry(0, &image_a),
-                    buffer_entry(1, &maximum),
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
+                normalize,
+                [width.div_ceil(32), height.div_ceil(4)],
+                [
+                    (0, counts.as_entire_binding()),
+                    (1, maximum.as_entire_binding()),
+                    (2, wgpu::BindingResource::TextureView(&view)),
+                    (9, map.as_entire_binding()),
                 ],
             ),
         ];
         Ok(Self {
             counts,
             maximum,
-            count_pipeline,
             stages,
+            blur_directions,
             texture,
         })
     }
 
-    pub fn encode(&self, mut encoder: DensityEncoder<'_>, input: &DensityInput) -> Result<()> {
-        let size = self.texture.size();
-        ensure!(
-            input.dimensions == [size.width, size.height],
-            "resampled graph dimensions differ from density map"
-        );
-        encoder.commands.clear_buffer(&self.counts, 0, None);
-        encoder.commands.clear_buffer(&self.maximum, 0, None);
-        let stage = Stage::new(
-            encoder.device,
-            self.count_pipeline.clone(),
-            &[
-                buffer_entry(0, &input.points),
-                buffer_entry(1, &self.counts),
-            ],
-        );
-        encoder.dispatch(&stage, input.workgroups);
+    /// Integer counts until encode reuses the buffer for the vertical f32 output.
+    pub const fn counts(&self) -> &wgpu::Buffer {
+        &self.counts
+    }
 
-        let workgroups = [size.width.div_ceil(32), size.height.div_ceil(4)];
-        for stage in &self.stages {
-            encoder.dispatch(stage, workgroups);
+    pub fn clear(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.counts, 0, None);
+        encoder.clear_buffer(&self.maximum, 0, None);
+    }
+
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, timings: &GpuTimings) {
+        for (stage, query) in self.stages.iter().zip(0..) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("density"),
+                timestamp_writes: timings.compute_pass(query),
+            });
+            pass.set_pipeline(&stage.pipeline);
+            pass.set_bind_group(0, &stage.bindings, &[]);
+            pass.dispatch_workgroups(stage.workgroups[0], stage.workgroups[1], 1);
         }
-        encoder.timings.resolve(encoder.commands);
-        Ok(())
-    }
-}
-
-impl DensityInput {
-    pub fn new(device: &wgpu::Device, graph: &ResampledGraph) -> Result<Self> {
-        let count = u32::try_from(graph.points().len())?;
-        let groups = count.div_ceil(256);
-        let limit = device.limits().max_compute_workgroups_per_dimension;
-        let x = groups.min(limit);
-        let y = groups.div_ceil(x);
-        ensure!(y <= limit, "density samples exceed GPU dispatch limit");
-        let contents = bytemuck::cast_slice(graph.points());
-        ensure!(
-            u64::try_from(contents.len())?
-                <= u64::from(device.limits().max_storage_buffer_binding_size),
-            "resampled points exceed GPU storage buffer limit"
-        );
-        Ok(Self {
-            points: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("resampled graph points"),
-                contents,
-                usage: wgpu::BufferUsages::STORAGE,
-            }),
-            dimensions: graph.dimensions(),
-            workgroups: [x, y],
-        })
-    }
-
-    pub const fn points(&self) -> &wgpu::Buffer {
-        &self.points
+        timings.resolve(encoder);
     }
 }
 
 impl Stage {
-    fn new(
+    fn new<const N: usize>(
         device: &wgpu::Device,
         pipeline: wgpu::ComputePipeline,
-        entries: &[wgpu::BindGroupEntry<'_>],
+        workgroups: [u32; 2],
+        inputs: [(u32, wgpu::BindingResource<'_>); N],
     ) -> Self {
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("density"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries,
-        });
-        Self { pipeline, bindings }
-    }
-}
-
-impl<'a> DensityEncoder<'a> {
-    pub const fn new(
-        device: &'a wgpu::Device,
-        commands: &'a mut wgpu::CommandEncoder,
-        timings: &'a GpuTimings,
-    ) -> Self {
+        let layout = pipeline.get_bind_group_layout(0);
+        let bindings = shader::bindings(device, &layout, inputs);
         Self {
-            device,
-            commands,
-            timings,
-            next_query: 0,
+            pipeline,
+            bindings,
+            workgroups,
         }
-    }
-
-    fn dispatch(&mut self, stage: &Stage, [x, y]: [u32; 2]) {
-        let timestamp_writes = self.timings.compute_pass(self.next_query);
-        self.next_query = self.next_query.saturating_add(1);
-        let mut pass = self
-            .commands
-            .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("density"),
-                timestamp_writes,
-            });
-        pass.set_pipeline(&stage.pipeline);
-        pass.set_bind_group(0, &stage.bindings, &[]);
-        pass.dispatch_workgroups(x, y, 1);
-    }
-}
-
-fn create_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-fn build_pipeline(
-    device: &wgpu::Device,
-    source: &str,
-    entry: &str,
-    size: wgpu::Extent3d,
-) -> wgpu::ComputePipeline {
-    create_pipeline(device, source, entry, size, &[])
-}
-
-fn build_gaussian_pipeline(
-    device: &wgpu::Device,
-    size: wgpu::Extent3d,
-    axis: f64,
-) -> wgpu::ComputePipeline {
-    create_pipeline(
-        device,
-        include_str!("shaders/blur.wgsl"),
-        "blur",
-        size,
-        &[("axis", axis)],
-    )
-}
-
-fn create_pipeline(
-    device: &wgpu::Device,
-    source: &str,
-    entry: &str,
-    size: wgpu::Extent3d,
-    constants: &[(&str, f64)],
-) -> wgpu::ComputePipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(entry),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
-    let mut overrides = vec![
-        ("map_width", f64::from(size.width)),
-        ("map_height", f64::from(size.height)),
-    ];
-    overrides.extend_from_slice(constants);
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(entry),
-        layout: None,
-        module: &shader,
-        entry_point: Some(entry),
-        compilation_options: wgpu::PipelineCompilationOptions {
-            constants: &overrides,
-            ..Default::default()
-        },
-        cache: None,
-    })
-}
-
-fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry {
-        binding,
-        resource: buffer.as_entire_binding(),
     }
 }

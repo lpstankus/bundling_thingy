@@ -3,13 +3,15 @@ mod gpu;
 mod graph;
 mod palette;
 mod profiling;
+mod resampling;
+mod shader;
 mod window;
 
-use clap::Parser;
+use clap::{Parser, builder::TypedValueParser};
 use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
 use graph::Graph;
-use palette::Palette;
+use palette::{ColorBy, Palette};
 use std::{
     fs::{self, File},
     path::PathBuf,
@@ -41,17 +43,29 @@ pub struct Options {
     #[arg(long, default_value = "out/rust", requires = "headless")]
     out: PathBuf,
 
-    /// Color palette for normalized path density and endpoint dots.
+    /// Color palette for paths and endpoint dots.
     #[arg(long, value_enum, default_value_t = Palette::default())]
     palette: Palette,
+
+    /// Value used to select each path's gradient color.
+    #[arg(long, value_enum, default_value_t = ColorBy::default())]
+    color_by: ColorBy,
 
     /// Draw dots at the start and end of each path.
     #[arg(long)]
     endpoint_dots: bool,
 
+    /// MSAA samples. Use 2 for speed or 4 for smoother edges.
+    #[arg(long, default_value_t = 4, value_parser = clap::builder::PossibleValuesParser::new(["2", "4"]).try_map(|value| value.parse::<u32>()))]
+    msaa: u32,
+
     /// Enable GPU debugging and validation.
     #[arg(long)]
     validate_gpu: bool,
+
+    /// Maximum graph buffer memory in MiB, excluding density and render targets.
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    max_graph_memory_mib: u64,
 }
 
 fn main() -> Result<()> {
@@ -71,18 +85,10 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
-    let mut gpu = pollster::block_on(Gpu::new(
-        None,
-        opts.validate_gpu,
-        opts.palette,
-        opts.endpoint_dots,
-    ))?;
+    let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
 
-    let mut graph = Graph::load(&opts.input)?;
-    graph.normalize()?;
-    let [width, height] = gpu.dimensions();
-    let graph = graph.resample(width, height)?;
-    gpu.upload(&graph)?;
+    let graph = Graph::load(&opts.input)?;
+    let samples = gpu.upload(&graph)?;
     gpu.render()?;
     let pixels = gpu.readback()?;
 
@@ -102,10 +108,6 @@ fn headless(opts: &Options) -> Result<()> {
         .wrap_err_with(|| format!("write {}", path.display()))?;
     drop(timing);
 
-    println!(
-        "wrote {} with {} samples",
-        path.display(),
-        graph.points().len()
-    );
+    println!("wrote {} with {} samples", path.display(), samples);
     Ok(())
 }
