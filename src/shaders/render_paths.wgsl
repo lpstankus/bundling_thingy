@@ -38,8 +38,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     let point = points[index];
     let first = point_position(point);
     let second = point_position(points[index + 1u]);
-    let direction = normalize(second - first);
-    let normal = vec2<f32>(-direction.y, direction.x) * 0.001;
+    let delta = second - first;
+    // A mean update can collapse both ends of a segment to the same position.
+    let normal = vec2<f32>(-delta.y, delta.x) * (0.001 / max(length(delta), 1e-10));
     let corner = CORNERS[vertex];
     let position = mix(first, second, corner.x) + normal * corner.y;
     var out: VertexOutput;
