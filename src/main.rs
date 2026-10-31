@@ -7,7 +7,7 @@ mod resampling;
 mod shader;
 mod window;
 
-use clap::Parser;
+use clap::{Parser, builder::TypedValueParser};
 use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
 use graph::Graph;
@@ -56,7 +56,7 @@ pub struct Options {
     endpoint_dots: bool,
 
     /// MSAA samples. Use 2 for speed or 4 for smoother edges.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(2..=4))]
+    #[arg(long, default_value_t = 4, value_parser = clap::builder::PossibleValuesParser::new(["2", "4"]).try_map(|value| value.parse::<u32>()))]
     msaa: u32,
 
     /// Enable GPU debugging and validation.
