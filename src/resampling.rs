@@ -21,6 +21,7 @@ pub struct Resampler {
     emit: wgpu::ComputePipeline,
     deduplicate: Option<wgpu::ComputePipeline>,
     budget: u64,
+    sample_bytes: u64,
     output: Option<OutputBuffers>,
 }
 
@@ -129,6 +130,11 @@ impl Resampler {
             emit,
             deduplicate,
             budget,
+            sample_bytes: SAMPLE_BYTES.saturating_add(if opts.neighbor_radius.is_some() {
+                POINT_BYTES
+            } else {
+                0
+            }),
             output: None,
         })
     }
@@ -151,7 +157,7 @@ impl Resampler {
         map: &wgpu::Buffer,
         timings: &GpuTimings,
     ) -> Result<PendingGraph> {
-        let allocation = Allocation::new(device, graph, self.budget)?;
+        let allocation = Allocation::new(device, graph, self.budget, self.sample_bytes)?;
         let capacity = allocation.parameters.capacity;
 
         if self
@@ -272,7 +278,7 @@ struct Allocation {
 }
 
 impl Allocation {
-    fn new(device: &wgpu::Device, graph: &Graph, budget: u64) -> Result<Self> {
+    fn new(device: &wgpu::Device, graph: &Graph, budget: u64, sample_bytes: u64) -> Result<Self> {
         let normalization = graph.normalization()?;
         let path_count = u32::try_from(graph.starts().len().saturating_sub(1))?;
         let point_bytes = u64::try_from(std::mem::size_of_val(graph.points()))?;
@@ -305,10 +311,11 @@ impl Allocation {
         ] {
             ensure!(bytes <= binding_limit, "{name} exceed GPU buffer limits");
         }
-        // Every sample needs a packed point and at most one four-byte segment index.
+        // Include a second point buffer when the neighbor mean pass is enabled.
         let capacity = u32::try_from(
             available
-                .saturating_div(SAMPLE_BYTES)
+                .checked_div(sample_bytes)
+                .ok_or_eyre("sample buffer stride must be nonzero")?
                 .min(binding_limit / POINT_BYTES),
         )?;
         ensure!(
@@ -337,7 +344,7 @@ impl Allocation {
             endpoint_bytes,
             workgroups: [x, y],
             reserved_bytes: fixed_bytes
-                .saturating_add(u64::from(capacity).saturating_mul(SAMPLE_BYTES)),
+                .saturating_add(u64::from(capacity).saturating_mul(sample_bytes)),
         })
     }
 }

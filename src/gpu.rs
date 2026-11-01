@@ -2,6 +2,7 @@ use crate::{
     Options,
     density::{self, Density},
     graph::Graph,
+    neighbor_mean::NeighborMean,
     palette::{ColorBy, Palette},
     profiling::GpuTimings,
     resampling::{self, Resampler},
@@ -37,6 +38,7 @@ pub struct Gpu {
     render_timings: GpuTimings,
     resampling_timings: GpuTimings,
     resampler: Resampler,
+    neighbor_mean: Option<NeighborMean>,
     graph: Option<UploadedGraph>,
 
     target: wgpu::Texture,
@@ -50,6 +52,7 @@ pub struct Gpu {
 struct UploadedGraph {
     bindings: wgpu::BindGroup,
     geometry: resampling::Geometry,
+    samples: u32,
 }
 
 impl Gpu {
@@ -84,22 +87,7 @@ impl Gpu {
         );
 
         let limits = adapter.limits();
-        let mut features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-        if opts.msaa == 2 {
-            features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-        }
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Bundling Thingy"),
-                required_features: features,
-                required_limits: wgpu::Limits {
-                    max_buffer_size: limits.max_buffer_size,
-                    max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await?;
+        let (device, queue) = Self::request_device(&adapter, opts.msaa).await?;
 
         let config = if let (Some(surface), Some(window)) = (&surface, &window) {
             Some(Self::configure_surface(&device, &adapter, surface, window)?)
@@ -126,6 +114,10 @@ impl Gpu {
         let render_timings = GpuTimings::new(&device, &queue, &["render.draw"])?;
         let resampler = Resampler::new(&device, opts)?;
         let resampling_timings = GpuTimings::new(&device, &queue, resampler.timing_stages())?;
+        let neighbor_mean = opts
+            .neighbor_radius
+            .map(|radius| NeighborMean::new(&device, &queue, radius, opts.color_by, &map))
+            .transpose()?;
         tracing::info!(adapter = %info.name, max_buffer_bytes = limits.max_buffer_size, max_storage_binding_bytes = limits.max_storage_buffer_binding_size, "GPU graph processing");
 
         let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
@@ -154,6 +146,7 @@ impl Gpu {
             render_timings,
             resampling_timings,
             resampler,
+            neighbor_mean,
             graph: None,
             target,
             msaa,
@@ -161,6 +154,29 @@ impl Gpu {
             download,
             surface: surface.zip(config),
         })
+    }
+
+    async fn request_device(
+        adapter: &wgpu::Adapter,
+        samples: u32,
+    ) -> Result<(wgpu::Device, wgpu::Queue)> {
+        let limits = adapter.limits();
+        let mut features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        if samples == 2 {
+            features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
+        Ok(adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Bundling Thingy"),
+                required_features: features,
+                required_limits: wgpu::Limits {
+                    max_buffer_size: limits.max_buffer_size,
+                    max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?)
     }
 
     fn configure_surface(
@@ -363,6 +379,9 @@ impl Gpu {
     #[tracing::instrument(name = "gpu.process_graph", skip_all, err)]
     pub fn upload(&mut self, graph: &Graph) -> Result<u32> {
         self.graph = None;
+        if let Some(neighbor_mean) = &mut self.neighbor_mean {
+            neighbor_mean.reset();
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -383,18 +402,58 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         self.wait()?;
         let (geometry, samples) = pending.finish()?;
-        let bindings = shader::bindings(
+        let bindings = Self::graph_bindings(&self.device, &self.pipeline, &geometry);
+        self.graph = Some(UploadedGraph {
+            bindings,
+            geometry,
+            samples,
+        });
+        Ok(samples)
+    }
+
+    #[tracing::instrument(name = "graph.iteration", skip_all, err)]
+    pub fn iterate(&mut self) -> Result<()> {
+        let neighbor_mean = self
+            .neighbor_mean
+            .as_mut()
+            .ok_or_eyre("neighbor radius is not configured")?;
+        let graph = self.graph.as_mut().ok_or_eyre("no uploaded graph")?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        if self.color_by == ColorBy::Density {
+            self.density.clear(&mut encoder);
+        }
+        neighbor_mean.encode(
             &self.device,
-            &self.pipeline.get_bind_group_layout(1),
+            &mut encoder,
+            &mut graph.geometry,
+            graph.samples,
+            self.density.counts(),
+        )?;
+        if self.color_by == ColorBy::Density {
+            self.density.encode(&mut encoder, &self.density_timings);
+        }
+        graph.bindings = Self::graph_bindings(&self.device, &self.pipeline, &graph.geometry);
+        self.queue.submit([encoder.finish()]);
+        self.wait()
+    }
+
+    fn graph_bindings(
+        device: &wgpu::Device,
+        pipeline: &wgpu::RenderPipeline,
+        geometry: &resampling::Geometry,
+    ) -> wgpu::BindGroup {
+        shader::bindings(
+            device,
+            &pipeline.get_bind_group_layout(1),
             [
                 (0, geometry.points.as_entire_binding()),
                 (1, geometry.segments.as_entire_binding()),
                 (2, geometry.endpoints.as_entire_binding()),
                 (3, geometry.edges.as_entire_binding()),
             ],
-        );
-        self.graph = Some(UploadedGraph { bindings, geometry });
-        Ok(samples)
+        )
     }
 
     fn encode_draw(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {

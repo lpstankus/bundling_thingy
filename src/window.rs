@@ -32,6 +32,7 @@ struct Running {
 
     graphs: Vec<(&'static str, Graph)>,
     index: usize,
+    iterations: u32,
     dirty: bool,
     last_title_update: Instant,
 }
@@ -62,6 +63,7 @@ impl Running {
             gpu,
             graphs,
             index: 0,
+            iterations: opts.neighbor_radius.map_or(0, |_| opts.iterations),
             dirty: true,
             last_title_update: Instant::now(),
         })
@@ -78,7 +80,9 @@ impl Running {
 
         if self.dirty {
             self.gpu.upload(graph)?;
-
+            for _ in 0..self.iterations {
+                self.gpu.iterate()?;
+            }
             self.dirty = false;
         }
 

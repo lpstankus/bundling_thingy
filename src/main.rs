@@ -1,6 +1,7 @@
 mod density;
 mod gpu;
 mod graph;
+mod neighbor_mean;
 mod palette;
 mod profiling;
 mod resampling;
@@ -14,7 +15,7 @@ use graph::Graph;
 use palette::{ColorBy, Palette};
 use std::{
     fs::{self, File},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Parser)]
@@ -55,6 +56,14 @@ pub struct Options {
     #[arg(long)]
     endpoint_dots: bool,
 
+    /// Mean-update radius in texels. Endpoints remain fixed.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    neighbor_radius: Option<u32>,
+
+    /// Mean updates per graph. Headless exports every iteration.
+    #[arg(long, default_value_t = 1, requires = "neighbor_radius", value_parser = clap::value_parser!(u32).range(1..))]
+    iterations: u32,
+
     /// MSAA samples. Use 2 for speed or 4 for smoother edges.
     #[arg(long, default_value_t = 4, value_parser = clap::builder::PossibleValuesParser::new(["2", "4"]).try_map(|value| value.parse::<u32>()))]
     msaa: u32,
@@ -89,13 +98,29 @@ fn headless(opts: &Options) -> Result<()> {
 
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
+    write_image(&gpu, &opts.out.join("original.png"))?;
+    if opts.neighbor_radius.is_some() {
+        for iteration in 1..=opts.iterations {
+            let _timing = tracing::info_span!("iteration", iteration).entered();
+            gpu.iterate()?;
+            let name = if opts.iterations == 1 {
+                "neighbor-mean.png".to_owned()
+            } else {
+                format!("iteration-{iteration:02}.png")
+            };
+            write_image(&gpu, &opts.out.join(name))?;
+        }
+    }
+    println!("rendered {} samples to {}", samples, opts.out.display());
+    Ok(())
+}
+
+fn write_image(gpu: &Gpu, path: &Path) -> Result<()> {
     gpu.render()?;
     let pixels = gpu.readback()?;
-
-    let path = opts.out.join("original.png");
-    let timing = tracing::info_span!("png.write", output = %path.display()).entered();
+    let _timing = tracing::info_span!("png.write", output = %path.display()).entered();
     let mut encoder = png::Encoder::new(
-        File::create(&path).wrap_err_with(|| format!("create {}", path.display()))?,
+        File::create(path).wrap_err_with(|| format!("create {}", path.display()))?,
         SIZE,
         SIZE,
     );
@@ -106,8 +131,6 @@ fn headless(opts: &Options) -> Result<()> {
         .write_image_data(&pixels)
         .and_then(|()| writer.finish())
         .wrap_err_with(|| format!("write {}", path.display()))?;
-    drop(timing);
-
-    println!("wrote {} with {} samples", path.display(), samples);
+    println!("wrote {}", path.display());
     Ok(())
 }
