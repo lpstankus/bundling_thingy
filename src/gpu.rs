@@ -112,11 +112,20 @@ impl Gpu {
             Self::density_binding(&device, &pipeline, &density.texture, &palette, &map);
         let density_timings = GpuTimings::new(&device, &queue, &density::TIMING_STAGES)?;
         let render_timings = GpuTimings::new(&device, &queue, &["render.draw"])?;
-        let resampler = Resampler::new(&device, opts)?;
+        let resampler = Resampler::new(&device, opts, [width, height])?;
         let resampling_timings = GpuTimings::new(&device, &queue, resampler.timing_stages())?;
         let neighbor_mean = opts
             .neighbor_radius
-            .map(|radius| NeighborMean::new(&device, &queue, radius, opts.color_by, &map))
+            .map(|radius| {
+                NeighborMean::new(
+                    &device,
+                    &queue,
+                    radius,
+                    [width, height],
+                    opts.color_by,
+                    &map,
+                )
+            })
             .transpose()?;
         tracing::info!(adapter = %info.name, max_buffer_bytes = limits.max_buffer_size, max_storage_binding_bytes = limits.max_storage_buffer_binding_size, "GPU graph processing");
 
@@ -547,6 +556,11 @@ impl Gpu {
                 return Ok(());
             }
             let _timing = tracing::info_span!("gpu.resize", width, height).entered();
+            if let Some(neighbor_mean) = &mut self.neighbor_mean {
+                self.resampler
+                    .resize_grid([width, height], neighbor_mean.radius())?;
+                neighbor_mean.resize(&self.device, [width, height])?;
+            }
             let density = self
                 .density
                 .resize(&self.device, [width, height], &self.map)?;

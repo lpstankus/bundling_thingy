@@ -1,4 +1,11 @@
-use crate::{Options, graph::Graph, palette::ColorBy, profiling::GpuTimings, shader};
+use crate::{
+    Options,
+    graph::Graph,
+    neighbor_mean::{self, NeighborMean},
+    palette::ColorBy,
+    profiling::GpuTimings,
+    shader,
+};
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use wgpu::util::DeviceExt;
 
@@ -22,6 +29,7 @@ pub struct Resampler {
     deduplicate: Option<wgpu::ComputePipeline>,
     budget: u64,
     sample_bytes: u64,
+    grid_bytes: u64,
     output: Option<OutputBuffers>,
 }
 
@@ -58,12 +66,19 @@ pub struct PendingGraph {
 }
 
 impl Resampler {
-    pub fn new(device: &wgpu::Device, opts: &Options) -> Result<Self> {
+    pub fn new(device: &wgpu::Device, opts: &Options, size: [u32; 2]) -> Result<Self> {
         let budget = opts
             .max_graph_memory_mib
             .checked_mul(MIB)
             .ok_or_eyre("graph memory budget is too large")?;
         ensure!(budget > 0, "graph memory budget must be nonzero");
+        let grid_bytes = opts
+            .neighbor_radius
+            .map_or(0, |radius| NeighborMean::grid_bytes(size, radius));
+        ensure!(
+            grid_bytes < budget,
+            "neighbor grid exceeds --max-graph-memory-mib; increase the budget or --neighbor-radius"
+        );
         let entries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -131,10 +146,11 @@ impl Resampler {
             deduplicate,
             budget,
             sample_bytes: SAMPLE_BYTES.saturating_add(if opts.neighbor_radius.is_some() {
-                POINT_BYTES
+                neighbor_mean::EXTRA_SAMPLE_BYTES
             } else {
                 0
             }),
+            grid_bytes,
             output: None,
         })
     }
@@ -147,6 +163,16 @@ impl Resampler {
         }
     }
 
+    pub fn resize_grid(&mut self, size: [u32; 2], radius: u32) -> Result<()> {
+        let bytes = NeighborMean::grid_bytes(size, radius);
+        ensure!(
+            bytes < self.budget,
+            "neighbor grid exceeds --max-graph-memory-mib; increase the budget or --neighbor-radius"
+        );
+        self.grid_bytes = bytes;
+        Ok(())
+    }
+
     #[tracing::instrument(name = "graph.prepare_gpu", skip_all, err)]
     pub fn encode(
         &mut self,
@@ -157,7 +183,13 @@ impl Resampler {
         map: &wgpu::Buffer,
         timings: &GpuTimings,
     ) -> Result<PendingGraph> {
-        let allocation = Allocation::new(device, graph, self.budget, self.sample_bytes)?;
+        let allocation = Allocation::new(
+            device,
+            graph,
+            self.budget,
+            self.sample_bytes,
+            self.grid_bytes,
+        )?;
         let capacity = allocation.parameters.capacity;
 
         if self
@@ -278,7 +310,13 @@ struct Allocation {
 }
 
 impl Allocation {
-    fn new(device: &wgpu::Device, graph: &Graph, budget: u64, sample_bytes: u64) -> Result<Self> {
+    fn new(
+        device: &wgpu::Device,
+        graph: &Graph,
+        budget: u64,
+        sample_bytes: u64,
+        grid_bytes: u64,
+    ) -> Result<Self> {
         let normalization = graph.normalization()?;
         let path_count = u32::try_from(graph.starts().len().saturating_sub(1))?;
         let point_bytes = u64::try_from(std::mem::size_of_val(graph.points()))?;
@@ -294,10 +332,11 @@ impl Allocation {
             .saturating_add(u64::try_from(std::mem::size_of::<Parameters>())?)
             .saturating_add(shader::MAP_UNIFORM_BYTES)
             .saturating_add(STATE_BYTES)
-            .saturating_add(STATISTICS_BYTES);
-        let available = budget
-            .checked_sub(fixed_bytes)
-            .ok_or_eyre("control points and path metadata exceed --max-graph-memory-mib")?;
+            .saturating_add(STATISTICS_BYTES)
+            .saturating_add(grid_bytes);
+        let available = budget.checked_sub(fixed_bytes).ok_or_eyre(
+            "control points, path metadata, and neighbor grid exceed --max-graph-memory-mib",
+        )?;
         let limits = device.limits();
         let binding_limit = limits
             .max_buffer_size
@@ -311,7 +350,7 @@ impl Allocation {
         ] {
             ensure!(bytes <= binding_limit, "{name} exceed GPU buffer limits");
         }
-        // Include a second point buffer when the neighbor mean pass is enabled.
+        // Include output points, indexed positions, and query tasks when neighbor means are enabled.
         let capacity = u32::try_from(
             available
                 .checked_div(sample_bytes)
