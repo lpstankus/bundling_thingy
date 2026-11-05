@@ -195,6 +195,8 @@ pub struct Snapshot<'a> {
 impl Snapshot<'_> {
     #[must_use]
     pub fn edges(&self) -> impl ExactSizeIterator<Item = (u32, &[[f32; 2]])> {
+        // Layout validates the ranges and Decoder verifies the final length.
+        // Both remain private and unchanged after construction.
         self.layout.edges.iter().map(|edge| {
             (
                 edge.id,

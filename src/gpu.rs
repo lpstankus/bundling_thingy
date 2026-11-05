@@ -416,13 +416,13 @@ impl Gpu {
                 .map_async(wgpu::MapMode::Read, move |result| {
                     let _ = send.send(result);
                 });
-            if let Err(error) = self.wait().and_then(|()| {
-                receive.recv()??;
-                Ok(())
-            }) {
-                staging.unmap();
+            if let Err(error) = self.wait() {
+                // Poll failure leaves the map state uncertain. Retire this run's staging buffer.
+                staging.destroy();
                 return Err(error);
             }
+            // A failed map callback already leaves the buffer unmapped.
+            receive.recv()??;
             let mapped = staging.slice(..count).get_mapped_range();
             let result = consume(&mapped);
             drop(mapped);
