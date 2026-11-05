@@ -13,6 +13,8 @@ const TIMING_STAGES: [&str; 3] = ["graph.count", "graph.emit", "graph.deduplicat
 pub const PATH_DRAW_OFFSET: u64 = 16;
 pub const ENDPOINT_DRAW_OFFSET: u64 = 32;
 
+pub const DISTORTION_STAGING_BYTES: u64 = 4_194_300;
+
 const MIB: u64 = 1024 * 1024;
 const WORKGROUP_SIZE: u32 = 8;
 const STATE_BYTES: u64 = 48;
@@ -30,6 +32,7 @@ pub struct Resampler {
     budget: u64,
     sample_bytes: u64,
     grid_bytes: u64,
+    staging_bytes: u64,
     output: Option<OutputBuffers>,
 }
 
@@ -75,9 +78,14 @@ impl Resampler {
         let grid_bytes = opts
             .neighbor_radius
             .map_or(0, |radius| NeighborMean::grid_bytes(size, radius));
+        let staging_bytes = if opts.evaluate_distortion {
+            DISTORTION_STAGING_BYTES
+        } else {
+            0
+        };
         ensure!(
-            grid_bytes < budget,
-            "neighbor grid exceeds --max-graph-memory-mib; increase the budget or --neighbor-radius"
+            grid_bytes.saturating_add(staging_bytes) < budget,
+            "neighbor grid and optional distortion staging exceed --max-graph-memory-mib; increase the budget or --neighbor-radius"
         );
         let entries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -151,6 +159,7 @@ impl Resampler {
                 0
             }),
             grid_bytes,
+            staging_bytes,
             output: None,
         })
     }
@@ -166,8 +175,8 @@ impl Resampler {
     pub fn resize_grid(&mut self, size: [u32; 2], radius: u32) -> Result<()> {
         let bytes = NeighborMean::grid_bytes(size, radius);
         ensure!(
-            bytes < self.budget,
-            "neighbor grid exceeds --max-graph-memory-mib; increase the budget or --neighbor-radius"
+            bytes.saturating_add(self.staging_bytes) < self.budget,
+            "neighbor grid and optional distortion staging exceed --max-graph-memory-mib; increase the budget or --neighbor-radius"
         );
         self.grid_bytes = bytes;
         Ok(())
@@ -188,7 +197,7 @@ impl Resampler {
             graph,
             self.budget,
             self.sample_bytes,
-            self.grid_bytes,
+            self.grid_bytes.saturating_add(self.staging_bytes),
         )?;
         let capacity = allocation.parameters.capacity;
 

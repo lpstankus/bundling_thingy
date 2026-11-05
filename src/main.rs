@@ -1,14 +1,17 @@
 mod density;
+mod distortion_report;
 mod gpu;
 mod graph;
 mod neighbor_mean;
 mod noisiness;
 mod palette;
 mod profiling;
+mod report;
 mod resampling;
 mod shader;
 mod window;
 
+use bundling_wgpu::distortion::{Aggregate, Curve};
 use clap::{Parser, builder::TypedValueParser};
 use color_eyre::eyre::{Result, WrapErr};
 use gpu::{Gpu, SIZE};
@@ -36,6 +39,10 @@ pub struct Options {
     /// Measure exported RGB occupancy and write noisiness.json.
     #[arg(long, requires = "headless")]
     evaluate_noisiness: bool,
+
+    /// Measure GPU geometry displacement and write distortion.json.
+    #[arg(long, requires = "headless")]
+    evaluate_distortion: bool,
 
     /// Accepted for compatibility; headless exports always resample.
     #[arg(long = "resample", requires = "headless", hide = true)]
@@ -99,7 +106,9 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
-    noisiness::invalidate(&opts.out)?;
+    report::invalidate(&opts.out, "distortion.json")?;
+    report::invalidate(&opts.out, "noisiness.json")?;
+    let mut distortion_images = Vec::new();
 
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
 
@@ -115,7 +124,28 @@ fn headless(opts: &Options) -> Result<()> {
 
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
+    let layout = if opts.evaluate_distortion {
+        Some(gpu.distortion_layout()?)
+    } else {
+        None
+    };
+    let baseline = layout
+        .as_ref()
+        .map(|layout| gpu.distortion_snapshot(layout))
+        .transpose()?;
+    if let Some(baseline) = &baseline {
+        baseline.validate_baseline()?;
+    }
     write_image(&gpu, &opts.out, "original.png", 0, report.as_mut())?;
+    if baseline.is_some() {
+        println!("original.png distortion=0 rms_displacement_pixels=0");
+        distortion_images.push(serde_json::json!({
+            "file": "original.png",
+            "iteration": 0,
+            "distortion": 0.0,
+            "rms_displacement_pixels": 0.0
+        }));
+    }
     if opts.neighbor_radius.is_some() {
         for iteration in 1..=opts.iterations {
             let _timing = tracing::info_span!("iteration", iteration).entered();
@@ -126,10 +156,35 @@ fn headless(opts: &Options) -> Result<()> {
                 format!("iteration-{iteration:02}.png")
             };
             write_image(&gpu, &opts.out, &name, iteration, report.as_mut())?;
+            if let Some(baseline) = &baseline {
+                let _capture =
+                    tracing::info_span!("distortion.capture", file = %name, iteration).entered();
+                let current = gpu.distortion_snapshot(baseline.layout())?;
+                let _measure =
+                    tracing::info_span!("distortion.measure", file = %name, iteration).entered();
+                let mut aggregate = Aggregate::default();
+                for ((_, original), (_, changed)) in baseline.edges().zip(current.edges()) {
+                    aggregate.add(&Curve::new(original)?, &Curve::new(changed)?)?;
+                }
+                let result = aggregate.finish(SIZE)?;
+                distortion_images.push(serde_json::json!({
+                    "file": name,
+                    "iteration": iteration,
+                    "distortion": result.distortion,
+                    "rms_displacement_pixels": result.rms_displacement_pixels
+                }));
+                println!(
+                    "{name} distortion={} rms_displacement_pixels={}",
+                    result.distortion, result.rms_displacement_pixels
+                );
+            }
         }
     }
     if let Some(report) = report {
         report.write(opts)?;
+    }
+    if let Some(layout) = &layout {
+        distortion_report::write(opts, layout, &distortion_images)?;
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())
