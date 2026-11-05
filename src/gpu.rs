@@ -40,6 +40,7 @@ pub struct Gpu {
     resampler: Resampler,
     neighbor_mean: Option<NeighborMean>,
     graph: Option<UploadedGraph>,
+    distortion_staging: Option<wgpu::Buffer>,
 
     target: wgpu::Texture,
     msaa: wgpu::TextureView,
@@ -140,6 +141,7 @@ impl Gpu {
         });
 
         Ok(Self {
+            distortion_staging: Self::create_distortion_staging(&device, opts),
             device,
             queue,
             map,
@@ -162,6 +164,17 @@ impl Gpu {
             sample_count: opts.msaa,
             download,
             surface: surface.zip(config),
+        })
+    }
+
+    fn create_distortion_staging(device: &wgpu::Device, opts: &Options) -> Option<wgpu::Buffer> {
+        opts.evaluate_distortion.then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("distortion staging"),
+                size: resampling::DISTORTION_STAGING_BYTES,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
         })
     }
 
@@ -375,6 +388,95 @@ impl Gpu {
                 },
             view_formats: &[],
         })
+    }
+
+    fn geometry_chunks(
+        &self,
+        source: &wgpu::Buffer,
+        bytes: u64,
+        mut consume: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let staging = self
+            .distortion_staging
+            .as_ref()
+            .ok_or_eyre("distortion staging disabled")?;
+        let mut offset = 0;
+        while offset < bytes {
+            let count = bytes
+                .saturating_sub(offset)
+                .min(resampling::DISTORTION_STAGING_BYTES);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            encoder.copy_buffer_to_buffer(source, offset, staging, 0, count);
+            self.queue.submit([encoder.finish()]);
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            staging
+                .slice(..count)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = send.send(result);
+                });
+            if let Err(error) = self.wait().and_then(|()| {
+                receive.recv()??;
+                Ok(())
+            }) {
+                staging.unmap();
+                return Err(error);
+            }
+            let mapped = staging.slice(..count).get_mapped_range();
+            let result = consume(&mapped);
+            drop(mapped);
+            staging.unmap();
+            result?;
+            offset = offset
+                .checked_add(count)
+                .ok_or_eyre("readback offset overflow")?;
+        }
+        Ok(())
+    }
+
+    pub fn distortion_layout(&self) -> Result<bundling_wgpu::geometry::Layout> {
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        let mut paths = Vec::new();
+        paths.try_reserve_exact(usize::try_from(graph.geometry.paths.size() / 12)?)?;
+        self.geometry_chunks(
+            &graph.geometry.paths,
+            graph.geometry.paths.size(),
+            |bytes| {
+                for record in bytes.as_chunks::<12>().0 {
+                    let [point, segment, count] = *record.as_chunks::<4>().0 else {
+                        color_eyre::eyre::bail!("invalid path record");
+                    };
+                    paths.push(bundling_wgpu::geometry::Reservation {
+                        point_offset: usize::try_from(u32::from_le_bytes(point))?,
+                        segment_offset: usize::try_from(u32::from_le_bytes(segment))?,
+                        count: usize::try_from(u32::from_le_bytes(count))?,
+                    });
+                }
+                Ok(())
+            },
+        )?;
+        tracing::info!(
+            staging_bytes = resampling::DISTORTION_STAGING_BYTES,
+            snapshot_bytes = u64::from(graph.samples) * 8,
+            metadata_bytes = std::mem::size_of_val(paths.as_slice()),
+            "distortion CPU storage per snapshot"
+        );
+        bundling_wgpu::geometry::Layout::new(&paths, usize::try_from(graph.samples)?)
+    }
+
+    pub fn distortion_snapshot<'a>(
+        &self,
+        layout: &'a bundling_wgpu::geometry::Layout,
+    ) -> Result<bundling_wgpu::geometry::Snapshot<'a>> {
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        let mut decoder = layout.decoder(usize::try_from(graph.samples)?)?;
+        self.geometry_chunks(
+            &graph.geometry.points,
+            u64::from(graph.samples) * 12,
+            |bytes| decoder.push(bytes),
+        )?;
+        decoder.finish()
     }
 
     fn wait(&self) -> Result<()> {

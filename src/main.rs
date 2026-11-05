@@ -37,6 +37,10 @@ pub struct Options {
     #[arg(long, requires = "headless")]
     evaluate_noisiness: bool,
 
+    /// Measure GPU geometry displacement for each exported image.
+    #[arg(long, requires = "headless")]
+    evaluate_distortion: bool,
+
     /// Accepted for compatibility; headless exports always resample.
     #[arg(long = "resample", requires = "headless", hide = true)]
     _resample: bool,
@@ -115,7 +119,22 @@ fn headless(opts: &Options) -> Result<()> {
 
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
+    let layout = if opts.evaluate_distortion {
+        Some(gpu.distortion_layout()?)
+    } else {
+        None
+    };
+    let baseline = layout
+        .as_ref()
+        .map(|layout| gpu.distortion_snapshot(layout))
+        .transpose()?;
+    if let Some(baseline) = &baseline {
+        baseline.validate_baseline()?;
+    }
     write_image(&gpu, &opts.out, "original.png", 0, report.as_mut())?;
+    if baseline.is_some() {
+        println!("original.png distortion=0 rms_displacement_pixels=0");
+    }
     if opts.neighbor_radius.is_some() {
         for iteration in 1..=opts.iterations {
             let _timing = tracing::info_span!("iteration", iteration).entered();
@@ -126,6 +145,21 @@ fn headless(opts: &Options) -> Result<()> {
                 format!("iteration-{iteration:02}.png")
             };
             write_image(&gpu, &opts.out, &name, iteration, report.as_mut())?;
+            if let Some(baseline) = &baseline {
+                let current = gpu.distortion_snapshot(baseline.layout())?;
+                let mut aggregate = bundling_wgpu::distortion::Aggregate::default();
+                for ((_, original), (_, changed)) in baseline.edges().zip(current.edges()) {
+                    aggregate.add(
+                        &bundling_wgpu::distortion::Curve::new(original)?,
+                        &bundling_wgpu::distortion::Curve::new(changed)?,
+                    )?;
+                }
+                let result = aggregate.finish(SIZE)?;
+                println!(
+                    "{name} distortion={} rms_displacement_pixels={}",
+                    result.distortion, result.rms_displacement_pixels
+                );
+            }
         }
     }
     if let Some(report) = report {
