@@ -1,6 +1,5 @@
 use color_eyre::eyre::{OptionExt, Result, WrapErr, ensure};
 use serde::Serialize;
-use std::{fs, io::ErrorKind, path::Path};
 
 use crate::{Options, gpu::SIZE};
 use clap::ValueEnum;
@@ -134,19 +133,6 @@ impl Report {
             "bundling": { "neighbor_radius": opts.neighbor_radius, "iterations": self.images.last().map_or(0, |image| image.iteration) },
             "images": self.images
         });
-        let path = opts.out.join("noisiness.json");
-        let temporary = opts.out.join("noisiness.json.tmp");
-        let bytes = serde_json::to_vec_pretty(&report).wrap_err("serialize noisiness report")?;
-        fs::write(&temporary, bytes).wrap_err_with(|| format!("write {}", temporary.display()))?;
-        fs::rename(&temporary, &path).wrap_err_with(|| format!("publish {}", path.display()))
-    }
-}
-
-pub fn invalidate(directory: &Path) -> Result<()> {
-    let path = directory.join("noisiness.json");
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).wrap_err_with(|| format!("remove stale {}", path.display())),
+        crate::report::publish(&opts.out, "noisiness.json", &report)
     }
 }

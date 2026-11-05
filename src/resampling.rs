@@ -175,7 +175,7 @@ impl Resampler {
     pub fn resize_grid(&mut self, size: [u32; 2], radius: u32) -> Result<()> {
         let bytes = NeighborMean::grid_bytes(size, radius);
         ensure!(
-            bytes < self.budget,
+            bytes.saturating_add(self.staging_bytes) < self.budget,
             "neighbor grid and optional distortion staging exceed --max-graph-memory-mib; increase the budget or --neighbor-radius"
         );
         self.grid_bytes = bytes;

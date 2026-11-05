@@ -435,6 +435,7 @@ impl Gpu {
         Ok(())
     }
 
+    #[tracing::instrument(name = "distortion.layout_readback", skip_all, err)]
     pub fn distortion_layout(&self) -> Result<bundling_wgpu::geometry::Layout> {
         let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
         let mut paths = Vec::new();
@@ -465,6 +466,7 @@ impl Gpu {
         bundling_wgpu::geometry::Layout::new(&paths, usize::try_from(graph.samples)?)
     }
 
+    #[tracing::instrument(name = "distortion.points_readback", skip_all, err)]
     pub fn distortion_snapshot<'a>(
         &self,
         layout: &'a bundling_wgpu::geometry::Layout,
