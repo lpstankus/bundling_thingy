@@ -2,6 +2,7 @@ mod density;
 mod gpu;
 mod graph;
 mod neighbor_mean;
+mod noisiness;
 mod palette;
 mod profiling;
 mod resampling;
@@ -31,6 +32,10 @@ pub struct Options {
     /// Export a PNG without opening a window.
     #[arg(long)]
     headless: bool,
+
+    /// Measure exported RGB occupancy and write noisiness.json.
+    #[arg(long, requires = "headless")]
+    evaluate_noisiness: bool,
 
     /// Accepted for compatibility; headless exports always resample.
     #[arg(long = "resample", requires = "headless", hide = true)]
@@ -94,11 +99,23 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
+    noisiness::invalidate(&opts.out)?;
+
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
+
+    let mut report = if opts.evaluate_noisiness {
+        gpu.render()?;
+        let blank = gpu.readback()?;
+        Some(noisiness::Report::new(
+            noisiness::background(&blank, SIZE, SIZE).wrap_err("calibrate noisiness background")?,
+        ))
+    } else {
+        None
+    };
 
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
-    write_image(&gpu, &opts.out.join("original.png"))?;
+    write_image(&gpu, &opts.out, "original.png", 0, report.as_mut())?;
     if opts.neighbor_radius.is_some() {
         for iteration in 1..=opts.iterations {
             let _timing = tracing::info_span!("iteration", iteration).entered();
@@ -108,19 +125,29 @@ fn headless(opts: &Options) -> Result<()> {
             } else {
                 format!("iteration-{iteration:02}.png")
             };
-            write_image(&gpu, &opts.out.join(name))?;
+            write_image(&gpu, &opts.out, &name, iteration, report.as_mut())?;
         }
+    }
+    if let Some(report) = report {
+        report.write(opts)?;
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())
 }
 
-fn write_image(gpu: &Gpu, path: &Path) -> Result<()> {
+fn write_image(
+    gpu: &Gpu,
+    directory: &Path,
+    file: &str,
+    iteration: u32,
+    report: Option<&mut noisiness::Report>,
+) -> Result<()> {
+    let path = directory.join(file);
     gpu.render()?;
     let pixels = gpu.readback()?;
     let _timing = tracing::info_span!("png.write", output = %path.display()).entered();
     let mut encoder = png::Encoder::new(
-        File::create(path).wrap_err_with(|| format!("create {}", path.display()))?,
+        File::create(&path).wrap_err_with(|| format!("create {}", path.display()))?,
         SIZE,
         SIZE,
     );
@@ -131,6 +158,9 @@ fn write_image(gpu: &Gpu, path: &Path) -> Result<()> {
         .write_image_data(&pixels)
         .and_then(|()| writer.finish())
         .wrap_err_with(|| format!("write {}", path.display()))?;
+    if let Some(report) = report {
+        report.record(&pixels, file, iteration)?;
+    }
     println!("wrote {}", path.display());
     Ok(())
 }
