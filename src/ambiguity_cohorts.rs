@@ -26,11 +26,11 @@ pub struct Cohorts<'a> {
     points: &'a [[f32; 2]],
     routes: &'a [Canonical],
 }
-impl Cohorts<'_> {
+impl<'a> Cohorts<'a> {
     /// Borrow the exact geometry used for the membership at this index.
     /// The index follows `memberships`, including duplicate routes.
     #[must_use]
-    pub fn canonical_points(&self, index: usize) -> Option<&[[f32; 2]]> {
+    pub fn canonical_points(&self, index: usize) -> Option<&'a [[f32; 2]]> {
         let route = self.routes.get(index)?;
         self.points.get(route.start..route.end)
     }
@@ -127,15 +127,26 @@ pub fn with_cohorts<R>(
     budget: &mut Budget,
     operation: impl FnOnce(Cohorts<'_>, &mut Budget) -> Result<R, Error>,
 ) -> Result<R, Error> {
-    if !config.route_tolerance.is_finite()
-        || config.route_tolerance <= 0.0
-        || !config.endpoint_tolerance.is_finite()
-        || config.endpoint_tolerance <= 0.0
-        || !config.sigma.is_finite()
-        || config.sigma < 0.0
-    {
-        return Err(Error::InvalidCurve);
-    }
+    with_prepared_cohorts(input, config, budget, |cohorts, _, budget| {
+        operation(cohorts, budget)
+    })
+}
+
+/// Infer cohorts and lend the lazily prepared originals to the scoring owner.
+/// All retained preparations remain charged until this scope ends.
+/// # Errors
+/// Invalid input and exhausted shared resources abort without partial cohorts.
+pub fn with_prepared_cohorts<R>(
+    input: &[Route<'_>],
+    config: &Config,
+    budget: &mut Budget,
+    operation: impl for<'a> FnOnce(
+        Cohorts<'a>,
+        &mut [Option<ambiguity_similarity::Prepared<'a>>],
+        &mut Budget,
+    ) -> Result<R, Error>,
+) -> Result<R, Error> {
+    validate_config(config)?;
     let mut count = 0usize;
     for route in input {
         budget.charge(1)?;
@@ -148,6 +159,9 @@ pub fn with_cohorts<R>(
         .and_then(|n| n.checked_add(storage::<(f64, usize)>(input.len().checked_mul(2)?).ok()?))
         .and_then(|n| n.checked_add(storage::<usize>(input.len().checked_mul(4)?).ok()?))
         .and_then(|n| n.checked_add(storage::<Membership>(input.len()).ok()?))
+        .and_then(|n| {
+            n.checked_add(storage::<Option<ambiguity_similarity::Prepared<'_>>>(input.len()).ok()?)
+        })
         .ok_or(Error::SizeOverflow)?;
     budget.reserve(bytes)?;
     let result = (|| {
@@ -191,33 +205,43 @@ pub fn with_cohorts<R>(
             ));
         }
         index.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let (cohorts, unique) = assign(
-            &points,
-            &mut routes,
-            &index,
-            &mut candidates,
-            (&mut heads, &mut tails),
-            config,
-            budget,
-        )?;
-        for route in &routes {
-            budget.charge(1)?;
-            memberships.push(Membership {
-                edge_id: route.id,
-                cohort: route.cohort,
-            });
+        let mut preparations = allocated(input.len())?;
+        budget.charge(u64::try_from(input.len()).map_err(|_| Error::SizeOverflow)?)?;
+        preparations.resize_with(input.len(), || None);
+        let result = (|| {
+            let (cohorts, unique) = assign(
+                &points,
+                &mut routes,
+                &index,
+                &mut candidates,
+                (&mut heads, &mut tails),
+                (config, &mut preparations),
+                budget,
+            )?;
+            for route in &routes {
+                budget.charge(1)?;
+                memberships.push(Membership {
+                    edge_id: route.id,
+                    cohort: route.cohort,
+                });
+            }
+            operation(
+                Cohorts {
+                    memberships: &memberships,
+                    cohort_count: cohorts,
+                    unique_route_count: unique,
+                    closed_route_count: closed,
+                    points: &points,
+                    routes: &routes,
+                },
+                &mut preparations,
+                budget,
+            )
+        })();
+        for prepared in preparations.into_iter().flatten() {
+            prepared.release(budget)?;
         }
-        operation(
-            Cohorts {
-                memberships: &memberships,
-                cohort_count: cohorts,
-                unique_route_count: unique,
-                closed_route_count: closed,
-                points: &points,
-                routes: &routes,
-            },
-            budget,
-        )
+        result
     })();
     budget.release(bytes)?;
     result
@@ -295,16 +319,17 @@ fn canonicalize(
     Ok(closed)
 }
 
-fn assign(
-    points: &[[f32; 2]],
+fn assign<'a>(
+    points: &'a [[f32; 2]],
     routes: &mut [Canonical],
     index: &[(f64, usize)],
     candidates: &mut Vec<usize>,
     chains: (&mut Vec<usize>, &mut Vec<usize>),
-    config: &Config,
+    preparation: (&Config, &mut [Option<ambiguity_similarity::Prepared<'a>>]),
     budget: &mut Budget,
 ) -> Result<(usize, usize), Error> {
     let (heads, tails) = chains;
+    let (config, preparations) = preparation;
     let mut cohorts = 0usize;
     let mut unique = 0usize;
     for i in 0..routes.len() {
@@ -359,7 +384,25 @@ fn assign(
                     break;
                 }
                 budget.charge(1)?;
-                let assessment = ambiguity_similarity::assess(curve, other, config, budget)?;
+                for (index, source) in [(i, curve), (member_index, other)] {
+                    budget.charge(1)?;
+                    let slot = preparations.get_mut(index).ok_or(Error::InvalidIndex)?;
+                    if slot.is_none() {
+                        *slot = Some(ambiguity_similarity::prepare(source, config.sigma, budget)?);
+                    }
+                }
+                let assessment = ambiguity_similarity::assess_prepared(
+                    preparations
+                        .get(i)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidIndex)?,
+                    preparations
+                        .get(member_index)
+                        .and_then(Option::as_ref)
+                        .ok_or(Error::InvalidIndex)?,
+                    config,
+                    budget,
+                )?;
                 if assessment.general_incompatible || assessment.endpoint_incompatible {
                     compatible = false;
                     break;
@@ -447,5 +490,18 @@ fn discover(
     candidates.sort_unstable();
     candidates.dedup();
 
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> Result<(), Error> {
+    if !config.route_tolerance.is_finite()
+        || config.route_tolerance <= 0.0
+        || !config.endpoint_tolerance.is_finite()
+        || config.endpoint_tolerance <= 0.0
+        || !config.sigma.is_finite()
+        || config.sigma < 0.0
+    {
+        return Err(Error::InvalidCurve);
+    }
     Ok(())
 }

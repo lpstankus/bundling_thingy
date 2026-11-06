@@ -210,11 +210,12 @@ fn vector<T>(capacity: usize) -> Result<Vec<T>, Resource> {
 /// Failed frames permanently invalidate this evaluator.
 pub struct Evaluator<'a, 'b> {
     cohorts: Cohorts<'a>,
-    config: &'a Config,
+    config: &'b Config,
     budget: &'b mut Budget,
     lookup: Vec<(u32, usize)>,
     baseline: Vec<Evidence>,
     cache: Vec<Option<Cached>>,
+    preparations: &'b mut [Option<ambiguity_similarity::Prepared<'a>>],
     h0: PairSet,
     h: PairSet,
     cross: PairSet,
@@ -306,6 +307,7 @@ impl Evaluator<'_, '_> {
             lookup: &self.lookup,
             baseline: &mut self.baseline,
             cache: &mut self.cache,
+            preparations: self.preparations,
             h: &mut self.h,
             cross: &mut self.cross,
             row: &mut row,
@@ -385,6 +387,7 @@ struct Accumulator<'a, 'b> {
     lookup: &'a [(u32, usize)],
     baseline: &'a mut Vec<Evidence>,
     cache: &'a mut [Option<Cached>],
+    preparations: &'a mut [Option<ambiguity_similarity::Prepared<'b>>],
     h: &'a mut PairSet,
     cross: &'a mut PairSet,
     row: &'a mut Row,
@@ -395,18 +398,10 @@ impl Accumulator<'_, '_> {
         &mut self,
         a: u32,
         b: u32,
+        ai: usize,
+        bi: usize,
         budget: &mut Budget,
-    ) -> Result<(usize, usize, ambiguity_similarity::Assessment), Resource> {
-        let ai = self
-            .lookup
-            .binary_search_by_key(&a, |p| p.0)
-            .map_err(|_| Resource::InvalidIndex)?;
-        let bi = self
-            .lookup
-            .binary_search_by_key(&b, |p| p.0)
-            .map_err(|_| Resource::InvalidIndex)?;
-        let ai = self.lookup.get(ai).ok_or(Resource::InvalidIndex)?.1;
-        let bi = self.lookup.get(bi).ok_or(Resource::InvalidIndex)?.1;
+    ) -> Result<ambiguity_similarity::Assessment, Resource> {
         let slot = if self.cache.is_empty() {
             None
         } else {
@@ -424,15 +419,35 @@ impl Accumulator<'_, '_> {
             && let Some(cached) = self.cache.get(index).ok_or(Resource::InvalidIndex)?
             && cached.key == (a, b)
         {
-            return Ok((ai, bi, cached.assessment));
+            return Ok(cached.assessment);
         }
         // Match complete-link assignment: the later canonical route is first.
-        let assessment = ambiguity_similarity::assess(
-            self.cohorts
-                .canonical_points(ai.max(bi))
+        for index in [ai, bi] {
+            budget.charge(1)?;
+            let slot = self
+                .preparations
+                .get_mut(index)
+                .ok_or(Resource::InvalidIndex)?;
+            if slot.is_none() {
+                let points = self
+                    .cohorts
+                    .canonical_points(index)
+                    .ok_or(Resource::InvalidIndex)?;
+                *slot = Some(ambiguity_similarity::prepare(
+                    points,
+                    self.config.similarity.sigma,
+                    budget,
+                )?);
+            }
+        }
+        let assessment = ambiguity_similarity::assess_prepared(
+            self.preparations
+                .get(ai.max(bi))
+                .and_then(Option::as_ref)
                 .ok_or(Resource::InvalidIndex)?,
-            self.cohorts
-                .canonical_points(ai.min(bi))
+            self.preparations
+                .get(ai.min(bi))
+                .and_then(Option::as_ref)
                 .ok_or(Resource::InvalidIndex)?,
             &self.config.similarity,
             budget,
@@ -444,7 +459,7 @@ impl Accumulator<'_, '_> {
                 assessment,
             });
         }
-        Ok((ai, bi, assessment))
+        Ok(assessment)
     }
     fn contact(&mut self, a: u32, b: u32, budget: &mut Budget) -> Result<(), Resource> {
         budget.charge(
@@ -452,23 +467,20 @@ impl Accumulator<'_, '_> {
                 .saturating_add(2)
                 .saturating_mul(2),
         )?;
-        let (ai, bi, assessment) = self.assess(a, b, budget)?;
-        let flags = [
-            assessment.general_incompatible,
-            assessment.endpoint_incompatible,
-        ];
-        let weights = [
-            Bounds::excess(
-                assessment.route_lower,
-                assessment.route_upper,
-                self.config.similarity.route_tolerance,
-            ),
-            Bounds::excess(
-                assessment.endpoints,
-                assessment.endpoints,
-                self.config.similarity.endpoint_tolerance,
-            ),
-        ];
+        let key = (a, b);
+        let search_work = u64::from(self.baseline.len().checked_ilog2().unwrap_or(0));
+        budget.charge(search_work.saturating_add(2))?;
+        let previous = self.baseline.binary_search_by_key(&key, |e| e.key).ok();
+        let ai = self
+            .lookup
+            .binary_search_by_key(&a, |p| p.0)
+            .map_err(|_| Resource::InvalidIndex)?;
+        let bi = self
+            .lookup
+            .binary_search_by_key(&b, |p| p.0)
+            .map_err(|_| Resource::InvalidIndex)?;
+        let ai = self.lookup.get(ai).ok_or(Resource::InvalidIndex)?.1;
+        let bi = self.lookup.get(bi).ok_or(Resource::InvalidIndex)?.1;
         let ca = self
             .cohorts
             .memberships
@@ -481,21 +493,39 @@ impl Accumulator<'_, '_> {
             .get(bi)
             .ok_or(Resource::InvalidIndex)?
             .cohort;
+        let (flags, weights) = if let Some(index) = previous {
+            let evidence = self.baseline.get(index).ok_or(Resource::InvalidIndex)?;
+            (evidence.flags, [evidence.general, evidence.endpoints])
+        } else if ca == cb {
+            ([false; 2], [Bounds::default(); 2])
+        } else {
+            let assessment = self.assess(a, b, ai, bi, budget)?;
+            (
+                [
+                    assessment.general_incompatible,
+                    assessment.endpoint_incompatible,
+                ],
+                [
+                    Bounds::excess(
+                        assessment.route_lower,
+                        assessment.route_upper,
+                        self.config.similarity.route_tolerance,
+                    ),
+                    Bounds::excess(
+                        assessment.endpoints,
+                        assessment.endpoints,
+                        self.config.similarity.endpoint_tolerance,
+                    ),
+                ],
+            )
+        };
+        validate_cohort(ca, cb, flags)?;
         if ca != cb {
-            let key = (ca.min(cb), ca.max(cb));
-            self.cross.insert(key, budget)?;
+            self.cross.insert((ca.min(cb), ca.max(cb)), budget)?;
             if flags[0] || flags[1] {
-                self.h.insert(key, budget)?;
+                self.h.insert((ca.min(cb), ca.max(cb)), budget)?;
             }
-        } else if flags[0] || flags[1] {
-            return Err(Resource::InconsistentCohort);
         }
-        let key = (a, b);
-        budget.charge(1)?;
-        budget.charge(
-            u64::from(self.baseline.len().checked_ilog2().unwrap_or(0)).saturating_add(2),
-        )?;
-        let previous = self.baseline.binary_search_by_key(&key, |e| e.key).ok();
         if let Some(index) = previous {
             self.baseline
                 .get_mut(index)
@@ -533,6 +563,12 @@ impl Accumulator<'_, '_> {
         }
         Ok(())
     }
+}
+const fn validate_cohort(a: usize, b: usize, flags: [bool; 2]) -> Result<(), Resource> {
+    if a == b && (flags[0] || flags[1]) {
+        return Err(Resource::InconsistentCohort);
+    }
+    Ok(())
 }
 fn number(value: usize) -> Result<f64, Resource> {
     count_value(u64::try_from(value).map_err(|_| Resource::SizeOverflow)?)
@@ -578,7 +614,7 @@ fn difference(a: &PairSet, b: &PairSet, budget: &mut Budget) -> Result<usize, Re
 /// All owned storage is released on success or failure. Original
 /// canonical storage remains reserved by `with_cohorts`; no source copies exist.
 /// Pair tables and baseline evidence reserve their full configured capacities
-/// before allocation, so index callback rollback never owns these reservations.
+/// before allocation. The evaluator releases lazy preparations on every exit.
 /// # Errors
 /// Invalid geometry/configuration, resource limits and callback errors abort.
 pub fn with_evaluator<R>(
@@ -595,8 +631,11 @@ pub fn with_evaluator<R>(
         }
     }
     let mut output = None;
-    let preparation =
-        ambiguity_cohorts::with_cohorts(original, &config.similarity, budget, |cohorts, budget| {
+    let preparation = ambiguity_cohorts::with_prepared_cohorts(
+        original,
+        &config.similarity,
+        budget,
+        |cohorts, preparations, budget| {
             let (bytes, records) = storage_requirements(config, original.len())?;
             budget.reserve(bytes)?;
             if let Err(error) = budget.reserve_records(records) {
@@ -644,6 +683,7 @@ pub fn with_evaluator<R>(
                     budget,
                     lookup,
                     cache,
+                    preparations,
                     baseline: vector(config.baseline_capacity)?,
                     h0,
                     h,
@@ -662,7 +702,8 @@ pub fn with_evaluator<R>(
             budget.release(bytes)?;
             output = Some(result);
             Ok(())
-        });
+        },
+    );
     preparation.map_err(|error| Error::PhaseResource(Phase::OriginalPreparation, error))?;
     output.ok_or(Error::InvalidState)?
 }

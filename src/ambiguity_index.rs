@@ -5,10 +5,8 @@
 //! segment geometry. Empty parts of those rectangles may add false candidates.
 //! Sort comparisons are outside the work counter. Requested capacities include
 //! simultaneous growth buffers, excluding allocator overhead and borrowed points.
-//! The callback owns any evidence it retains on success. On failure the invocation
-//! rolls back all new byte and record reservations, including callback reservations.
-//! Callers must discard partial callback evidence after any failure.
-//! Callbacks must not release reservations owned before this invocation.
+//! The index releases only its own reservations on every exit. Callbacks own
+//! their retained reservations on success and failure and must clean them up.
 use crate::{
     ambiguity_contact,
     weak_frechet::{Budget, Error as ResourceError},
@@ -237,7 +235,8 @@ fn split(piece: Piece, maximum: f64) -> Result<Option<(Piece, Piece)>, ResourceE
 ///
 /// `piece_length` bounds each piece's axis extent and changes only acceleration.
 /// A balanced AABB hierarchy prunes both coordinates. Dense contact remains quadratic.
-/// Callback reservations survive success and share the index's global ledger.
+/// Callback reservations survive success and failure on the shared ledger.
+/// The callback owner must release them after either result.
 /// # Errors
 /// Invalid geometry/IDs/parameters, global resource exhaustion, narrow-phase
 /// numerical errors and callback failures abort without a successful result.
@@ -249,9 +248,8 @@ pub fn enumerate<E>(
     budget: &mut Budget,
     mut callback: impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
 ) -> Result<Statistics, Error<E>> {
-    let before = budget.statistics();
     let mut stats = Statistics::default();
-    let result = run(
+    run(
         paths,
         radius,
         minimum,
@@ -263,23 +261,7 @@ pub fn enumerate<E>(
     .map_err(|error| match error {
         Error::Resource(resource, _) => Error::Resource(resource, stats),
         other => other,
-    });
-    if result.is_err() {
-        let after = budget.statistics();
-        budget.release(
-            after
-                .workspace_reserved
-                .checked_sub(before.workspace_reserved)
-                .ok_or(ResourceError::InvalidRelease)?,
-        )?;
-        budget.release_records(
-            after
-                .records_reserved
-                .checked_sub(before.records_reserved)
-                .ok_or(ResourceError::InvalidRelease)?,
-        )?;
-    }
-    result
+    })
 }
 fn run<E>(
     paths: &[Path<'_>],

@@ -2,9 +2,12 @@
 use crate::weak_frechet::{self, Budget, Error, Orientation, WorkCategory};
 use std::mem::size_of;
 
-/// Prepared storage is scoped to `with_prepared`; no reservation escapes its callback.
+/// Opaque certified geometry bound to an immutable original.
+///
+/// Scoped preparations belong to `with_prepared`; retained preparations belong to their caller.
 /// Adjacent source indices describe each retained shortcut's inclusive source range.
-pub struct Prepared {
+pub struct Prepared<'a> {
+    original: &'a [[f32; 2]],
     points: Vec<[f32; 2]>,
     source_indices: Vec<usize>,
     error: f64,
@@ -39,6 +42,7 @@ pub fn with_prepared<R>(
     budget.reserve(bytes)?;
     let result = (|| {
         let mut prepared = Prepared {
+            original: input,
             points: Vec::new(),
             source_indices: Vec::new(),
             error: 0.0,
@@ -123,7 +127,7 @@ fn index_value(index: usize) -> Result<f64, Error> {
 fn point(points: &[[f32; 2]], index: usize) -> Result<[f64; 2], Error> {
     Ok(points.get(index).ok_or(Error::InvalidIndex)?.map(f64::from))
 }
-impl Prepared {
+impl Prepared<'_> {
     #[must_use]
     pub fn points(&self) -> &[[f32; 2]] {
         &self.points
@@ -222,35 +226,138 @@ pub fn assess(
         || config.route_tolerance <= 0.0
         || !config.endpoint_tolerance.is_finite()
         || config.endpoint_tolerance <= 0.0
+        || !config.sigma.is_finite()
+        || config.sigma < 0.0
     {
         return Err(Error::InvalidCurve);
     }
     with_prepared(a, config.sigma, budget, |pa, budget| {
         with_prepared(b, config.sigma, budget, |pb, budget| {
-            let mut forward = bounds(pa, pb, Orientation::Forward, budget)?;
-            let mut reverse = bounds(pa, pb, Orientation::Reversed, budget)?;
-            if !forward.precedes(reverse, config, true)?
-                && !reverse.precedes(forward, config, false)?
-            {
-                forward = full(a, b, Orientation::Forward, budget)?;
-                reverse = full(a, b, Orientation::Reversed, budget)?;
-            }
-            let (mut chosen, orientation) = if forward.precedes(reverse, config, true)? {
-                (forward, Orientation::Forward)
-            } else {
-                (reverse, Orientation::Reversed)
-            };
-            if chosen.lower <= config.route_tolerance && chosen.upper > config.route_tolerance {
-                chosen = full(a, b, orientation, budget)?;
-            }
-            Ok(Assessment {
-                orientation,
-                route_lower: chosen.lower,
-                route_upper: chosen.upper,
-                endpoints: chosen.endpoints,
-                general_incompatible: chosen.lower > config.route_tolerance,
-                endpoint_incompatible: chosen.endpoints > config.endpoint_tolerance,
-            })
+            assess_prepared(pa, pb, config, budget)
         })
     })
+}
+
+/// Assess preparations bound to their immutable originals. Full fallback uses
+/// those originals and never another route with the same cohort membership.
+/// # Errors
+/// Invalid thresholds or exhausted shared resources abort the assessment.
+pub fn assess_prepared(
+    pa: &Prepared<'_>,
+    pb: &Prepared<'_>,
+    config: &Config,
+    budget: &mut Budget,
+) -> Result<Assessment, Error> {
+    if !config.route_tolerance.is_finite()
+        || config.route_tolerance <= 0.0
+        || !config.endpoint_tolerance.is_finite()
+        || config.endpoint_tolerance <= 0.0
+        || !config.sigma.is_finite()
+        || config.sigma < 0.0
+    {
+        return Err(Error::InvalidCurve);
+    }
+    let a = pa.original;
+    let b = pb.original;
+
+    let needs_original = |prepared: &Prepared<'_>| {
+        prepared.error > config.sigma
+            || (config.sigma == 0.0 && prepared.points.len() != prepared.original.len())
+    };
+    let (mut forward, mut reverse) = if needs_original(pa) || needs_original(pb) {
+        (
+            full(a, b, Orientation::Forward, budget)?,
+            full(a, b, Orientation::Reversed, budget)?,
+        )
+    } else {
+        (
+            bounds(pa, pb, Orientation::Forward, budget)?,
+            bounds(pa, pb, Orientation::Reversed, budget)?,
+        )
+    };
+    if !forward.precedes(reverse, config, true)? && !reverse.precedes(forward, config, false)? {
+        forward = full(a, b, Orientation::Forward, budget)?;
+        reverse = full(a, b, Orientation::Reversed, budget)?;
+    }
+    let (mut chosen, orientation) = if forward.precedes(reverse, config, true)? {
+        (forward, Orientation::Forward)
+    } else {
+        (reverse, Orientation::Reversed)
+    };
+    if chosen.lower <= config.route_tolerance && chosen.upper > config.route_tolerance {
+        chosen = full(a, b, orientation, budget)?;
+    }
+    Ok(Assessment {
+        orientation,
+        route_lower: chosen.lower,
+        route_upper: chosen.upper,
+        endpoints: chosen.endpoints,
+        general_incompatible: chosen.lower > config.route_tolerance,
+        endpoint_incompatible: chosen.endpoints > config.endpoint_tolerance,
+    })
+}
+
+/// Retain compact certified knots and source indices. The caller owns the
+/// reservation until `release`; construction restores it on every failure.
+/// # Errors
+/// Invalid geometry, sigma, allocation or shared resource limits abort.
+pub fn prepare<'a>(
+    input: &'a [[f32; 2]],
+    sigma: f64,
+    budget: &mut Budget,
+) -> Result<Prepared<'a>, Error> {
+    with_prepared(input, sigma, budget, |temporary, budget| {
+        let bytes = temporary
+            .points
+            .len()
+            .checked_mul(
+                size_of::<[f32; 2]>()
+                    .checked_add(size_of::<usize>())
+                    .ok_or(Error::SizeOverflow)?,
+            )
+            .ok_or(Error::SizeOverflow)?;
+        budget.reserve(bytes)?;
+        let result = (|| {
+            budget
+                .charge(u64::try_from(temporary.points.len()).map_err(|_| Error::SizeOverflow)?)?;
+            let mut points = Vec::new();
+            points
+                .try_reserve_exact(temporary.points.len())
+                .map_err(|_| Error::Allocation)?;
+            let mut source_indices = Vec::new();
+            source_indices
+                .try_reserve_exact(temporary.source_indices.len())
+                .map_err(|_| Error::Allocation)?;
+            points.extend_from_slice(&temporary.points);
+            source_indices.extend_from_slice(&temporary.source_indices);
+            Ok(Prepared {
+                original: input,
+                points,
+                source_indices,
+                error: temporary.error,
+            })
+        })();
+        if result.is_err() {
+            budget.release(bytes)?;
+        }
+        result
+    })
+}
+impl Prepared<'_> {
+    /// Release this owner's compact retained storage.
+    /// # Errors
+    /// Reports a ledger ownership violation.
+    pub fn release(self, budget: &mut Budget) -> Result<(), Error> {
+        let bytes = self
+            .points
+            .len()
+            .checked_mul(
+                size_of::<[f32; 2]>()
+                    .checked_add(size_of::<usize>())
+                    .ok_or(Error::SizeOverflow)?,
+            )
+            .ok_or(Error::SizeOverflow)?;
+        drop(self);
+        budget.release(bytes)
+    }
 }
