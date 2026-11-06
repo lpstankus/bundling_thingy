@@ -1,6 +1,6 @@
 //! CPU ambiguity evaluation in original input units, with frozen baseline evidence.
 //!
-//! General RMS excess can exceed one.
+//! General and endpoint ratios are separate RMS excesses and can exceed one.
 //! Empty contact sets have zero ratios. Bounds describe original route distance
 //! approximation under ordinary f64 arithmetic, without exact-real guarantees.
 //! Canonical original order is frozen. Closed routes retain starts.
@@ -110,6 +110,7 @@ pub struct Row {
     pub contacts: u64,
     pub collapsed: usize,
     pub general: View,
+    pub endpoints: View,
     pub resources: Statistics,
     pub index: ambiguity_index::Statistics,
 }
@@ -121,7 +122,8 @@ struct Cached {
 struct Evidence {
     key: (u32, u32),
     general: Bounds,
-    incompatible: bool,
+    endpoints: Bounds,
+    flags: [bool; 2],
     seen: bool,
 }
 fn vector<T>(capacity: usize) -> Result<Vec<T>, Resource> {
@@ -246,13 +248,17 @@ impl Evaluator<'_, '_> {
         row.collapsed = stats.constant_paths;
         for evidence in &self.baseline {
             self.budget.charge(1)?;
-            if !baseline && !evidence.seen && evidence.incompatible {
-                row.general.resolved = row
-                    .general
-                    .resolved
-                    .checked_add(1)
-                    .ok_or(Resource::SizeOverflow)?;
-                row.general.resolved_squared_excess.add(evidence.general)?;
+            if !baseline && !evidence.seen {
+                for (view, flag, weight) in [
+                    (&mut row.general, evidence.flags[0], evidence.general),
+                    (&mut row.endpoints, evidence.flags[1], evidence.endpoints),
+                ] {
+                    if flag {
+                        view.resolved =
+                            view.resolved.checked_add(1).ok_or(Resource::SizeOverflow)?;
+                        view.resolved_squared_excess.add(weight)?;
+                    }
+                }
             }
         }
         finish(
@@ -260,10 +266,20 @@ impl Evaluator<'_, '_> {
             row.contacts,
             self.config.similarity.route_tolerance,
         )?;
+        finish(
+            &mut row.endpoints,
+            row.contacts,
+            self.config.similarity.endpoint_tolerance,
+        )?;
         row.general.baseline = if baseline {
             row.general.current
         } else {
             self.baseline_row.general.current
+        };
+        row.endpoints.baseline = if baseline {
+            row.endpoints.current
+        } else {
+            self.baseline_row.endpoints.current
         };
         row.resources = self.budget.statistics();
         Ok(row)
@@ -367,18 +383,28 @@ impl Accumulator<'_, '_> {
             .map_err(|_| Resource::InvalidIndex)?;
         let ai = self.lookup.get(ai).ok_or(Resource::InvalidIndex)?.1;
         let bi = self.lookup.get(bi).ok_or(Resource::InvalidIndex)?.1;
-        let (incompatible, weight) = if let Some(index) = previous {
+        let (flags, weights) = if let Some(index) = previous {
             let evidence = self.baseline.get(index).ok_or(Resource::InvalidIndex)?;
-            (evidence.incompatible, evidence.general)
+            (evidence.flags, [evidence.general, evidence.endpoints])
         } else {
             let assessment = self.assess(a, b, ai, bi, budget)?;
             (
-                assessment.general_incompatible,
-                Bounds::excess(
-                    assessment.route_lower,
-                    assessment.route_upper,
-                    self.config.similarity.route_tolerance,
-                ),
+                [
+                    assessment.general_incompatible,
+                    assessment.endpoint_incompatible,
+                ],
+                [
+                    Bounds::excess(
+                        assessment.route_lower,
+                        assessment.route_upper,
+                        self.config.similarity.route_tolerance,
+                    ),
+                    Bounds::excess(
+                        assessment.endpoints,
+                        assessment.endpoints,
+                        self.config.similarity.endpoint_tolerance,
+                    ),
+                ],
             )
         };
         if let Some(index) = previous {
@@ -387,26 +413,32 @@ impl Accumulator<'_, '_> {
                 .ok_or(Resource::InvalidIndex)?
                 .seen = true;
         }
-        let view = &mut self.row.general;
-        view.squared_excess.add(weight)?;
-        if incompatible {
-            view.current = view.current.checked_add(1).ok_or(Resource::SizeOverflow)?;
-            if !self.is_baseline && previous.is_none() {
-                view.introduced = view
-                    .introduced
-                    .checked_add(1)
-                    .ok_or(Resource::SizeOverflow)?;
-                view.introduced_squared_excess.add(weight)?;
+        for (i, view) in [&mut self.row.general, &mut self.row.endpoints]
+            .into_iter()
+            .enumerate()
+        {
+            let weight = *weights.get(i).ok_or(Resource::InvalidIndex)?;
+            view.squared_excess.add(weight)?;
+            if *flags.get(i).ok_or(Resource::InvalidIndex)? {
+                view.current = view.current.checked_add(1).ok_or(Resource::SizeOverflow)?;
+                if !self.is_baseline && previous.is_none() {
+                    view.introduced = view
+                        .introduced
+                        .checked_add(1)
+                        .ok_or(Resource::SizeOverflow)?;
+                    view.introduced_squared_excess.add(weight)?;
+                }
             }
         }
-        if self.is_baseline && incompatible {
+        if self.is_baseline && (flags[0] || flags[1]) {
             if self.baseline.len() == self.config.baseline_capacity {
                 return Err(Resource::RecordLimit);
             }
             self.baseline.push(Evidence {
                 key,
-                general: weight,
-                incompatible,
+                general: weights[0],
+                endpoints: weights[1],
+                flags,
                 seen: true,
             });
         }
