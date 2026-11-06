@@ -10,10 +10,15 @@ pub fn invalidate(directory: &Path, file: &str) -> Result<()> {
     }
 }
 
-pub fn publish(directory: &Path, file: &str, report: &serde_json::Value) -> Result<()> {
+pub fn publish<T: serde::Serialize>(directory: &Path, file: &str, report: &T) -> Result<()> {
     let path = directory.join(file);
     let temporary = directory.join(format!("{file}.tmp"));
-    let bytes = serde_json::to_vec_pretty(report).wrap_err("serialize report")?;
-    fs::write(&temporary, bytes).wrap_err_with(|| format!("write {}", temporary.display()))?;
+    let mut writer = std::io::BufWriter::new(
+        fs::File::create(&temporary).wrap_err_with(|| format!("create {}", temporary.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, report).wrap_err("serialize report")?;
+    std::io::Write::flush(&mut writer)
+        .wrap_err_with(|| format!("flush {}", temporary.display()))?;
+    drop(writer);
     fs::rename(&temporary, &path).wrap_err_with(|| format!("publish {}", path.display()))
 }
