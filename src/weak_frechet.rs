@@ -4,6 +4,7 @@ use std::{cmp::Ordering, collections::BinaryHeap, fmt, mem::size_of};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     InvalidCurve,
+    InvalidScale,
     WorkLimit,
     WorkspaceLimit,
     InvalidRelease,
@@ -15,6 +16,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidCurve => "weak Frechet requires nonempty finite curves",
+            Self::InvalidScale => "evaluation tolerances produce nonfinite normalized distances",
             Self::WorkLimit => "evaluation work limit exceeded",
             Self::WorkspaceLimit => "evaluation requested workspace limit exceeded",
             Self::InvalidRelease => "workspace release exceeds outstanding reservations",
