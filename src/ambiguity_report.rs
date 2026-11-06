@@ -175,6 +175,41 @@ impl General {
     }
 }
 #[derive(Serialize)]
+struct Endpoints {
+    current_incompatible_pairs: usize,
+    baseline_incompatible_pairs: usize,
+    introduced_pairs: usize,
+    resolved_pairs: usize,
+    squared_excess_pixels_squared: f64,
+    baseline_squared_excess_pixels_squared: f64,
+    introduced_squared_excess_pixels_squared: f64,
+    resolved_squared_excess_pixels_squared: f64,
+    rms_excess_pixels: f64,
+    ratio: f64,
+}
+impl From<General> for Endpoints {
+    fn from(value: General) -> Self {
+        Self {
+            current_incompatible_pairs: value.current_incompatible_pairs,
+            baseline_incompatible_pairs: value.baseline_incompatible_pairs,
+            introduced_pairs: value.introduced_pairs,
+            resolved_pairs: value.resolved_pairs,
+            squared_excess_pixels_squared: value.squared_excess_pixels_squared.lower,
+            baseline_squared_excess_pixels_squared: value
+                .baseline_squared_excess_pixels_squared
+                .lower,
+            introduced_squared_excess_pixels_squared: value
+                .introduced_squared_excess_pixels_squared
+                .lower,
+            resolved_squared_excess_pixels_squared: value
+                .resolved_squared_excess_pixels_squared
+                .lower,
+            rms_excess_pixels: value.rms_excess_pixels.lower,
+            ratio: value.ratio.lower,
+        }
+    }
+}
+#[derive(Serialize)]
 pub struct Image {
     file: String,
     iteration: u32,
@@ -182,6 +217,7 @@ pub struct Image {
     baseline_contact_pairs: u64,
     current_collapsed_paths: usize,
     general: General,
+    endpoints: Endpoints,
     #[serde(with = "ResourceStatistics")]
     resources: Statistics,
     #[serde(with = "IndexStatistics")]
@@ -196,6 +232,7 @@ impl Image {
             baseline_contact_pairs: baseline.contacts,
             current_collapsed_paths: row.collapsed,
             general: General::new(row.general, baseline.general)?,
+            endpoints: General::new(row.endpoints, baseline.endpoints)?.into(),
             resources: row.resources,
             index: row.index,
         })
@@ -276,6 +313,7 @@ pub fn run(
                         "counts": {"eligible_routes": count, "skipped_reservations": baseline.layout().skipped_count(), "total_reservations": count.saturating_add(baseline.layout().skipped_count()), "original_constants": evaluator.original_constant_count(), "closed_stored_start_routes": originals.closed_route_count, "unique_canonical_routes": originals.unique_route_count},
                         "definitions": {
                             "general": "For sustained current contacts, sqrt(mean(max(d-T,0)^2))/T, with original whole-route continuous endpoint-constrained weak Frechet distance d in the joint selected orientation. Introduced/resolved incompatible edge counts and squared-excess sums are co-primary alongside RMS.",
+                            "endpoints": "Separate sqrt(mean(max(e-U,0)^2))/U over the same contacts, where e is the larger matched endpoint distance in that same orientation. Introduced/resolved counts and sums are co-primary.",
                             "interpretation": "Lower excess means less original-route mismatch among current sustained contacts. Ratios are dimensionless and can exceed 1. Compatible contacts can dilute RMS. No combined score or overall quality claim.",
                             "empty_contacts": "count 0, sums 0, RMS 0, ratios 0"
                         },
@@ -285,7 +323,7 @@ pub fn run(
                             "distance_argument_order": "Pair scoring passes the later route in canonical original order first, so their f64 predicates agree near thresholds.",
                             "original_preparations": "Certified original routes are prepared on demand and retained by the original scope until evaluation ends. Their compact knots, source ranges and metadata share the workspace budget. Stored baseline contributions are reused for the same edge pairs.",
                             "canonicalization": "Normalize signed zero; remove consecutive duplicates and exact redundant forward-collinear vertices while retaining retracing. Lexicographically smaller forward/reverse sequence, geometry order with stable edge ID ties. Closed routes retain stored starts.",
-                            "approximation": "Endpoint-preserving strong index-correspondence certificate per shortcut; bound original weak distance by simplified distance plus/minus the sum of certificate errors. Refine undecidable orientations/classifications on full curves. Bounds describe frozen original geometry and can tighten without geometric change. General output has explicit lower/upper bounds under ordinary f64 arithmetic, not exact-real arithmetic.",
+                            "approximation": "Endpoint-preserving strong index-correspondence certificate per shortcut; bound original weak distance by simplified distance plus/minus the sum of certificate errors. Refine undecidable orientations/classifications on full curves. Bounds describe frozen original geometry and can tighten without geometric change. General output has explicit lower/upper bounds; endpoint values are exact under ordinary f64 arithmetic, not exact-real arithmetic.",
                             "limitations": "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.",
                             "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
                             "edge_ids": "Edge IDs are stable drawable GPU path IDs from the uploaded layout, not semantic route labels.",
