@@ -12,6 +12,7 @@ pub struct Route<'a> {
     pub points: &'a [[f32; 2]],
 }
 /// Frozen membership, ordered by canonical geometry and then stable ID.
+#[derive(serde::Serialize)]
 pub struct Membership {
     pub edge_id: u32,
     pub cohort: usize,

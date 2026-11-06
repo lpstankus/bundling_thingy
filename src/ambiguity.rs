@@ -75,7 +75,7 @@ pub struct Config {
     /// Slot capacity of each of three cohort sets. Full sets fail explicitly.
     pub cohort_capacity: usize,
 }
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct Bounds {
     pub lower: f64,
     pub upper: f64,
@@ -108,7 +108,7 @@ pub struct View {
     pub introduced_squared_excess: Bounds,
     pub resolved_squared_excess: Bounds,
 }
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct CohortView {
     pub current: usize,
     pub baseline: usize,
