@@ -181,45 +181,114 @@ impl Workspace<'_> {
     }
 }
 
-fn segments(points: &[[f32; 2]], workspace: &mut Workspace<'_>) -> Result<Vec<Segment>, Error> {
-    let first = points.first().ok_or(BudgetError::InvalidCurve)?;
-    let mut previous = first.map(f64::from);
-    let mut count = 0_usize;
-    for point in points {
-        workspace.charge(1)?;
-        if point.iter().any(|value| !value.is_finite()) {
-            return Err(BudgetError::InvalidCurve.into());
+#[derive(Clone, Copy)]
+struct PositiveSegment {
+    end: usize,
+    length: f64,
+}
+/// Validated snapshot-local geometry borrowing the caller's points.
+///
+/// Storage stays charged to the budget used by `prepare` until `release`.
+/// Dropping this value frees storage but does not release its ledger reservation.
+/// A containing workspace may instead own and release `workspace_bytes` after drop.
+pub struct PreparedCurve<'a> {
+    points: &'a [[f32; 2]],
+    segments: Vec<PositiveSegment>,
+    total_length: f64,
+    workspace_bytes: usize,
+}
+impl<'a> PreparedCurve<'a> {
+    /// Validate once and retain positive-point indices and exact kernel lengths.
+    /// # Errors
+    /// Invalid curves, arc precision failures and shared allocation/resource limits.
+    pub fn prepare(points: &'a [[f32; 2]], budget: &mut Budget) -> Result<Self, Error> {
+        let mut workspace = Workspace {
+            budget,
+            reserved: 0,
+        };
+        let first = points.first().ok_or(BudgetError::InvalidCurve)?;
+        let mut previous = first.map(f64::from);
+        let mut count = 0;
+        for point in points {
+            workspace.charge(1)?;
+            if point.iter().any(|v| !v.is_finite()) {
+                return Err(BudgetError::InvalidCurve.into());
+            }
+            let current = point.map(f64::from);
+            if !same_point(current, previous) {
+                count = increment(count)?;
+                previous = current;
+            }
         }
-        let current = point.map(f64::from);
-        if !same_point(current, previous) {
-            count = increment(count)?;
+        let mut segments = workspace.vector(count)?;
+        previous = first.map(f64::from);
+        let mut total_length = 0.0;
+        for (end, point) in points.iter().enumerate() {
+            workspace.charge(1)?;
+            let current = point.map(f64::from);
+            if same_point(current, previous) {
+                continue;
+            }
+            let delta = difference(current, previous);
+            let length = dot(delta, delta).sqrt();
+            let next = total_length + length;
+            if !next.is_finite() || next <= total_length {
+                return Err(Error::NumericalFailure);
+            }
+            segments.push(PositiveSegment { end, length });
+            total_length = next;
             previous = current;
         }
+        let workspace_bytes = workspace.reserved;
+        workspace.reserved = 0;
+        Ok(Self {
+            points,
+            segments,
+            total_length,
+            workspace_bytes,
+        })
     }
-    let mut result = workspace.vector(count)?;
-    previous = first.map(f64::from);
-    let mut arc = 0.0;
-    for point in points {
-        workspace.charge(1)?;
-        let current = point.map(f64::from);
-        if same_point(current, previous) {
-            continue;
-        }
-        let delta = difference(current, previous);
-        let length = dot(delta, delta).sqrt();
-        let next_arc = arc + length;
-        if !next_arc.is_finite() || next_arc <= arc {
-            return Err(Error::NumericalFailure);
-        }
-        result.push(Segment {
-            start: previous,
-            end: current,
-            length,
-        });
-        arc = next_arc;
-        previous = current;
+    #[must_use]
+    pub const fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes
     }
-    Ok(result)
+    #[must_use]
+    pub const fn total_length(&self) -> f64 {
+        self.total_length
+    }
+    #[must_use]
+    pub const fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+    /// # Errors
+    /// Rejects an index outside the positive segments.
+    pub fn segment_length(&self, index: usize) -> Result<f64, Error> {
+        Ok(at(&self.segments, index)?.length)
+    }
+    /// Drop preparation and release its storage from the same ledger.
+    /// # Errors
+    /// Rejects an inconsistent reservation ledger.
+    pub fn release(self, budget: &mut Budget) -> Result<(), Error> {
+        let bytes = self.workspace_bytes;
+        drop(self);
+        Ok(budget.release(bytes)?)
+    }
+    fn segment(&self, index: usize) -> Result<Segment, Error> {
+        let metadata = at(&self.segments, index)?;
+        let start = if let Some(previous) = index.checked_sub(1) {
+            at(&self.segments, previous)?.end
+        } else {
+            0
+        };
+        Ok(Segment {
+            start: at(self.points, start)?.map(f64::from),
+            end: at(self.points, metadata.end)?.map(f64::from),
+            length: metadata.length,
+        })
+    }
+    fn closed(&self) -> bool {
+        self.points.first() == self.points.last()
+    }
 }
 
 fn point_distance_squared(point: Point, segment: Segment) -> f64 {
@@ -330,14 +399,14 @@ fn insert_patch(
     patches: &mut Vec<Patch>,
     capacity: &mut usize,
     cell: (usize, usize),
-    curves: (&[Segment], &[Segment]),
+    curves: (&PreparedCurve<'_>, &PreparedCurve<'_>),
     radius: f64,
     workspace: &mut Workspace<'_>,
 ) -> Result<(), Error> {
     workspace.charge(3)?; // candidate and two capsule projections
     let (row, column) = cell;
-    let source = at(curves.0, row)?;
-    let target = at(curves.1, column)?;
+    let source = curves.0.segment(row)?;
+    let target = curves.1.segment(column)?;
     let along_a = projection(source, target, radius, radius * radius)?;
     let along_b = projection(target, source, radius, radius * radius)?;
     match (along_a, along_b) {
@@ -400,65 +469,77 @@ fn join(
         .parent = left;
     Ok(())
 }
-fn find(
-    patches: &[Patch],
-    cell: (usize, usize),
-    workspace: &mut Workspace<'_>,
-) -> Result<Option<usize>, Error> {
-    let mut low = 0;
-    let mut high = patches.len();
-    while low < high {
-        workspace.charge(1)?;
-        let middle = low
-            .checked_add(high.checked_sub(low).ok_or(BudgetError::SizeOverflow)? / 2)
-            .ok_or(BudgetError::SizeOverflow)?;
-        match at(patches, middle)?.cell.cmp(&cell) {
-            std::cmp::Ordering::Less => low = increment(middle)?,
-            std::cmp::Ordering::Greater => high = middle,
-            std::cmp::Ordering::Equal => return Ok(Some(middle)),
-        }
-    }
-    Ok(None)
-}
-fn forward_neighbor(
-    segments: &[Segment],
-    index: usize,
-    closed: bool,
-) -> Result<Option<(usize, Point)>, Error> {
-    let next = increment(index)?;
-    if next < segments.len() {
-        return Ok(Some((next, at(segments, index)?.end)));
-    }
-    Ok(closed.then_some((0, at(segments, index)?.end)))
-}
+// Every positive cell checks both directed forward boundaries. Row joins sweep
+// sorted column lists. Column joins use consecutive cells within each row. The
+// periodic pass is separate, so two-segment retraces retain both cut boundaries.
 fn connect(
     patches: &[Patch],
     nodes: &mut [Node],
-    curves: (&[Segment], &[Segment]),
+    curves: (&PreparedCurve<'_>, &PreparedCurve<'_>),
     closed: (bool, bool),
     squared_radius: f64,
     workspace: &mut Workspace<'_>,
 ) -> Result<(), Error> {
-    for (index, patch) in patches.iter().enumerate() {
-        workspace.charge(1)?;
-        let (row, column) = patch.cell;
-        // Each directed forward boundary is visited, including both boundaries of
-        // two-segment closed retraces. Looking only at unordered neighbors loses one.
-        let neighbors = [
-            forward_neighbor(curves.0, row, closed.0)?
-                .map(|(next, point)| ((next, column), point, at(curves.1, column))),
-            forward_neighbor(curves.1, column, closed.1)?
-                .map(|(next, point)| ((row, next), point, at(curves.0, row))),
-        ];
-        for neighbor in neighbors.into_iter().flatten() {
-            let (cell, point, segment) = neighbor;
+    let mut row_start = 0;
+    let mut next_row = 0;
+    while row_start < patches.len() {
+        let row = at(patches, row_start)?.cell.0;
+        let mut row_end = row_start;
+        while row_end < patches.len() && at(patches, row_end)?.cell.0 == row {
             workspace.charge(1)?;
-            if point_distance_squared(point, segment?) > squared_radius {
-                continue;
-            }
-            let other = find(patches, cell, workspace)?.ok_or(Error::IncompleteCandidates)?;
-            join(nodes, index, other, workspace)?;
+            row_end = increment(row_end)?;
         }
+        let forward = increment(row)?;
+        let target_row = if forward < curves.0.segment_count() {
+            Some(forward)
+        } else {
+            closed.0.then_some(0)
+        };
+        if target_row == Some(0) {
+            next_row = 0;
+        } else {
+            next_row = next_row.max(row_end);
+        }
+        let mut column_cursor = next_row;
+        for index in row_start..row_end {
+            workspace.charge(1)?;
+            let column = at(patches, index)?.cell.1;
+            if let Some(target_row) = target_row {
+                let point = curves.0.segment(row)?.end;
+                workspace.charge(1)?;
+                if point_distance_squared(point, curves.1.segment(column)?) <= squared_radius {
+                    let cell = (target_row, column);
+                    while column_cursor < patches.len() && at(patches, column_cursor)?.cell < cell {
+                        workspace.charge(1)?;
+                        column_cursor = increment(column_cursor)?;
+                    }
+                    if patches.get(column_cursor).is_none_or(|p| p.cell != cell) {
+                        return Err(Error::IncompleteCandidates);
+                    }
+                    join(nodes, index, column_cursor, workspace)?;
+                }
+            }
+            let forward_column = increment(column)?;
+            let target = if forward_column < curves.1.segment_count() {
+                Some((forward_column, increment(index)?))
+            } else {
+                closed.1.then_some((0, row_start))
+            };
+            if let Some((target_column, other)) = target {
+                workspace.charge(1)?;
+                let point = curves.1.segment(column)?.end;
+                if point_distance_squared(point, curves.0.segment(row)?) <= squared_radius {
+                    if patches
+                        .get(other)
+                        .is_none_or(|p| p.cell != (row, target_column))
+                    {
+                        return Err(Error::IncompleteCandidates);
+                    }
+                    join(nodes, index, other, workspace)?;
+                }
+            }
+        }
+        row_start = row_end;
     }
     Ok(())
 }
@@ -587,51 +668,61 @@ fn evaluate(
     candidates: Option<impl Iterator<Item = (usize, usize)>>,
     budget: &mut Budget,
 ) -> Result<bool, Error> {
-    let squared_radius = radius * radius;
-    if !radius.is_finite()
-        || radius < 0.0
-        || !squared_radius.is_finite()
-        || radius > 0.0 && squared_radius == 0.0
-        || !minimum.is_finite()
-        || minimum <= 0.0
-    {
-        return Err(Error::InvalidParameters);
-    }
+    validate_parameters(radius, minimum)?;
     let mut workspace = Workspace {
         budget,
         reserved: 0,
     };
-    let source = segments(a, &mut workspace)?;
-    let target = segments(b, &mut workspace)?;
-    if source.is_empty() || target.is_empty() {
+    let source = PreparedCurve::prepare(a, workspace.budget)?;
+    workspace.reserved = source.workspace_bytes();
+    let target = PreparedCurve::prepare(b, workspace.budget)?;
+    workspace.reserved = workspace
+        .reserved
+        .checked_add(target.workspace_bytes())
+        .ok_or(BudgetError::SizeOverflow)?;
+    let rows = if candidates.is_some() {
+        0
+    } else {
+        source.segment_count()
+    };
+    let columns = target.segment_count();
+    let exhaustive = (0..rows).flat_map(|row| (0..columns).map(move |column| (row, column)));
+    let cells = candidates.into_iter().flatten().chain(exhaustive);
+    contact_prepared_candidates(&source, &target, radius, minimum, cells, workspace.budget)
+}
+/// Reuse validated snapshot geometry with the same exact candidate contract.
+/// # Errors
+/// Invalid parameters, indices, numerical predicates, missing neighboring cells,
+/// or shared resource failures. Preparation reservations survive every exit.
+pub fn contact_prepared_candidates(
+    a: &PreparedCurve<'_>,
+    b: &PreparedCurve<'_>,
+    radius: f64,
+    minimum: f64,
+    candidates: impl IntoIterator<Item = (usize, usize)>,
+    budget: &mut Budget,
+) -> Result<bool, Error> {
+    validate_parameters(radius, minimum)?;
+    let mut workspace = Workspace {
+        budget,
+        reserved: 0,
+    };
+    let source = a;
+    let target = b;
+    if source.segment_count() == 0 || target.segment_count() == 0 {
         return Ok(false);
     }
     let mut patches = Vec::new();
     let mut capacity = 0;
-    if let Some(candidates) = candidates {
-        for cell in candidates {
-            insert_patch(
-                &mut patches,
-                &mut capacity,
-                cell,
-                (&source, &target),
-                radius,
-                &mut workspace,
-            )?;
-        }
-    } else {
-        for row in 0..source.len() {
-            for column in 0..target.len() {
-                insert_patch(
-                    &mut patches,
-                    &mut capacity,
-                    (row, column),
-                    (&source, &target),
-                    radius,
-                    &mut workspace,
-                )?;
-            }
-        }
+    for cell in candidates {
+        insert_patch(
+            &mut patches,
+            &mut capacity,
+            cell,
+            (source, target),
+            radius,
+            &mut workspace,
+        )?;
     }
     patches.sort_unstable_by_key(|patch| patch.cell);
     workspace.charge(u64::try_from(patches.len()).map_err(|_| BudgetError::SizeOverflow)?)?;
@@ -647,9 +738,9 @@ fn evaluate(
     connect(
         &patches,
         &mut nodes,
-        (&source, &target),
-        (a.first() == a.last(), b.first() == b.last()),
-        squared_radius,
+        (source, target),
+        (a.closed(), b.closed()),
+        radius * radius,
         &mut workspace,
     )?;
     let mut records = workspace.vector(patches.len())?;
@@ -660,14 +751,28 @@ fn evaluate(
             along_a: Projection {
                 segment: patch.cell.0,
                 interval: patch.along_a,
-                length: at(&source, patch.cell.0)?.length,
+                length: source.segment_length(patch.cell.0)?,
             },
             along_b: Projection {
                 segment: patch.cell.1,
                 interval: patch.along_b,
-                length: at(&target, patch.cell.1)?.length,
+                length: target.segment_length(patch.cell.1)?,
             },
         });
     }
     component_lengths(&mut records, minimum, &mut workspace)
+}
+
+fn validate_parameters(radius: f64, minimum: f64) -> Result<(), Error> {
+    let squared_radius = radius * radius;
+    if !radius.is_finite()
+        || radius < 0.0
+        || !squared_radius.is_finite()
+        || radius > 0.0 && squared_radius == 0.0
+        || !minimum.is_finite()
+        || minimum <= 0.0
+    {
+        return Err(Error::InvalidParameters);
+    }
+    Ok(())
 }

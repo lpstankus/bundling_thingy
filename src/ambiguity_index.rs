@@ -205,11 +205,19 @@ fn split_bounds(
     stats: &mut Statistics,
 ) -> Result<(), ResourceError> {
     tick(workspace.budget, &mut stats.entries_visited)?;
+    if let Some((left, right)) = split(piece, maximum)? {
+        split_bounds(left, maximum, output, capacity, workspace, stats)?;
+        split_bounds(right, maximum, output, capacity, workspace, stats)
+    } else {
+        tick(workspace.budget, &mut stats.pieces_generated)?;
+        workspace.push(output, capacity, piece, false)
+    }
+}
+fn split(piece: Piece, maximum: f64) -> Result<Option<(Piece, Piece)>, ResourceError> {
     let width = piece.high[0] - piece.low[0];
     let height = piece.high[1] - piece.low[1];
     if width.max(height) <= maximum {
-        tick(workspace.budget, &mut stats.pieces_generated)?;
-        return workspace.push(output, capacity, piece, false);
+        return Ok(None);
     }
     let axis = usize::from(height > width);
     let low = *piece.low.get(axis).ok_or(ResourceError::InvalidIndex)?;
@@ -222,13 +230,12 @@ fn split_bounds(
     let mut right = piece;
     *left.high.get_mut(axis).ok_or(ResourceError::InvalidIndex)? = middle;
     *right.low.get_mut(axis).ok_or(ResourceError::InvalidIndex)? = middle;
-    split_bounds(left, maximum, output, capacity, workspace, stats)?;
-    split_bounds(right, maximum, output, capacity, workspace, stats)
+    Ok(Some((left, right)))
 }
 /// Stream each qualifying unordered pair once, in stable ID order.
 ///
 /// `piece_length` bounds each piece's axis extent and changes only acceleration.
-/// The index is sorted by minimum x. Dense drawings can require quadratic work.
+/// A balanced AABB hierarchy prunes both coordinates. Dense contact remains quadratic.
 /// Callback reservations survive success and share the index's global ledger.
 /// # Errors
 /// Invalid geometry/IDs/parameters, global resource exhaustion, narrow-phase
@@ -288,39 +295,27 @@ fn run<E>(
         bytes: 0,
         records: 0,
     };
-    let mut ordered = workspace.vector(paths.len(), false)?;
-    for path in paths {
-        workspace.budget.charge(1)?;
-        ordered.push(*path);
-    }
-    ordered.sort_unstable_by_key(|path| path.id);
-    for pair in ordered.windows(2) {
-        workspace.budget.charge(1)?;
-        if let [a, b] = pair
-            && a.id == b.id
-        {
-            return Err(Error::DuplicateId(a.id));
-        }
-    }
-    let mut index = Vec::new();
-    let mut index_capacity = 0;
-    build(
+    let ordered = ordered_paths(paths, &mut workspace)?;
+    let prepared = prepare_paths(&ordered, &mut workspace)?;
+    let mut index = build(
         &ordered,
+        &prepared,
         minimum,
         piece_length,
-        &mut index,
-        &mut index_capacity,
         &mut workspace,
         stats,
     )?;
-    index.sort_unstable_by(|a, b| a.low[0].total_cmp(&b.low[0]));
+    let mut hierarchy = workspace.vector(node_count(index.len())?, false)?;
+    if !index.is_empty() {
+        build_tree(&mut index, 0, &mut hierarchy, workspace.budget, stats)?;
+    }
     let mut candidates = Vec::<Candidate>::new();
     let mut capacity = 0;
     for (source, path) in ordered.iter().enumerate() {
         collect(
-            source,
-            &index,
-            radius,
+            (source, path.points),
+            (&index, &hierarchy),
+            (radius, piece_length),
             &mut candidates,
             &mut capacity,
             &mut workspace,
@@ -343,15 +338,28 @@ fn run<E>(
                 end = end.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
             }
             let other = ordered.get(partner).ok_or(ResourceError::InvalidIndex)?;
+            let pair = candidates
+                .get_mut(start..end)
+                .ok_or(ResourceError::InvalidIndex)?;
+            if !participation_possible(
+                pair,
+                (source, partner),
+                &prepared,
+                minimum,
+                workspace.budget,
+            )? {
+                start = end;
+                continue;
+            }
             tick(workspace.budget, &mut stats.narrow_pairs)?;
             let cells = candidates
                 .get(start..end)
                 .ok_or(ResourceError::InvalidIndex)?
                 .iter()
                 .map(|entry| entry.cell);
-            let contact = ambiguity_contact::contact_candidates(
-                path.points,
-                other.points,
+            let contact = ambiguity_contact::contact_prepared_candidates(
+                prepared.get(source).ok_or(ResourceError::InvalidIndex)?,
+                prepared.get(partner).ok_or(ResourceError::InvalidIndex)?,
                 radius,
                 minimum,
                 cells,
@@ -378,34 +386,20 @@ fn run<E>(
 
 fn build<E>(
     ordered: &[Path<'_>],
+    prepared: &[ambiguity_contact::PreparedCurve<'_>],
     minimum: f64,
     piece_length: f64,
-    index: &mut Vec<Piece>,
-    index_capacity: &mut usize,
     workspace: &mut Workspace<'_>,
     stats: &mut Statistics,
-) -> Result<(), Error<E>> {
+) -> Result<Vec<Piece>, Error<E>> {
+    let mut eligible = workspace.vector(ordered.len(), false)?;
+    let mut count = 0_usize;
     for (edge, path) in ordered.iter().enumerate() {
         let first = path.points.first().ok_or(Error::InvalidPath(path.id))?;
-        let mut previous = first.map(f64::from);
-        let mut length = 0.0;
-        for point in path.points {
-            workspace.budget.charge(1)?;
-            if point.iter().any(|v| !v.is_finite()) {
-                return Err(Error::InvalidPath(path.id));
-            }
-            let current = point.map(f64::from);
-            let delta = [current[0] - previous[0], current[1] - previous[1]];
-            let step = delta[0].mul_add(delta[0], delta[1] * delta[1]).sqrt();
-            if step > 0.0 {
-                let next = length + step;
-                if !next.is_finite() || next <= length {
-                    return Err(Error::InvalidPath(path.id));
-                }
-                length = next;
-            }
-            previous = current;
-        }
+        let length = prepared
+            .get(edge)
+            .ok_or(ResourceError::InvalidIndex)?
+            .total_length();
         if length == 0.0 {
             stats.constant_paths = stats
                 .constant_paths
@@ -420,7 +414,31 @@ fn build<E>(
                 .ok_or(ResourceError::SizeOverflow)?;
             continue;
         }
-        previous = first.map(f64::from);
+        eligible.push(edge);
+        let mut previous = first.map(f64::from);
+        for point in path.points {
+            workspace.budget.charge(1)?;
+            let current = point.map(f64::from);
+            if (current[0] - previous[0]).hypot(current[1] - previous[1]) <= 0.0 {
+                continue;
+            }
+            count = count
+                .checked_add(count_pieces(
+                    bounds(edge, 0, previous, current),
+                    piece_length,
+                    workspace.budget,
+                    stats,
+                )?)
+                .ok_or(ResourceError::SizeOverflow)?;
+            previous = current;
+        }
+    }
+    let mut index = workspace.vector(count, false)?;
+    let mut index_capacity = count;
+    for edge in eligible {
+        let path = ordered.get(edge).ok_or(ResourceError::InvalidIndex)?;
+        let first = path.points.first().ok_or(ResourceError::InvalidCurve)?;
+        let mut previous = first.map(f64::from);
         let mut segment = 0;
         for point in path.points {
             workspace.budget.charge(1)?;
@@ -432,8 +450,8 @@ fn build<E>(
                 (edge, segment),
                 (previous, current),
                 piece_length,
-                index,
-                index_capacity,
+                &mut index,
+                &mut index_capacity,
                 workspace,
                 stats,
             )?;
@@ -441,44 +459,175 @@ fn build<E>(
             previous = current;
         }
     }
-    Ok(())
+    Ok(index)
 }
 
-fn collect(
-    source: usize,
-    index: &[Piece],
-    radius: f64,
-    candidates: &mut Vec<Candidate>,
-    capacity: &mut usize,
-    workspace: &mut Workspace<'_>,
+#[derive(Clone, Copy)]
+struct Node {
+    low: [f64; 2],
+    high: [f64; 2],
+    maximum_edge: usize,
+    start: usize,
+    end: usize,
+    right: usize,
+}
+const LEAF_SIZE: usize = 16;
+fn node_count(count: usize) -> Result<usize, ResourceError> {
+    if count <= LEAF_SIZE {
+        return Ok(usize::from(count > 0));
+    }
+    // At the last possibly mixed level, balanced ranges have q or q+1
+    // elements. Only ranges larger than LEAF_SIZE split once more.
+    let groups = 1_usize
+        .checked_shl((count / LEAF_SIZE).ilog2())
+        .ok_or(ResourceError::SizeOverflow)?;
+    let quotient = count
+        .checked_div(groups)
+        .ok_or(ResourceError::SizeOverflow)?;
+    let extra = if quotient > LEAF_SIZE {
+        groups
+    } else {
+        count
+            .checked_rem(groups)
+            .ok_or(ResourceError::SizeOverflow)?
+    };
+    groups
+        .checked_add(extra)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_sub(1))
+        .ok_or(ResourceError::SizeOverflow)
+}
+fn build_tree(
+    pieces: &mut [Piece],
+    offset: usize,
+    nodes: &mut Vec<Node>,
+    budget: &mut Budget,
     stats: &mut Statistics,
-) -> Result<(), ResourceError> {
-    candidates.clear();
-    for piece in index {
-        tick(workspace.budget, &mut stats.entries_visited)?;
-        if piece.edge != source {
-            continue;
+) -> Result<usize, ResourceError> {
+    let first = pieces.first().ok_or(ResourceError::InvalidIndex)?;
+    let mut node = Node {
+        low: first.low,
+        high: first.high,
+        maximum_edge: first.edge,
+        start: offset,
+        end: offset
+            .checked_add(pieces.len())
+            .ok_or(ResourceError::SizeOverflow)?,
+        right: 0,
+    };
+    for piece in pieces.iter() {
+        tick(budget, &mut stats.entries_visited)?;
+        node.low = [node.low[0].min(piece.low[0]), node.low[1].min(piece.low[1])];
+        node.high = [
+            node.high[0].max(piece.high[0]),
+            node.high[1].max(piece.high[1]),
+        ];
+        node.maximum_edge = node.maximum_edge.max(piece.edge);
+    }
+    let index = nodes.len();
+    budget.charge(1)?;
+    nodes.push(node);
+    if pieces.len() > LEAF_SIZE {
+        let axis = usize::from(node.high[1] - node.low[1] > node.high[0] - node.low[0]);
+        let middle = pieces.len() / 2;
+        // In-place partition comparisons, like sort comparisons, are separate from work units.
+        pieces.select_nth_unstable_by(middle, |a, b| {
+            let center = |p: &Piece| {
+                if axis == 0 {
+                    p.high[0].mul_add(0.5, p.low[0] * 0.5)
+                } else {
+                    p.high[1].mul_add(0.5, p.low[1] * 0.5)
+                }
+            };
+            center(a)
+                .total_cmp(&center(b))
+                .then_with(|| a.edge.cmp(&b.edge))
+                .then_with(|| a.segment.cmp(&b.segment))
+        });
+        let (left, right) = pieces.split_at_mut(middle);
+        build_tree(left, offset, nodes, budget, stats)?;
+        let right_index = build_tree(
+            right,
+            offset
+                .checked_add(middle)
+                .ok_or(ResourceError::SizeOverflow)?,
+            nodes,
+            budget,
+            stats,
+        )?;
+        nodes
+            .get_mut(index)
+            .ok_or(ResourceError::InvalidIndex)?
+            .right = right_index;
+    }
+    Ok(index)
+}
+fn overlaps(low: [f64; 2], high: [f64; 2], other_low: [f64; 2], other_high: [f64; 2]) -> bool {
+    low[0] <= other_high[0]
+        && high[0] >= other_low[0]
+        && low[1] <= other_high[1]
+        && high[1] >= other_low[1]
+}
+struct Query<'a> {
+    index: &'a [Piece],
+    nodes: &'a [Node],
+    candidates: &'a mut Vec<Candidate>,
+    capacity: &'a mut usize,
+    stats: &'a mut Statistics,
+}
+impl Query<'_> {
+    fn visit(
+        &mut self,
+        piece: Piece,
+        radius: f64,
+        node_index: usize,
+        workspace: &mut Workspace<'_>,
+    ) -> Result<(), ResourceError> {
+        tick(workspace.budget, &mut self.stats.entries_visited)?;
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or(ResourceError::InvalidIndex)?;
+        let low = [
+            (piece.low[0] - radius).next_down(),
+            (piece.low[1] - radius).next_down(),
+        ];
+        let high = [
+            (piece.high[0] + radius).next_up(),
+            (piece.high[1] + radius).next_up(),
+        ];
+        if node.maximum_edge <= piece.edge || !overlaps(low, high, node.low, node.high) {
+            return Ok(());
         }
-        let high = (piece.high[0] + radius).next_up();
-        let low = (piece.low[0] - radius).next_down();
-        for target in index {
-            tick(workspace.budget, &mut stats.entries_visited)?;
-            if target.low[0] > high {
-                break;
-            }
-            if target.edge <= source || target.high[0] < low {
+        if node.right != 0 {
+            let right = node.right;
+            self.visit(
+                piece,
+                radius,
+                node_index
+                    .checked_add(1)
+                    .ok_or(ResourceError::SizeOverflow)?,
+                workspace,
+            )?;
+            return self.visit(piece, radius, right, workspace);
+        }
+        for target in self
+            .index
+            .get(node.start..node.end)
+            .ok_or(ResourceError::InvalidIndex)?
+        {
+            tick(workspace.budget, &mut self.stats.entries_visited)?;
+            if target.edge <= piece.edge {
                 continue;
             }
-            tick(workspace.budget, &mut stats.candidate_examinations)?;
-            if target.low[1] > (piece.high[1] + radius).next_up()
-                || target.high[1] < (piece.low[1] - radius).next_down()
-            {
+            tick(workspace.budget, &mut self.stats.candidate_examinations)?;
+            if !overlaps(low, high, target.low, target.high) {
                 continue;
             }
-            tick(workspace.budget, &mut stats.candidate_records)?;
+            tick(workspace.budget, &mut self.stats.candidate_records)?;
             workspace.push(
-                candidates,
-                capacity,
+                self.candidates,
+                self.capacity,
                 Candidate {
                     partner: target.edge,
                     cell: (piece.segment, target.segment),
@@ -486,6 +635,60 @@ fn collect(
                 true,
             )?;
         }
+        Ok(())
+    }
+    fn split_query(
+        &mut self,
+        piece: Piece,
+        parameters: (f64, f64),
+        workspace: &mut Workspace<'_>,
+    ) -> Result<(), ResourceError> {
+        tick(workspace.budget, &mut self.stats.entries_visited)?;
+        if let Some((left, right)) = split(piece, parameters.1)? {
+            self.split_query(left, parameters, workspace)?;
+            self.split_query(right, parameters, workspace)
+        } else if self.nodes.is_empty() {
+            Ok(())
+        } else {
+            self.visit(piece, parameters.0, 0, workspace)
+        }
+    }
+}
+fn collect(
+    source: (usize, &[[f32; 2]]),
+    index: (&[Piece], &[Node]),
+    parameters: (f64, f64),
+    candidates: &mut Vec<Candidate>,
+    capacity: &mut usize,
+    workspace: &mut Workspace<'_>,
+    stats: &mut Statistics,
+) -> Result<(), ResourceError> {
+    candidates.clear();
+    let mut query = Query {
+        index: index.0,
+        nodes: index.1,
+        candidates,
+        capacity,
+        stats,
+    };
+    let Some(first) = source.1.first() else {
+        return Err(ResourceError::InvalidCurve);
+    };
+    let mut previous = first.map(f64::from);
+    let mut segment = 0;
+    for point in source.1 {
+        workspace.budget.charge(1)?;
+        let current = point.map(f64::from);
+        if (current[0] - previous[0]).hypot(current[1] - previous[1]) <= 0.0 {
+            continue;
+        }
+        query.split_query(
+            bounds(source.0, segment, previous, current),
+            parameters,
+            workspace,
+        )?;
+        previous = current;
+        segment = segment.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
     }
     Ok(())
 }
@@ -503,4 +706,124 @@ fn validate_parameters<E>(radius: f64, minimum: f64, piece_length: f64) -> Resul
         return Err(Error::InvalidParameters);
     }
     Ok(())
+}
+
+fn prepare_paths<'a, E>(
+    paths: &[Path<'a>],
+    workspace: &mut Workspace<'_>,
+) -> Result<Vec<ambiguity_contact::PreparedCurve<'a>>, Error<E>> {
+    let mut prepared = workspace.vector(paths.len(), false)?;
+    for path in paths {
+        let curve = ambiguity_contact::PreparedCurve::prepare(path.points, workspace.budget)
+            .map_err(|error| match error {
+                ambiguity_contact::Error::Budget(ResourceError::InvalidCurve) => {
+                    Error::InvalidPath(path.id)
+                }
+                ambiguity_contact::Error::Budget(error) => Error::from(error),
+                error => Error::Contact {
+                    source: path.id,
+                    partner: path.id,
+                    error,
+                },
+            })?;
+        workspace.bytes = workspace
+            .bytes
+            .checked_add(curve.workspace_bytes())
+            .ok_or(ResourceError::SizeOverflow)?;
+        prepared.push(curve);
+    }
+    Ok(prepared)
+}
+// A component's projection union cannot exceed the sum of lengths of all
+// participating original segments. Count each distinct segment once. Round each
+// addition upward, and add one upward step per candidate to cover rounding in
+// the narrow phase's interval-union multiply-adds. This is rejection only.
+fn participation_possible(
+    candidates: &mut [Candidate],
+    edges: (usize, usize),
+    prepared: &[ambiguity_contact::PreparedCurve<'_>],
+    minimum: f64,
+    budget: &mut Budget,
+) -> Result<bool, ResourceError> {
+    let source = prepared.get(edges.0).ok_or(ResourceError::InvalidIndex)?;
+    let partner = prepared.get(edges.1).ok_or(ResourceError::InvalidIndex)?;
+    if !participation_bound(candidates.iter().map(|c| c.cell.0), source, minimum, budget)? {
+        return Ok(false);
+    }
+    candidates.sort_unstable_by_key(|c| (c.cell.1, c.cell.0));
+    participation_bound(
+        candidates.iter().map(|c| c.cell.1),
+        partner,
+        minimum,
+        budget,
+    )
+}
+fn participation_bound(
+    segments: impl Iterator<Item = usize>,
+    curve: &ambiguity_contact::PreparedCurve<'_>,
+    minimum: f64,
+    budget: &mut Budget,
+) -> Result<bool, ResourceError> {
+    let mut previous = None;
+    let mut total = 0.0_f64;
+    let mut count = 0_usize;
+    for segment in segments {
+        budget.charge(1)?;
+        if previous != Some(segment) {
+            let length = curve
+                .segment_length(segment)
+                .map_err(|_| ResourceError::InvalidIndex)?;
+            total = (total + length).next_up();
+            if total >= minimum {
+                return Ok(true);
+            }
+            previous = Some(segment);
+        }
+        count = count.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
+    }
+    for _ in 0..count {
+        budget.charge(1)?;
+        total = total.next_up();
+        if total >= minimum {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ordered_paths<'a, E>(
+    paths: &[Path<'a>],
+    workspace: &mut Workspace<'_>,
+) -> Result<Vec<Path<'a>>, Error<E>> {
+    let mut ordered = workspace.vector(paths.len(), false)?;
+    for path in paths {
+        workspace.budget.charge(1)?;
+        ordered.push(*path);
+    }
+    ordered.sort_unstable_by_key(|path| path.id);
+    for pair in ordered.windows(2) {
+        workspace.budget.charge(1)?;
+        if let [a, b] = pair
+            && a.id == b.id
+        {
+            return Err(Error::DuplicateId(a.id));
+        }
+    }
+    Ok(ordered)
+}
+
+fn count_pieces(
+    piece: Piece,
+    maximum: f64,
+    budget: &mut Budget,
+    stats: &mut Statistics,
+) -> Result<usize, ResourceError> {
+    tick(budget, &mut stats.entries_visited)?;
+    if let Some((left, right)) = split(piece, maximum)? {
+        count_pieces(left, maximum, budget, stats)?
+            .checked_add(count_pieces(right, maximum, budget, stats)?)
+            .ok_or(ResourceError::SizeOverflow)
+    } else {
+        Ok(1)
+    }
 }
