@@ -1,5 +1,5 @@
 //! Index-correspondence simplification and coherent endpoint-aware matching.
-use crate::weak_frechet::{self, Budget, Error, Orientation};
+use crate::weak_frechet::{self, Budget, Error, Orientation, WorkCategory};
 use std::mem::size_of;
 
 /// Prepared storage is scoped to `with_prepared`; no reservation escapes its callback.
@@ -68,7 +68,7 @@ pub fn with_prepared<R>(
             let error = loop {
                 let mut maximum = 0.0_f64;
                 for i in increment(start)?..end {
-                    budget.charge(1)?;
+                    budget.charge_classified(1, WorkCategory::SimplifierPointVisits)?;
                     let fraction = index_value(i.checked_sub(start).ok_or(Error::InvalidIndex)?)?
                         / index_value(end.checked_sub(start).ok_or(Error::InvalidIndex)?)?;
                     let [ax, ay] = point(input, start)?;

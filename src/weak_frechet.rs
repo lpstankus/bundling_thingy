@@ -34,9 +34,35 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+/// Disjoint classifications of existing charged work units, not elapsed time.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkCategory {
+    Other,
+    WeakCellVisits,
+    HeapOperations,
+    SimplifierPointVisits,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WorkBreakdown {
+    pub other: u64,
+    pub weak_cell_visits: u64,
+    pub heap_operations: u64,
+    pub simplifier_point_visits: u64,
+}
+impl WorkBreakdown {
+    const ZERO: Self = Self {
+        other: 0,
+        weak_cell_visits: 0,
+        heap_operations: 0,
+        simplifier_point_visits: 0,
+    };
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Statistics {
     pub work_consumed: u64,
+    pub work_breakdown: WorkBreakdown,
     pub workspace_reserved: usize,
     pub workspace_peak: usize,
     pub records_reserved: usize,
@@ -56,6 +82,7 @@ impl Budget {
     pub const fn begin_phase(&mut self) -> Statistics {
         let previous = self.statistics;
         self.statistics.work_consumed = 0;
+        self.statistics.work_breakdown = WorkBreakdown::ZERO;
         previous
     }
     #[must_use]
@@ -66,6 +93,7 @@ impl Budget {
             record_limit: usize::MAX,
             statistics: Statistics {
                 work_consumed: 0,
+                work_breakdown: WorkBreakdown::ZERO,
                 workspace_reserved: 0,
                 workspace_peak: 0,
                 records_reserved: 0,
@@ -110,6 +138,12 @@ impl Budget {
     /// # Errors
     /// Returns `WorkLimit` without changing the ledger if the limit would be exceeded.
     pub fn charge(&mut self, units: u64) -> Result<(), Error> {
+        self.charge_classified(units, WorkCategory::Other)
+    }
+    /// Charge existing work to one disjoint category before its operation.
+    /// # Errors
+    /// Returns `WorkLimit` without changing any counter on failure.
+    pub fn charge_classified(&mut self, units: u64, category: WorkCategory) -> Result<(), Error> {
         let total = self
             .statistics
             .work_consumed
@@ -118,6 +152,16 @@ impl Budget {
         if total > self.work_limit {
             return Err(Error::WorkLimit);
         }
+        let counter = match category {
+            WorkCategory::Other => &mut self.statistics.work_breakdown.other,
+            WorkCategory::WeakCellVisits => &mut self.statistics.work_breakdown.weak_cell_visits,
+            WorkCategory::HeapOperations => &mut self.statistics.work_breakdown.heap_operations,
+            WorkCategory::SimplifierPointVisits => {
+                &mut self.statistics.work_breakdown.simplifier_point_visits
+            }
+        };
+        let classified = counter.checked_add(units).ok_or(Error::WorkLimit)?;
+        *counter = classified;
         self.statistics.work_consumed = total;
         Ok(())
     }
@@ -295,7 +339,7 @@ impl Search {
         let mut heap = BinaryHeap::new();
         heap.try_reserve_exact(grid.entries)
             .map_err(|_| Error::Allocation)?;
-        budget.charge(1)?;
+        budget.charge_classified(1, WorkCategory::HeapOperations)?;
         *labels.first_mut().ok_or(Error::InvalidIndex)? = initial;
         heap.push(Entry {
             cost: initial,
@@ -306,7 +350,7 @@ impl Search {
     fn relax(&mut self, cell: usize, cost: f64, budget: &mut Budget) -> Result<(), Error> {
         let label = self.labels.get_mut(cell).ok_or(Error::InvalidIndex)?;
         if cost < *label {
-            budget.charge(1)?;
+            budget.charge_classified(1, WorkCategory::HeapOperations)?;
             *label = cost;
             self.heap.push(Entry { cost, cell });
         }
@@ -322,7 +366,7 @@ fn traverse(
 ) -> Result<f64, Error> {
     let mut search = Search::new(grid, initial, budget)?;
     while !search.heap.is_empty() {
-        budget.charge(1)?;
+        budget.charge_classified(1, WorkCategory::HeapOperations)?;
         let Some(Entry { cost, cell }) = search.heap.pop() else {
             break;
         };
@@ -332,7 +376,7 @@ fn traverse(
         {
             continue;
         }
-        budget.charge(1)?;
+        budget.charge_classified(1, WorkCategory::WeakCellVisits)?;
         if increment(cell)? == grid.cells {
             return Ok(cost);
         }

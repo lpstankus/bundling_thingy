@@ -4,7 +4,7 @@ use bundling_wgpu::{
     ambiguity_cohorts::{Membership, Route},
     ambiguity_index, ambiguity_similarity,
     geometry::Snapshot,
-    weak_frechet::{Budget, Statistics},
+    weak_frechet::{Budget, Statistics, WorkBreakdown},
 };
 use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use serde::Serialize;
@@ -337,7 +337,7 @@ pub fn run(
                             "limitations": "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.",
                             "contact": "One connected continuous radius-proximity component must have projected arc-interval union length at least the minimum on both curves. Point/tangent patches connect cells. Exact closed current paths use periodic adjacency.",
                             "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
-                            "work": "One work limit per preparation/baseline/current snapshot; no per-pair reset. Total work is charged before operations. Detailed measured index categories accompany each row. Separate weak-cell, heap and simplifier visit counters are unavailable; their work is included in total. Sort comparisons are not work units.",
+                            "work": "One work limit per preparation/baseline/current snapshot; no per-pair reset. Total work is charged before operations. The disjoint work_breakdown fields sum to work_consumed in charged work units: weak_cell_visits counts settled nonstale free-space cell visits, heap_operations counts individual pushes/pops, simplifier_point_visits counts interior point examinations for shortcut correspondence certificates, and other contains all remaining charges, including label initialization and geometry validation. Counts record successful pre-operation charges; failed charges change no counters. Detailed index counters accompany each row and overlap total work; do not add them to this full breakdown. Sort comparisons are not work units.",
                             "workspace": "Requested capacities include canonical/cohort data, evaluator metadata/tables, index/kernel temporaries, original/current route views and typed report rows with 32 filename bytes each. Shared GPU/CPU snapshots, allocator overhead, small report metadata and streaming serializer/I/O buffers are separate from requested evaluation workspace; this is not process RSS."
                         },
                         "resources": {"integration_route_view_bytes": route_bytes, "integration_report_buffer_bytes": row_bytes, "integration_reserved_bytes": caller_bytes, "image_capacity": rows, "original_route_view_capacity": count, "current_route_view_capacity": count, "filename_capacity_bytes_per_image": 32, "shared_snapshot_bytes_each": baseline.layout().sample_count().checked_mul(size_of::<[f32;2]>()), "maximum_shared_snapshots": 2, "geometry_staging_bytes": crate::resampling::GEOMETRY_STAGING_BYTES, "index_piece_length_clip_units": config.piece_length, "index_piece_length_pixels": params.route_tolerance_pixels},
@@ -379,8 +379,19 @@ struct IndexStatistics {
 #[serde(remote = "Statistics")]
 struct ResourceStatistics {
     work_consumed: u64,
+    #[serde(with = "ClassifiedWork")]
+    work_breakdown: WorkBreakdown,
     workspace_reserved: usize,
     workspace_peak: usize,
     records_reserved: usize,
     records_peak: usize,
+}
+
+#[derive(Serialize)]
+#[serde(remote = "WorkBreakdown")]
+struct ClassifiedWork {
+    other: u64,
+    weak_cell_visits: u64,
+    heap_operations: u64,
+    simplifier_point_visits: u64,
 }
