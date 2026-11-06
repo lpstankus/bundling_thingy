@@ -12,10 +12,14 @@ pub enum Error {
     SizeOverflow,
     Allocation,
     InvalidIndex,
+    InconsistentCohort,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::InconsistentCohort => {
+                "canonical original pair is incompatible within its frozen complete-link cohort"
+            }
             Self::InvalidCurve => "weak Frechet requires nonempty finite curves",
             Self::InvalidScale => "evaluation tolerances produce nonfinite normalized distances",
             Self::WorkLimit => "evaluation work limit exceeded",
@@ -47,6 +51,13 @@ pub struct Budget {
     statistics: Statistics,
 }
 impl Budget {
+    /// Begin a preparation or snapshot phase, returning the previous evidence.
+    /// Outstanding storage reservations and lifetime peaks remain unchanged.
+    pub const fn begin_phase(&mut self) -> Statistics {
+        let previous = self.statistics;
+        self.statistics.work_consumed = 0;
+        previous
+    }
     #[must_use]
     pub const fn new(work: u64, workspace: usize) -> Self {
         Self {

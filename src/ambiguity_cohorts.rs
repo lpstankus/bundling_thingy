@@ -22,6 +22,17 @@ pub struct Cohorts<'a> {
     pub cohort_count: usize,
     pub unique_route_count: usize,
     pub closed_route_count: usize,
+    points: &'a [[f32; 2]],
+    routes: &'a [Canonical],
+}
+impl Cohorts<'_> {
+    /// Borrow the exact geometry used for the membership at this index.
+    /// The index follows `memberships`, including duplicate routes.
+    #[must_use]
+    pub fn canonical_points(&self, index: usize) -> Option<&[[f32; 2]]> {
+        let route = self.routes.get(index)?;
+        self.points.get(route.start..route.end)
+    }
 }
 struct Canonical {
     id: u32,
@@ -201,6 +212,8 @@ pub fn with_cohorts<R>(
                 cohort_count: cohorts,
                 unique_route_count: unique,
                 closed_route_count: closed,
+                points: &points,
+                routes: &routes,
             },
             budget,
         )

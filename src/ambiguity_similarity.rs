@@ -102,6 +102,7 @@ pub fn with_prepared<R>(
     result
 }
 
+#[derive(Clone, Copy)]
 pub struct Assessment {
     pub orientation: Orientation,
     pub route_lower: f64,
