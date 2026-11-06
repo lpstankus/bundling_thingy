@@ -169,7 +169,8 @@ impl Ord for Entry {
         other
             .cost
             .total_cmp(&self.cost)
-            .then_with(|| other.cell.cmp(&self.cell))
+            // With equal bottleneck costs, favor progress toward the final cell.
+            .then_with(|| self.cell.cmp(&other.cell))
     }
 }
 impl PartialOrd for Entry {
