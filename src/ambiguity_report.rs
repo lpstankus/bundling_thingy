@@ -1,9 +1,8 @@
 use crate::{Options, gpu::SIZE};
 use bundling_wgpu::{
-    ambiguity::{self, Bounds, Evaluator, Row, View},
-    ambiguity_index,
-    ambiguity_originals::Route,
-    ambiguity_similarity,
+    ambiguity::{self, Bounds, CohortView, Evaluator, Row, View},
+    ambiguity_cohorts::{Membership, Route},
+    ambiguity_index, ambiguity_similarity,
     geometry::Snapshot,
     weak_frechet::{Budget, Statistics, WorkBreakdown},
 };
@@ -93,13 +92,18 @@ impl Parameters {
             .ok_or_else(|| eyre!("possible pair count overflow"))?;
         let global = self.stored_pair_limit;
         let baseline = pairs.min(global / 5);
+        let cohort = pairs.min(global / 10);
         let cache = pairs.min(global / 100).min(65_536);
-        let fixed = baseline
-            .checked_add(cache)
+        let fixed = cohort
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(baseline))
+            .and_then(|n| n.checked_add(cache))
             .ok_or_else(|| eyre!("fixed capacity overflow"))?;
         let capacities = Capacities {
             possible_edge_pairs: pairs,
             baseline_evidence_records: baseline,
+            cohort_records_per_table: cohort,
+            cohort_table_count: 3,
             cache_records: cache,
             fixed_pair_records: fixed,
             candidate_record_headroom: global.saturating_sub(fixed),
@@ -115,6 +119,7 @@ impl Parameters {
                 minimum_contact: self.minimum_contact_pixels / pixels_per_clip(),
                 piece_length: self.route_tolerance_pixels / pixels_per_clip(),
                 baseline_capacity: baseline,
+                cohort_capacity: cohort,
                 cache_capacity: cache,
             },
             capacities,
@@ -125,6 +130,8 @@ impl Parameters {
 struct Capacities {
     possible_edge_pairs: usize,
     baseline_evidence_records: usize,
+    cohort_records_per_table: usize,
+    cohort_table_count: usize,
     cache_records: usize,
     fixed_pair_records: usize,
     candidate_record_headroom: usize,
@@ -218,6 +225,7 @@ pub struct Image {
     current_collapsed_paths: usize,
     general: General,
     endpoints: Endpoints,
+    cohorts: CohortView,
     #[serde(with = "ResourceStatistics")]
     resources: Statistics,
     #[serde(with = "IndexStatistics")]
@@ -233,6 +241,7 @@ impl Image {
             current_collapsed_paths: row.collapsed,
             general: General::new(row.general, baseline.general)?,
             endpoints: General::new(row.endpoints, baseline.endpoints)?.into(),
+            cohorts: row.cohorts,
             resources: row.resources,
             index: row.index,
         })
@@ -244,6 +253,7 @@ struct Report<'a> {
     metadata: serde_json::Value,
     parameters: &'a Parameters,
     capacities: Capacities,
+    memberships: &'a [Membership],
     #[serde(with = "ResourceStatistics")]
     preparation_resources: Statistics,
     images: &'a [Image],
@@ -303,54 +313,57 @@ pub fn run(
         ambiguity::with_evaluator(&originals, &config, &mut budget, |evaluator| {
             Ok((|| -> Result<()> {
                 operation(evaluator, &mut images)?;
-                let originals = evaluator.originals();
+                let cohorts = evaluator.memberships();
                 let report = Report {
                     metadata: serde_json::json!({
                         "schema_version": 1, "metric_version": 1, "metric": "ambiguity",
                         "baseline": {"source": "gpu_resampled_iteration_0", "preprocessing_distortion_included": false},
                         "input": opts.input.display().to_string(),
                         "geometry": {"geometry_contract_version": 1, "coordinate_space": "clip", "distance_output_units": "export_pixels", "squared_distance_output_units": "export_pixels_squared", "width": SIZE, "height": SIZE, "pixels_per_clip_unit": pixels_per_clip(), "normalization": "initial graph bounds, centered uniform 95% fit, fixed across snapshots", "active_samples": baseline.layout().sample_count()},
-                        "counts": {"eligible_routes": count, "skipped_reservations": baseline.layout().skipped_count(), "total_reservations": count.saturating_add(baseline.layout().skipped_count()), "original_constants": evaluator.original_constant_count(), "closed_stored_start_routes": originals.closed_route_count, "unique_canonical_routes": originals.unique_route_count},
+                        "counts": {"eligible_routes": count, "skipped_reservations": baseline.layout().skipped_count(), "total_reservations": count.saturating_add(baseline.layout().skipped_count()), "original_constants": evaluator.original_constant_count(), "closed_stored_start_routes": cohorts.closed_route_count, "unique_canonical_routes": cohorts.unique_route_count, "cohorts": cohorts.cohort_count},
                         "definitions": {
                             "general": "For sustained current contacts, sqrt(mean(max(d-T,0)^2))/T, with original whole-route continuous endpoint-constrained weak Frechet distance d in the joint selected orientation. Introduced/resolved incompatible edge counts and squared-excess sums are co-primary alongside RMS.",
                             "endpoints": "Separate sqrt(mean(max(e-U,0)^2))/U over the same contacts, where e is the larger matched endpoint distance in that same orientation. Introduced/resolved counts and sums are co-primary.",
+                            "cohorts": "Deduplicated unordered cohort pairs witnessed by an incompatible contacting edge pair. Introduced cohort associations are primary; denominator counts all distinct cross-cohort pairs contacting in this snapshot.",
                             "interpretation": "Lower excess means less original-route mismatch among current sustained contacts. Ratios are dimensionless and can exceed 1. Compatible contacts can dilute RMS. No combined score or overall quality claim.",
-                            "empty_contacts": "count 0, sums 0, RMS 0, ratios 0"
+                            "empty_contacts": "count 0, sums 0, RMS 0, ratios 0; empty cohort denominator gives fraction 0"
                         },
                         "policies": {
                             "defaults": "Operational defaults, not calibrated perceptual constants. All pixel thresholds convert in f64 using SIZE/2; GPU f32 geometry is unchanged.",
                             "orientation": "Minimize max(d/T,e/U) jointly over forward/reversed matching, then smaller d, smaller e, then forward. Endpoint tolerance gives stronger endpoint influence. Inclusive thresholds, no epsilon halo.",
-                            "distance_argument_order": "Pair scoring passes the later route in canonical original order first, so their f64 predicates agree near thresholds.",
-                            "original_preparations": "Certified original routes are prepared on demand and retained by the original scope until evaluation ends. Their compact knots, source ranges and metadata share the workspace budget. Stored baseline contributions are reused for the same edge pairs.",
+                            "distance_argument_order": "Both cohort inference and pair scoring pass the later route in canonical membership order first, so their f64 predicates agree near thresholds.",
+                            "original_preparations": "Certified original routes are prepared on demand and retained by the original scope until evaluation ends. Their compact knots, source ranges and metadata share the workspace budget. Stored baseline contributions are reused for the same edge pairs; same-cohort contacts have proven zero excess.",
                             "canonicalization": "Normalize signed zero; remove consecutive duplicates and exact redundant forward-collinear vertices while retaining retracing. Lexicographically smaller forward/reverse sequence, geometry order with stable edge ID ties. Closed routes retain stored starts.",
+                            "cohorts": "First-fit complete-link over all unique canonical originals, with full membership mapping and duplicate multiplicity retained. Partition depends on thresholds and canonical order; crossing a partition alone is not incompatibility.",
                             "approximation": "Endpoint-preserving strong index-correspondence certificate per shortcut; bound original weak distance by simplified distance plus/minus the sum of certificate errors. Refine undecidable orientations/classifications on full curves. Bounds describe frozen original geometry and can tighten without geometric change. General output has explicit lower/upper bounds; endpoint values are exact under ordinary f64 arithmetic, not exact-real arithmetic.",
                             "limitations": "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.",
                             "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
-                            "edge_ids": "Edge IDs are stable drawable GPU path IDs from the uploaded layout, not semantic route labels.",
+                            "edge_ids": "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels.",
                             "contact": "One connected continuous radius-proximity component must have projected arc-interval union length at least the minimum on both curves. Point/tangent patches connect cells. Exact closed current paths use periodic adjacency.",
                             "short_path_count": "index.short_paths counts positive paths whose ordinary f64 total is below the minimum. This is diagnostic only; they remain indexed and use the conservative candidate participation test.",
-                            "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. Increase --ambiguity-stored-pair-limit for exhausted baseline tables or candidates. Only recomputable cache entries may evict.",
+                            "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
                             "work": "One work limit per preparation/baseline/current snapshot; no per-pair reset. Total work is charged before operations. The disjoint work_breakdown fields sum to work_consumed in charged work units: weak_cell_visits counts settled nonstale free-space cell visits, heap_operations counts individual pushes/pops, simplifier_point_visits counts interior point examinations for shortcut correspondence certificates, and other contains all remaining charges, including label initialization and geometry validation. Counts record successful pre-operation charges; failed charges change no counters. Detailed index counters accompany each row and overlap total work; do not add them to this full breakdown. Sort comparisons are not work units.",
-                            "workspace": "Requested capacities include canonical original data, evaluator metadata/tables, index/kernel temporaries, original/current route views and typed report rows with 32 filename bytes each. Shared GPU/CPU snapshots, allocator overhead, small report metadata and streaming serializer/I/O buffers are separate from requested evaluation workspace; this is not process RSS."
+                            "workspace": "Requested capacities include canonical/cohort data, evaluator metadata/tables, index/kernel temporaries, original/current route views and typed report rows with 32 filename bytes each. Shared GPU/CPU snapshots, allocator overhead, small report metadata and streaming serializer/I/O buffers are separate from requested evaluation workspace; this is not process RSS."
                         },
                         "resources": {"integration_route_view_bytes": route_bytes, "integration_report_buffer_bytes": row_bytes, "integration_reserved_bytes": caller_bytes, "image_capacity": rows, "original_route_view_capacity": count, "current_route_view_capacity": count, "filename_capacity_bytes_per_image": 32, "shared_snapshot_bytes_each": baseline.layout().sample_count().checked_mul(size_of::<[f32;2]>()), "maximum_shared_snapshots": 2, "geometry_staging_bytes": crate::resampling::GEOMETRY_STAGING_BYTES, "index_piece_length_clip_units": config.piece_length, "index_piece_length_pixels": params.route_tolerance_pixels},
                         "bundling": {"neighbor_radius": opts.neighbor_radius, "iterations": rows.saturating_sub(1)}
                     }),
                     parameters: params,
                     capacities,
+                    memberships: cohorts.memberships(),
                     preparation_resources: evaluator.preparation_resources(),
                     images: &images,
                 };
                 crate::report::publish(&opts.out, "ambiguity.json", &report)
             })())
-        }).wrap_err("ambiguity preparation/evaluation failed; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit; baseline capacities derive from the stored-pair limit")??;
+        }).wrap_err("ambiguity preparation/evaluation failed; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit; baseline/cohort capacities derive from the stored-pair limit")??;
         Ok(())
     })();
     budget.release(caller_bytes)?;
     outcome.wrap_err_with(|| format!(
-        "ambiguity limits: --ambiguity-work-limit={}, --ambiguity-workspace-bytes={}, --ambiguity-stored-pair-limit={}; derived baseline evidence capacity={}, recomputable cache={}. Raise the work or workspace setting for that failure; for stored-pair or baseline table exhaustion raise --ambiguity-stored-pair-limit, which scales the fixed tables and candidate headroom; resources after scoped cleanup={:?}",
+        "ambiguity limits: --ambiguity-work-limit={}, --ambiguity-workspace-bytes={}, --ambiguity-stored-pair-limit={}; derived baseline evidence capacity={}, each of three cohort tables={}, recomputable cache={}. Raise the work or workspace setting for that failure; for stored-pair or baseline/cohort table exhaustion raise --ambiguity-stored-pair-limit, which scales the fixed tables and candidate headroom; resources after scoped cleanup={:?}",
         params.work_limit, params.workspace_bytes, params.stored_pair_limit,
-        config.baseline_capacity, config.cache_capacity, budget.statistics()
+        config.baseline_capacity, config.cohort_capacity, config.cache_capacity, budget.statistics()
     ))
 }
 
