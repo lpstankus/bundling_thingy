@@ -7,6 +7,7 @@ pub enum Error {
     InvalidScale,
     WorkLimit,
     WorkspaceLimit,
+    RecordLimit,
     InvalidRelease,
     SizeOverflow,
     Allocation,
@@ -18,6 +19,7 @@ impl fmt::Display for Error {
             Self::InvalidCurve => "weak Frechet requires nonempty finite curves",
             Self::InvalidScale => "evaluation tolerances produce nonfinite normalized distances",
             Self::WorkLimit => "evaluation work limit exceeded",
+            Self::RecordLimit => "evaluation stored pair record limit exceeded",
             Self::WorkspaceLimit => "evaluation requested workspace limit exceeded",
             Self::InvalidRelease => "workspace release exceeds outstanding reservations",
             Self::SizeOverflow => "evaluation size arithmetic overflow",
@@ -33,12 +35,15 @@ pub struct Statistics {
     pub work_consumed: u64,
     pub workspace_reserved: usize,
     pub workspace_peak: usize,
+    pub records_reserved: usize,
+    pub records_peak: usize,
 }
 /// A shared sequential ledger. Retained evidence stays reserved until its owner releases it.
 #[derive(Debug)]
 pub struct Budget {
     work_limit: u64,
     workspace_limit: usize,
+    record_limit: usize,
     statistics: Statistics,
 }
 impl Budget {
@@ -47,12 +52,45 @@ impl Budget {
         Self {
             work_limit: work,
             workspace_limit: workspace,
+            record_limit: usize::MAX,
             statistics: Statistics {
                 work_consumed: 0,
                 workspace_reserved: 0,
                 workspace_peak: 0,
+                records_reserved: 0,
+                records_peak: 0,
             },
         }
+    }
+    /// Construct a ledger with a global stored-pair capacity limit.
+    #[must_use]
+    pub const fn with_record_limit(work: u64, workspace: usize, records: usize) -> Self {
+        let mut budget = Self::new(work, workspace);
+        budget.record_limit = records;
+        budget
+    }
+    /// Reserve requested record capacity before allocating its storage.
+    /// # Errors
+    /// Returns `RecordLimit` without changing the ledger on failure.
+    pub fn reserve_records(&mut self, records: usize) -> Result<(), Error> {
+        reserve_capacity(
+            &mut self.statistics.records_reserved,
+            &mut self.statistics.records_peak,
+            records,
+            self.record_limit,
+            Error::RecordLimit,
+        )
+    }
+    /// Release capacity when its owner drops the corresponding storage.
+    /// # Errors
+    /// Rejects a release larger than outstanding reservations.
+    pub fn release_records(&mut self, records: usize) -> Result<(), Error> {
+        self.statistics.records_reserved = self
+            .statistics
+            .records_reserved
+            .checked_sub(records)
+            .ok_or(Error::InvalidRelease)?;
+        Ok(())
     }
     #[must_use]
     pub const fn statistics(&self) -> Statistics {
@@ -75,17 +113,13 @@ impl Budget {
     /// # Errors
     /// Returns `WorkspaceLimit` without changing outstanding reservations on failure.
     pub fn reserve(&mut self, bytes: usize) -> Result<(), Error> {
-        let total = self
-            .statistics
-            .workspace_reserved
-            .checked_add(bytes)
-            .ok_or(Error::WorkspaceLimit)?;
-        if total > self.workspace_limit {
-            return Err(Error::WorkspaceLimit);
-        }
-        self.statistics.workspace_reserved = total;
-        self.statistics.workspace_peak = self.statistics.workspace_peak.max(total);
-        Ok(())
+        reserve_capacity(
+            &mut self.statistics.workspace_reserved,
+            &mut self.statistics.workspace_peak,
+            bytes,
+            self.workspace_limit,
+            Error::WorkspaceLimit,
+        )
     }
     /// # Errors
     /// Rejects releases larger than the outstanding ledger, leaving it unchanged.
@@ -358,4 +392,20 @@ pub fn distance(
         route: cost.sqrt(),
         endpoints: endpoints.sqrt(),
     })
+}
+
+fn reserve_capacity(
+    current: &mut usize,
+    peak: &mut usize,
+    added: usize,
+    limit: usize,
+    error: Error,
+) -> Result<(), Error> {
+    let total = current.checked_add(added).ok_or(error)?;
+    if total > limit {
+        return Err(error);
+    }
+    *current = total;
+    *peak = (*peak).max(total);
+    Ok(())
 }
