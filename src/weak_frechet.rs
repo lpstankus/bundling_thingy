@@ -404,6 +404,54 @@ fn traverse(
     }
     Err(Error::InvalidIndex)
 }
+// A one-segment grid is a chain, so every interior boundary is mandatory.
+fn chain(a: &Curve<'_>, b: &Curve<'_>, initial: f64, budget: &mut Budget) -> Result<f64, Error> {
+    let (line, other) = if a.segments == 1 { (a, b) } else { (b, a) };
+    let mut cost = initial;
+    for i in 1..other.segments {
+        budget.charge(1)?;
+        cost = cost.max(boundary(other.at(i)?, line.at(0)?, line.at(1)?));
+    }
+    Ok(cost)
+}
+
+// Each step crosses exactly one shared cell boundary. If all weights are at
+// most the endpoint lower bound, this path certifies the exact minimax cost.
+fn staircase(
+    a: &Curve<'_>,
+    b: &Curve<'_>,
+    initial: f64,
+    budget: &mut Budget,
+) -> Result<bool, Error> {
+    let mut row = 0;
+    let mut column = 0;
+    while increment(row)? < a.segments || increment(column)? < b.segments {
+        budget.charge(1)?;
+        let next_row = increment(row)?;
+        let next_column = increment(column)?;
+        let advance_row = next_row < a.segments
+            && (next_column == b.segments
+                || next_row
+                    .checked_mul(b.segments)
+                    .ok_or(Error::SizeOverflow)?
+                    <= next_column
+                        .checked_mul(a.segments)
+                        .ok_or(Error::SizeOverflow)?);
+        let weight = if advance_row {
+            let weight = boundary(a.at(next_row)?, b.at(column)?, b.at(next_column)?);
+            row = next_row;
+            weight
+        } else {
+            let weight = boundary(b.at(next_column)?, a.at(row)?, a.at(next_row)?);
+            column = next_column;
+            weight
+        };
+        if weight > initial {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 /// Backtracking is allowed; closed routes retain their stored starts.
 /// Squared f64 costs preserve input units after the final square root.
 /// # Errors
@@ -424,6 +472,8 @@ pub fn distance(
         point_distance(b.at(0)?, &a, budget)?
     } else if a.segments == 1 && b.segments == 1 {
         endpoints
+    } else if a.segments == 1 || b.segments == 1 {
+        chain(&a, &b, endpoints, budget)?
     } else {
         // Equal vertex counts provide a strong synchronized correspondence bound.
         let mut upper = f64::INFINITY;
@@ -434,7 +484,7 @@ pub fn distance(
                 upper = upper.max(squared(a.at(i)?, b.at(i)?));
             }
         }
-        if upper <= endpoints {
+        if upper <= endpoints || staircase(&a, &b, endpoints, budget)? {
             endpoints
         } else {
             let grid = Grid::new(a.segments, b.segments)?;
