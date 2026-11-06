@@ -13,28 +13,28 @@ use std::mem::size_of;
 #[derive(Debug, clap::Args, Serialize)]
 pub struct Parameters {
     /// Whole-route tolerance in export pixels. Operational, not perceptually calibrated.
-    #[arg(long = "ambiguity-route-tolerance-pixels", default_value_t = 16.0, value_parser = positive_pixels)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-route-tolerance-pixels", default_value_t = 16.0, value_parser = positive_pixels)]
     route_tolerance_pixels: f64,
     /// Matched-endpoint tolerance in export pixels.
-    #[arg(long = "ambiguity-endpoint-tolerance-pixels", default_value_t = 4.0, value_parser = positive_pixels)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-endpoint-tolerance-pixels", default_value_t = 4.0, value_parser = positive_pixels)]
     endpoint_tolerance_pixels: f64,
     /// Sustained-contact radius in export pixels. Zero is supported.
-    #[arg(long = "ambiguity-contact-radius-pixels", default_value_t = 2.0, value_parser = nonnegative_pixels)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-contact-radius-pixels", default_value_t = 2.0, value_parser = nonnegative_pixels)]
     contact_radius_pixels: f64,
     /// Required contact length along both curves in export pixels.
-    #[arg(long = "ambiguity-minimum-contact-pixels", default_value_t = 24.0, value_parser = positive_pixels)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-minimum-contact-pixels", default_value_t = 24.0, value_parser = positive_pixels)]
     minimum_contact_pixels: f64,
     /// Certified correspondence error in export pixels. Zero uses full curves.
-    #[arg(long = "ambiguity-simplification-pixels", default_value_t = 0.1, value_parser = nonnegative_pixels)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-simplification-pixels", default_value_t = 0.1, value_parser = nonnegative_pixels)]
     simplification_pixels: f64,
     /// Work units per preparation or snapshot, shared across all pair evaluations.
-    #[arg(long = "ambiguity-work-limit", default_value_t = 2_000_000_000, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-work-limit", default_value_t = 2_000_000_000, value_parser = clap::value_parser!(u64).range(1..))]
     work_limit: u64,
     /// Requested evaluation workspace bytes, excluding shared snapshots and allocator overhead.
-    #[arg(long = "ambiguity-workspace-bytes", default_value_t = 1_073_741_824, value_parser = positive_capacity)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-workspace-bytes", default_value_t = 1_073_741_824, value_parser = positive_capacity)]
     workspace_bytes: usize,
     /// Global stored-pair capacity, including fixed tables and temporary candidate records.
-    #[arg(long = "ambiguity-stored-pair-limit", default_value_t = 5_000_000, value_parser = positive_capacity)]
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-stored-pair-limit", default_value_t = 5_000_000, value_parser = positive_capacity)]
     stored_pair_limit: usize,
 }
 
@@ -331,6 +331,7 @@ pub fn run(
                         "policies": {
                             "defaults": "Operational defaults, not calibrated perceptual constants. All pixel thresholds convert in f64 using SIZE/2; GPU f32 geometry is unchanged.",
                             "orientation": "Minimize max(d/T,e/U) jointly over forward/reversed matching, then smaller d, smaller e, then forward. Endpoint tolerance gives stronger endpoint influence. Inclusive thresholds, no epsilon halo.",
+                            "distance_argument_order": "Both cohort inference and pair scoring pass the later route in canonical membership order first, so their f64 predicates agree near thresholds.",
                             "canonicalization": "Normalize signed zero; remove consecutive duplicates and exact redundant forward-collinear vertices while retaining retracing. Lexicographically smaller forward/reverse sequence, geometry order with stable edge ID ties. Closed routes retain stored starts.",
                             "cohorts": "First-fit complete-link over all unique canonical originals, with full membership mapping and duplicate multiplicity retained. Partition depends on thresholds and canonical order; crossing a partition alone is not incompatibility.",
                             "approximation": "Endpoint-preserving strong index-correspondence certificate per shortcut; bound original weak distance by simplified distance plus/minus the sum of certificate errors. Refine undecidable orientations/classifications on full curves. Bounds describe frozen original geometry and can tighten without geometric change. General output has explicit lower/upper bounds; endpoint values are exact under ordinary f64 arithmetic, not exact-real arithmetic.",
@@ -338,6 +339,7 @@ pub fn run(
                             "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
                             "edge_ids": "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels.",
                             "contact": "One connected continuous radius-proximity component must have projected arc-interval union length at least the minimum on both curves. Point/tangent patches connect cells. Exact closed current paths use periodic adjacency.",
+                            "short_path_count": "index.short_paths counts positive paths whose ordinary f64 total is below the minimum. This is diagnostic only; they remain indexed and use the conservative candidate participation test.",
                             "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
                             "work": "One work limit per preparation/baseline/current snapshot; no per-pair reset. Total work is charged before operations. The disjoint work_breakdown fields sum to work_consumed in charged work units: weak_cell_visits counts settled nonstale free-space cell visits, heap_operations counts individual pushes/pops, simplifier_point_visits counts interior point examinations for shortcut correspondence certificates, and other contains all remaining charges, including label initialization and geometry validation. Counts record successful pre-operation charges; failed charges change no counters. Detailed index counters accompany each row and overlap total work; do not add them to this full breakdown. Sort comparisons are not work units.",
                             "workspace": "Requested capacities include canonical/cohort data, evaluator metadata/tables, index/kernel temporaries, original/current route views and typed report rows with 32 filename bytes each. Shared GPU/CPU snapshots, allocator overhead, small report metadata and streaming serializer/I/O buffers are separate from requested evaluation workspace; this is not process RSS."

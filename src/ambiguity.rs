@@ -426,12 +426,13 @@ impl Accumulator<'_, '_> {
         {
             return Ok((ai, bi, cached.assessment));
         }
+        // Match complete-link assignment: the later canonical route is first.
         let assessment = ambiguity_similarity::assess(
             self.cohorts
-                .canonical_points(ai)
+                .canonical_points(ai.max(bi))
                 .ok_or(Resource::InvalidIndex)?,
             self.cohorts
-                .canonical_points(bi)
+                .canonical_points(ai.min(bi))
                 .ok_or(Resource::InvalidIndex)?,
             &self.config.similarity,
             budget,

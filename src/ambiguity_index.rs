@@ -23,6 +23,7 @@ pub struct Path<'a> {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Statistics {
     pub constant_paths: usize,
+    /// Positive paths with a rounded total below the minimum; they remain indexed.
     pub short_paths: usize,
     pub pieces_generated: u64,
     pub entries_visited: u64,
@@ -412,7 +413,6 @@ fn build<E>(
                 .short_paths
                 .checked_add(1)
                 .ok_or(ResourceError::SizeOverflow)?;
-            continue;
         }
         eligible.push(edge);
         let mut previous = first.map(f64::from);
