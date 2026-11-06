@@ -45,7 +45,7 @@ pub struct Options {
     #[arg(long, requires = "headless")]
     evaluate_distortion: bool,
 
-    /// Measure general and endpoint geometric ambiguity and write ambiguity.json.
+    /// Measure all three geometric ambiguity views and write ambiguity.json.
     #[arg(long, requires = "headless")]
     evaluate_ambiguity: bool,
 

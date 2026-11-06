@@ -3,15 +3,16 @@
 //! General and endpoint ratios are separate RMS excesses and can exceed one.
 //! Empty contact sets have zero ratios. Bounds describe original route distance
 //! approximation under ordinary f64 arithmetic, without exact-real guarantees.
-//! Canonical original order is frozen. Closed routes retain starts.
+//! Cohorts use geometry-ordered first-fit complete-link membership. Their IDs
+//! depend on the thresholds and partition rule. Closed routes retain starts.
 //! Contact measures connected continuous participation along both routes, which
 //! can include shallow crossings and backtracking rather than a monotone match.
 //! All owned heap storage uses the caller's shared ledger. Fixed-capacity tables
 //! never grow, baseline evidence never evicts, and only cached assessments evict.
 //! Index and kernel temporary storage remain on that ledger during callbacks.
 use crate::{
+    ambiguity_cohorts::{self, Cohorts, Route},
     ambiguity_index::{self, Path},
-    ambiguity_originals::{self, Originals, Route},
     ambiguity_similarity::{self, Config as Similarity},
     weak_frechet::{Budget, Error as Resource, Statistics},
 };
@@ -71,6 +72,8 @@ pub struct Config {
     pub baseline_capacity: usize,
     /// Direct-mapped recomputable assessment slots. Zero disables caching.
     pub cache_capacity: usize,
+    /// Slot capacity of each of three cohort sets. Full sets fail explicitly.
+    pub cohort_capacity: usize,
 }
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct Bounds {
@@ -105,12 +108,22 @@ pub struct View {
     pub introduced_squared_excess: Bounds,
     pub resolved_squared_excess: Bounds,
 }
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct CohortView {
+    pub current: usize,
+    pub baseline: usize,
+    pub introduced: usize,
+    pub resolved: usize,
+    pub contacting_cross_cohort: usize,
+    pub incompatible_fraction: f64,
+}
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Row {
     pub contacts: u64,
     pub collapsed: usize,
     pub general: View,
     pub endpoints: View,
+    pub cohorts: CohortView,
     pub resources: Statistics,
     pub index: ambiguity_index::Statistics,
 }
@@ -126,6 +139,65 @@ struct Evidence {
     flags: [bool; 2],
     seen: bool,
 }
+struct PairSet {
+    slots: Vec<Option<(usize, usize)>>,
+    len: usize,
+}
+impl PairSet {
+    fn new(capacity: usize, budget: &mut Budget) -> Result<Self, Resource> {
+        budget.charge(u64::try_from(capacity).map_err(|_| Resource::SizeOverflow)?)?;
+        let mut slots = vector(capacity)?;
+        slots.resize(capacity, None);
+        Ok(Self { slots, len: 0 })
+    }
+    fn clear(&mut self, budget: &mut Budget) -> Result<(), Resource> {
+        budget.charge(u64::try_from(self.slots.len()).map_err(|_| Resource::SizeOverflow)?)?;
+        self.slots.fill(None);
+        self.len = 0;
+        Ok(())
+    }
+    fn locate(&self, key: (usize, usize), budget: &mut Budget) -> Result<(usize, bool), Resource> {
+        if self.slots.is_empty() {
+            return Err(Resource::RecordLimit);
+        }
+        let mut index = key
+            .0
+            .wrapping_mul(0x9e37_79b9)
+            .wrapping_add(key.1)
+            .checked_rem(self.slots.len())
+            .ok_or(Resource::InvalidIndex)?;
+        for _ in 0..self.slots.len() {
+            budget.charge(1)?;
+            match self.slots.get(index).ok_or(Resource::InvalidIndex)? {
+                Some(value) if *value == key => return Ok((index, true)),
+                None => return Ok((index, false)),
+                _ => {
+                    index = index
+                        .wrapping_add(1)
+                        .checked_rem(self.slots.len())
+                        .ok_or(Resource::InvalidIndex)?;
+                }
+            }
+        }
+        Err(Resource::RecordLimit)
+    }
+    fn insert(&mut self, key: (usize, usize), budget: &mut Budget) -> Result<(), Resource> {
+        let (index, found) = self.locate(key, budget)?;
+        if !found {
+            *self.slots.get_mut(index).ok_or(Resource::InvalidIndex)? = Some(key);
+            self.len = self.len.checked_add(1).ok_or(Resource::SizeOverflow)?;
+        }
+        Ok(())
+    }
+    fn contains(&self, key: (usize, usize), budget: &mut Budget) -> Result<bool, Resource> {
+        // A full table can still establish absence by exhausting all slots.
+        match self.locate(key, budget) {
+            Ok((_, found)) => Ok(found),
+            Err(Resource::RecordLimit) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
 fn vector<T>(capacity: usize) -> Result<Vec<T>, Resource> {
     let mut v = Vec::new();
     v.try_reserve_exact(capacity)
@@ -133,17 +205,20 @@ fn vector<T>(capacity: usize) -> Result<Vec<T>, Resource> {
     Ok(v)
 }
 
-/// Scoped evaluator. Canonical geometry remains borrowed from
-/// original preparation, with their reservations live throughout this scope.
+/// Scoped evaluator. Canonical geometry and memberships remain borrowed from
+/// cohort preparation, with their reservations live throughout this scope.
 /// Failed frames permanently invalidate this evaluator.
 pub struct Evaluator<'a, 'b> {
-    originals: Originals<'a>,
+    cohorts: Cohorts<'a>,
     config: &'b Config,
     budget: &'b mut Budget,
     lookup: Vec<(u32, usize)>,
     baseline: Vec<Evidence>,
     cache: Vec<Option<Cached>>,
     preparations: &'b mut [Option<ambiguity_similarity::Prepared<'a>>],
+    h0: PairSet,
+    h: PairSet,
+    cross: PairSet,
     preparation: Statistics,
     original_constants: usize,
     baseline_row: Row,
@@ -151,8 +226,8 @@ pub struct Evaluator<'a, 'b> {
 }
 impl Evaluator<'_, '_> {
     #[must_use]
-    pub const fn originals(&self) -> &Originals<'_> {
-        &self.originals
+    pub const fn memberships(&self) -> &Cohorts<'_> {
+        &self.cohorts
     }
     #[must_use]
     pub const fn preparation_resources(&self) -> Statistics {
@@ -219,18 +294,22 @@ impl Evaluator<'_, '_> {
         baseline: bool,
         phase: Phase,
     ) -> Result<Row, Error> {
+        self.h.clear(self.budget)?;
+        self.cross.clear(self.budget)?;
         for evidence in &mut self.baseline {
             self.budget.charge(1)?;
             evidence.seen = false;
         }
         let mut row = Row::default();
         let mut accumulator = Accumulator {
-            originals: &self.originals,
+            cohorts: &self.cohorts,
             config: self.config,
             lookup: &self.lookup,
             baseline: &mut self.baseline,
             cache: &mut self.cache,
             preparations: self.preparations,
+            h: &mut self.h,
+            cross: &mut self.cross,
             row: &mut row,
             is_baseline: baseline,
         };
@@ -281,17 +360,36 @@ impl Evaluator<'_, '_> {
         } else {
             self.baseline_row.endpoints.current
         };
+        row.cohorts.current = self.h.len;
+        row.cohorts.contacting_cross_cohort = self.cross.len;
+        if baseline {
+            for slot in &self.h.slots {
+                self.budget.charge(1)?;
+                if let Some(key) = slot {
+                    self.h0.insert(*key, self.budget)?;
+                }
+            }
+        } else {
+            row.cohorts.introduced = difference(&self.h, &self.h0, self.budget)?;
+            row.cohorts.resolved = difference(&self.h0, &self.h, self.budget)?;
+        }
+        row.cohorts.baseline = self.h0.len;
+        if self.cross.len > 0 {
+            row.cohorts.incompatible_fraction = number(self.h.len)? / number(self.cross.len)?;
+        }
         row.resources = self.budget.statistics();
         Ok(row)
     }
 }
 struct Accumulator<'a, 'b> {
-    originals: &'a Originals<'b>,
+    cohorts: &'a Cohorts<'b>,
     config: &'a Config,
     lookup: &'a [(u32, usize)],
     baseline: &'a mut Vec<Evidence>,
     cache: &'a mut [Option<Cached>],
     preparations: &'a mut [Option<ambiguity_similarity::Prepared<'b>>],
+    h: &'a mut PairSet,
+    cross: &'a mut PairSet,
     row: &'a mut Row,
     is_baseline: bool,
 }
@@ -323,7 +421,7 @@ impl Accumulator<'_, '_> {
         {
             return Ok(cached.assessment);
         }
-        // Use the later canonical original route first.
+        // Match complete-link assignment: the later canonical route is first.
         for index in [ai, bi] {
             budget.charge(1)?;
             let slot = self
@@ -332,7 +430,7 @@ impl Accumulator<'_, '_> {
                 .ok_or(Resource::InvalidIndex)?;
             if slot.is_none() {
                 let points = self
-                    .originals
+                    .cohorts
                     .canonical_points(index)
                     .ok_or(Resource::InvalidIndex)?;
                 *slot = Some(ambiguity_similarity::prepare(
@@ -383,9 +481,23 @@ impl Accumulator<'_, '_> {
             .map_err(|_| Resource::InvalidIndex)?;
         let ai = self.lookup.get(ai).ok_or(Resource::InvalidIndex)?.1;
         let bi = self.lookup.get(bi).ok_or(Resource::InvalidIndex)?.1;
+        let ca = self
+            .cohorts
+            .memberships()
+            .get(ai)
+            .ok_or(Resource::InvalidIndex)?
+            .cohort;
+        let cb = self
+            .cohorts
+            .memberships()
+            .get(bi)
+            .ok_or(Resource::InvalidIndex)?
+            .cohort;
         let (flags, weights) = if let Some(index) = previous {
             let evidence = self.baseline.get(index).ok_or(Resource::InvalidIndex)?;
             (evidence.flags, [evidence.general, evidence.endpoints])
+        } else if ca == cb {
+            ([false; 2], [Bounds::default(); 2])
         } else {
             let assessment = self.assess(a, b, ai, bi, budget)?;
             (
@@ -407,6 +519,13 @@ impl Accumulator<'_, '_> {
                 ],
             )
         };
+        validate_cohort(ca, cb, flags)?;
+        if ca != cb {
+            self.cross.insert((ca.min(cb), ca.max(cb)), budget)?;
+            if flags[0] || flags[1] {
+                self.h.insert((ca.min(cb), ca.max(cb)), budget)?;
+            }
+        }
         if let Some(index) = previous {
             self.baseline
                 .get_mut(index)
@@ -445,6 +564,15 @@ impl Accumulator<'_, '_> {
         Ok(())
     }
 }
+const fn validate_cohort(a: usize, b: usize, flags: [bool; 2]) -> Result<(), Resource> {
+    if a == b && (flags[0] || flags[1]) {
+        return Err(Resource::InconsistentCohort);
+    }
+    Ok(())
+}
+fn number(value: usize) -> Result<f64, Resource> {
+    count_value(u64::try_from(value).map_err(|_| Resource::SizeOverflow)?)
+}
 fn count_value(value: u64) -> Result<f64, Resource> {
     let high = f64::from(u32::try_from(value >> 32).map_err(|_| Resource::SizeOverflow)?);
     let low =
@@ -468,12 +596,24 @@ fn finish(view: &mut View, count: u64, tolerance: f64) -> Result<(), Resource> {
     }
     Ok(())
 }
-/// Prepare originals, compute the original baseline, then evaluate snapshots in
+fn difference(a: &PairSet, b: &PairSet, budget: &mut Budget) -> Result<usize, Resource> {
+    let mut count = 0usize;
+    for slot in &a.slots {
+        budget.charge(1)?;
+        let Some(key) = slot else { continue };
+        if !b.contains(*key, budget)? {
+            count = count.checked_add(1).ok_or(Resource::SizeOverflow)?;
+        }
+    }
+    Ok(count)
+}
+
+/// Prepare cohorts, compute the original baseline, then evaluate snapshots in
 /// the callback.
 ///
 /// All owned storage is released on success or failure. Original
-/// canonical storage remains reserved by `with_originals`; no source copies exist.
-/// Cache and baseline evidence reserve their full configured capacities
+/// canonical storage remains reserved by `with_cohorts`; no source copies exist.
+/// Pair tables and baseline evidence reserve their full configured capacities
 /// before allocation. The evaluator releases lazy preparations on every exit.
 /// # Errors
 /// Invalid geometry/configuration, resource limits and callback errors abort.
@@ -491,11 +631,11 @@ pub fn with_evaluator<R>(
         }
     }
     let mut output = None;
-    let preparation = ambiguity_originals::with_originals(
+    let preparation = ambiguity_cohorts::with_prepared_cohorts(
         original,
         &config.similarity,
         budget,
-        |originals, preparations, budget| {
+        |cohorts, preparations, budget| {
             let (bytes, records) = storage_requirements(config, original.len())?;
             budget.reserve(bytes)?;
             if let Err(error) = budget.reserve_records(records) {
@@ -505,13 +645,10 @@ pub fn with_evaluator<R>(
             let result = (|| -> Result<R, Error> {
                 let mut lookup = vector(original.len())?;
                 let mut original_constants = 0usize;
-                for index in 0..original.len() {
+                for (index, m) in cohorts.memberships().iter().enumerate() {
                     budget.charge(1)?;
-                    lookup.push((
-                        originals.edge_id(index).ok_or(Resource::InvalidIndex)?,
-                        index,
-                    ));
-                    if originals
+                    lookup.push((m.edge_id, index));
+                    if cohorts
                         .canonical_points(index)
                         .ok_or(Resource::InvalidIndex)?
                         .len()
@@ -536,15 +673,21 @@ pub fn with_evaluator<R>(
                     u64::try_from(config.cache_capacity).map_err(|_| Resource::SizeOverflow)?,
                 )?;
                 cache.resize(config.cache_capacity, None);
+                let h0 = PairSet::new(config.cohort_capacity, budget)?;
+                let h = PairSet::new(config.cohort_capacity, budget)?;
+                let cross = PairSet::new(config.cohort_capacity, budget)?;
                 let preparation = budget.statistics();
                 let mut evaluator = Evaluator {
-                    originals,
+                    cohorts,
                     config,
                     budget,
                     lookup,
                     cache,
                     preparations,
                     baseline: vector(config.baseline_capacity)?,
+                    h0,
+                    h,
+                    cross,
                     preparation,
                     original_constants,
                     baseline_row: Row::default(),
@@ -567,12 +710,22 @@ pub fn with_evaluator<R>(
 
 fn storage_requirements(config: &Config, route_count: usize) -> Result<(usize, usize), Resource> {
     let records = config
-        .baseline_capacity
-        .checked_add(config.cache_capacity)
+        .cohort_capacity
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(config.baseline_capacity))
+        .and_then(|n| n.checked_add(config.cache_capacity))
         .ok_or(Resource::SizeOverflow)?;
     let bytes = config
-        .baseline_capacity
-        .checked_mul(size_of::<Evidence>())
+        .cohort_capacity
+        .checked_mul(3)
+        .and_then(|n| n.checked_mul(size_of::<Option<(usize, usize)>>()))
+        .and_then(|n| {
+            n.checked_add(
+                config
+                    .baseline_capacity
+                    .checked_mul(size_of::<Evidence>())?,
+            )
+        })
         .and_then(|n| {
             n.checked_add(
                 config
