@@ -147,18 +147,31 @@ fn headless(opts: &Options) -> Result<()> {
             .validate_baseline()?;
     }
     if opts.evaluate_ambiguity {
+        // The GPU backend reuses this device and the resident geometry buffers.
+        let candidates = (opts.ambiguity.backend == ambiguity_report::Backend::Gpu)
+            .then(|| gpu.ambiguity_candidates(opts.ambiguity.gpu_settings()?))
+            .transpose()?;
+        let geometry = candidates
+            .as_ref()
+            .map(|_| gpu.candidate_geometry())
+            .transpose()?;
         ambiguity_report::run(
             opts,
             baseline
                 .as_ref()
                 .ok_or_else(|| color_eyre::eyre::eyre!("missing ambiguity baseline"))?,
-            |evaluator, images| {
+            candidates.as_ref().zip(geometry),
+            |evaluator, stage, images| {
                 image_flow(
                     opts,
                     &mut gpu,
                     baseline.as_ref(),
                     noisiness,
-                    Some(evaluator),
+                    Some(Ambiguity {
+                        evaluator,
+                        baseline: stage,
+                        candidates: candidates.as_ref(),
+                    }),
                     images,
                 )
             },
@@ -183,12 +196,18 @@ impl Options {
     }
 }
 
+struct Ambiguity<'e, 'a, 'b> {
+    evaluator: &'e mut bundling_wgpu::ambiguity::Evaluator<'a, 'b>,
+    baseline: ambiguity_report::CandidateStage,
+    candidates: Option<&'e bundling_wgpu::ambiguity_gpu::Candidates>,
+}
+
 fn image_flow(
     opts: &Options,
     gpu: &mut Gpu,
     baseline: Option<&bundling_wgpu::geometry::Snapshot<'_>>,
     mut noisiness: Option<noisiness::Report>,
-    mut evaluator: Option<&mut bundling_wgpu::ambiguity::Evaluator<'_, '_>>,
+    mut ambiguity: Option<Ambiguity<'_, '_, '_>>,
     ambiguity_images: &mut Vec<ambiguity_report::Image>,
 ) -> Result<()> {
     let mut distortion_images = Vec::new();
@@ -232,8 +251,13 @@ fn image_flow(
                 result.0, result.1
             );
         }
-        if let Some(evaluator) = evaluator.as_mut() {
-            let row = if let Some(current) = &current {
+        if let Some(Ambiguity {
+            evaluator,
+            baseline: baseline_stage,
+            candidates,
+        }) = ambiguity.as_mut()
+        {
+            let (row, stage) = if let Some(current) = &current {
                 let mut paths = Vec::new();
                 paths.try_reserve_exact(current.layout().edge_count())?;
                 paths.extend(
@@ -241,15 +265,20 @@ fn image_flow(
                         .edges()
                         .map(|(id, points)| bundling_wgpu::ambiguity_index::Path { id, points }),
                 );
-                evaluator.evaluate(&paths).wrap_err("evaluate ambiguity snapshot; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit")?
+                let candidates = candidates
+                    .map(|candidates| {
+                        Ok::<_, color_eyre::Report>((candidates, gpu.candidate_geometry()?))
+                    })
+                    .transpose()?;
+                ambiguity_report::evaluate(evaluator, &paths, candidates).wrap_err("evaluate ambiguity snapshot; check --ambiguity-work-limit, --ambiguity-workspace-bytes, --ambiguity-stored-pair-limit and the named GPU contact limit")?
             } else {
-                evaluator.baseline()
+                (evaluator.baseline(), *baseline_stage)
             };
             ambiguity_images.push(ambiguity_report::Image::new(
                 name,
                 iteration,
-                &row,
-                &evaluator.baseline(),
+                (&row, &evaluator.baseline()),
+                &stage,
             )?);
         }
     }

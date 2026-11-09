@@ -12,6 +12,8 @@ pub mod ambiguity_cohorts;
 
 pub mod ambiguity_index;
 
+pub mod ambiguity_gpu;
+
 pub mod ambiguity;
 
 pub mod ambiguity_originals;

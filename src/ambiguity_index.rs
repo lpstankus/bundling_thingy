@@ -7,8 +7,13 @@
 //! simultaneous growth buffers, excluding allocator overhead and borrowed points.
 //! The index releases only its own reservations on every exit. Callbacks own
 //! their retained reservations on success and failure and must clean them up.
+//! The crate's verified GPU frame may replace the CPU index. It decides each
+//! complete source/partner run as certified contact, certified no contact or
+//! complete CPU fallback through the same private pair route, in the same
+//! source/partner order, emitting through the same contact helper. No other
+//! external candidate or certificate provider is accepted.
 use crate::{
-    ambiguity_contact,
+    ambiguity_contact, ambiguity_gpu,
     weak_frechet::{Budget, Error as ResourceError},
 };
 use std::{fmt, mem::size_of};
@@ -46,6 +51,9 @@ pub enum Error<E> {
         partner: u32,
         error: E,
     },
+    /// GPU contact acceleration failed (resource, device or protocol); no CPU
+    /// index replaces it.
+    Gpu(ambiguity_gpu::Error),
 }
 impl<E: fmt::Display> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,6 +74,7 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
                 partner,
                 error,
             } => write!(f, "callback {source}/{partner}: {error}"),
+            Self::Gpu(error) => write!(f, "GPU contact: {error}"),
         }
     }
 }
@@ -75,6 +84,39 @@ impl<E> From<ResourceError> for Error<E> {
         Self::Resource(error, Statistics::default())
     }
 }
+impl<E> From<ambiguity_gpu::Error> for Error<E> {
+    fn from(error: ambiguity_gpu::Error) -> Self {
+        match error {
+            ambiguity_gpu::Error::Workspace(resource) => resource.into(),
+            other => Self::Gpu(other),
+        }
+    }
+}
+/// One candidate segment-pair cell of a GPU fallback run.
+///
+/// Path fields are ordinals in increasing ID order. Segment fields are positive
+/// segment indices after duplicate removal, as in `PreparedCurve`. Field order
+/// matches the CPU candidate order: source, partner, then cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct CandidateCell {
+    pub source: u32,
+    pub partner: u32,
+    pub source_segment: u32,
+    pub partner_segment: u32,
+}
+
+/// Candidate enumeration used before the unchanged per-source narrow phase.
+pub enum BroadPhase<'a> {
+    /// Streaming CPU AABB hierarchy over bounded segment pieces.
+    Cpu,
+    /// GPU candidates and certified contact decisions on resident geometry,
+    /// verified bit for bit against the enumerated paths and using this
+    /// enumeration's radius, minimum and preparation. Uncertain pairs take the
+    /// complete CPU pair route.
+    Gpu(&'a mut ambiguity_gpu::Frame),
+}
+
 #[derive(Clone, Copy)]
 struct Piece {
     edge: usize,
@@ -86,6 +128,32 @@ struct Piece {
 struct Candidate {
     partner: usize,
     cell: (usize, usize),
+}
+/// Candidate view shared by CPU and external records of one source.
+trait CellRecord: Copy {
+    fn partner(&self) -> usize;
+    fn cell(&self) -> (usize, usize);
+}
+impl CellRecord for Candidate {
+    fn partner(&self) -> usize {
+        self.partner
+    }
+    fn cell(&self) -> (usize, usize) {
+        self.cell
+    }
+}
+// Out-of-range sentinels cannot occur for u32 on supported targets; they would
+// fail the later index lookups rather than alias a valid segment.
+fn index(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+impl CellRecord for CandidateCell {
+    fn partner(&self) -> usize {
+        index(self.partner)
+    }
+    fn cell(&self) -> (usize, usize) {
+        (index(self.source_segment), index(self.partner_segment))
+    }
 }
 struct Workspace<'a> {
     budget: &'a mut Budget,
@@ -107,15 +175,18 @@ impl Workspace<'_> {
             .bytes
             .checked_add(bytes)
             .ok_or(ResourceError::SizeOverflow)?;
+        let total_records = self
+            .records
+            .checked_add(if records { capacity } else { 0 })
+            .ok_or(ResourceError::SizeOverflow)?;
         self.budget.reserve(bytes)?;
-        self.bytes = total;
-        if records {
-            self.budget.reserve_records(capacity)?;
-            self.records = self
-                .records
-                .checked_add(capacity)
-                .ok_or(ResourceError::SizeOverflow)?;
+        if records && let Err(error) = self.budget.reserve_records(capacity) {
+            // Roll back so batch retries start from the same ledger.
+            self.budget.release(bytes)?;
+            return Err(error);
         }
+        self.bytes = total;
+        self.records = total_records;
         let mut result = Vec::new();
         result
             .try_reserve_exact(capacity)
@@ -246,14 +317,40 @@ pub fn enumerate<E>(
     minimum: f64,
     piece_length: f64,
     budget: &mut Budget,
-    mut callback: impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
+    callback: impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
 ) -> Result<Statistics, Error<E>> {
-    let mut stats = Statistics::default();
-    run(
+    enumerate_with(
+        BroadPhase::Cpu,
         paths,
         radius,
         minimum,
         piece_length,
+        budget,
+        callback,
+    )
+}
+/// `enumerate` with a selectable broad phase and identical contact decisions.
+///
+/// GPU batches are whole increasing source ranges sized by the joint device,
+/// record and workspace plan; multi-source ranges halve before fill and a
+/// single source that still does not fit is an error. CPU fallback pairs are
+/// charged as on the CPU path; GPU generation and certification are not.
+/// # Errors
+/// As `enumerate`, plus external source failures and contract violations.
+pub fn enumerate_with<E>(
+    broad_phase: BroadPhase<'_>,
+    paths: &[Path<'_>],
+    radius: f64,
+    minimum: f64,
+    piece_length: f64,
+    budget: &mut Budget,
+    mut callback: impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
+) -> Result<Statistics, Error<E>> {
+    let mut stats = Statistics::default();
+    run(
+        broad_phase,
+        paths,
+        (radius, minimum, piece_length),
         budget,
         &mut callback,
         &mut stats,
@@ -264,10 +361,9 @@ pub fn enumerate<E>(
     })
 }
 fn run<E>(
+    broad_phase: BroadPhase<'_>,
     paths: &[Path<'_>],
-    radius: f64,
-    minimum: f64,
-    piece_length: f64,
+    (radius, minimum, piece_length): (f64, f64, f64),
     budget: &mut Budget,
     callback: &mut impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
     stats: &mut Statistics,
@@ -280,12 +376,33 @@ fn run<E>(
     };
     let ordered = ordered_paths(paths, &mut workspace)?;
     let prepared = prepare_paths(&ordered, &mut workspace)?;
-    let mut index = build(
-        &ordered,
-        &prepared,
+    let narrow = Narrow {
+        ordered: &ordered,
+        prepared: &prepared,
+        radius,
         minimum,
+    };
+    match broad_phase {
+        BroadPhase::Cpu => cpu_candidates(&narrow, piece_length, &mut workspace, stats, callback)?,
+        BroadPhase::Gpu(frame) => {
+            gpu_candidates(&narrow, frame, &mut workspace, stats, callback)?;
+        }
+    }
+    Ok(*stats)
+}
+fn cpu_candidates<E>(
+    narrow: &Narrow<'_, '_>,
+    piece_length: f64,
+    workspace: &mut Workspace<'_>,
+    stats: &mut Statistics,
+    callback: &mut impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
+) -> Result<(), Error<E>> {
+    let mut index = build(
+        narrow.ordered,
+        narrow.prepared,
+        narrow.minimum,
         piece_length,
-        &mut workspace,
+        workspace,
         stats,
     )?;
     let mut hierarchy = workspace.vector(node_count(index.len())?, false)?;
@@ -294,14 +411,14 @@ fn run<E>(
     }
     let mut candidates = Vec::<Candidate>::new();
     let mut capacity = 0;
-    for (source, path) in ordered.iter().enumerate() {
+    for (source, path) in narrow.ordered.iter().enumerate() {
         collect(
             (source, path.points),
             (&index, &hierarchy),
-            (radius, piece_length),
+            (narrow.radius, piece_length),
             &mut candidates,
             &mut capacity,
-            &mut workspace,
+            workspace,
             stats,
         )?;
         candidates.sort_unstable();
@@ -309,62 +426,194 @@ fn run<E>(
             .budget
             .charge(u64::try_from(candidates.len()).map_err(|_| ResourceError::SizeOverflow)?)?;
         candidates.dedup();
+        narrow.source(source, &mut candidates, workspace.budget, stats, callback)?;
+    }
+    Ok(())
+}
+/// Run GPU batches. The session releases the frame's device buffers and its
+/// own reservations on every exit, including unwinding.
+fn gpu_candidates<E>(
+    narrow: &Narrow<'_, '_>,
+    frame: &mut ambiguity_gpu::Frame,
+    workspace: &mut Workspace<'_>,
+    stats: &mut Statistics,
+    callback: &mut impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
+) -> Result<(), Error<E>> {
+    let tables = narrow
+        .ordered
+        .len()
+        .checked_add(1)
+        .ok_or(ResourceError::SizeOverflow)?;
+    let mut segment_offsets = workspace.vector::<u32>(tables, false)?;
+    segment_offsets.push(0);
+    for curve in narrow.prepared {
+        workspace.budget.charge(1)?;
+        classify(curve, narrow.minimum, stats)?;
+        let previous = segment_offsets.last().copied().unwrap_or(0);
+        let count =
+            u32::try_from(curve.segment_count()).map_err(|_| ResourceError::SizeOverflow)?;
+        segment_offsets.push(
+            previous
+                .checked_add(count)
+                .ok_or(ResourceError::SizeOverflow)?,
+        );
+    }
+    let request = ambiguity_gpu::Request {
+        paths: narrow.ordered,
+        prepared: narrow.prepared,
+        segment_offsets: &segment_offsets,
+        radius: narrow.radius,
+        minimum: narrow.minimum,
+    };
+    let mut session = frame.session(&request, workspace.budget)?;
+    while let Some(mut batch) = session.next_batch()? {
+        stats.candidate_records = stats
+            .candidate_records
+            .checked_add(u64::from(batch.cells()))
+            .ok_or(ResourceError::SizeOverflow)?;
+        batch.decide(|decision, budget| match decision {
+            ambiguity_gpu::Decision::Contact { source, partner } => {
+                narrow.emit((source, partner), budget, stats, callback)
+            }
+            ambiguity_gpu::Decision::Fallback {
+                source,
+                partner,
+                cells,
+            } => {
+                if narrow.pair((source, partner), cells, budget, stats)? {
+                    narrow.emit((source, partner), budget, stats, callback)?;
+                }
+                Ok(())
+            }
+        })?;
+    }
+    Ok(())
+}
+fn classify(
+    curve: &ambiguity_contact::PreparedCurve<'_>,
+    minimum: f64,
+    stats: &mut Statistics,
+) -> Result<(), ResourceError> {
+    let length = curve.total_length();
+    let counter = if length == 0.0 {
+        &mut stats.constant_paths
+    } else if length < minimum {
+        &mut stats.short_paths
+    } else {
+        return Ok(());
+    };
+    *counter = counter.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
+    Ok(())
+}
+
+/// Frame geometry shared by every per-source narrow phase.
+struct Narrow<'p, 'a> {
+    ordered: &'p [Path<'a>],
+    prepared: &'p [ambiguity_contact::PreparedCurve<'a>],
+    radius: f64,
+    minimum: f64,
+}
+impl Narrow<'_, '_> {
+    /// Stream sorted, deduplicated candidates of one source by increasing partner.
+    fn source<E, T: CellRecord>(
+        &self,
+        source: usize,
+        candidates: &mut [T],
+        budget: &mut Budget,
+        stats: &mut Statistics,
+        callback: &mut impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
+    ) -> Result<(), Error<E>> {
         let mut start = 0;
         while let Some(first) = candidates.get(start) {
-            let partner = first.partner;
+            let partner = first.partner();
             let mut end = start;
             while candidates
                 .get(end)
-                .is_some_and(|entry| entry.partner == partner)
+                .is_some_and(|entry| entry.partner() == partner)
             {
-                workspace.budget.charge(1)?;
+                budget.charge(1)?;
                 end = end.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
             }
-            let other = ordered.get(partner).ok_or(ResourceError::InvalidIndex)?;
             let pair = candidates
                 .get_mut(start..end)
                 .ok_or(ResourceError::InvalidIndex)?;
-            if !participation_possible(
-                pair,
-                (source, partner),
-                &prepared,
-                minimum,
-                workspace.budget,
-            )? {
-                start = end;
-                continue;
-            }
-            tick(workspace.budget, &mut stats.narrow_pairs)?;
-            let cells = candidates
-                .get(start..end)
-                .ok_or(ResourceError::InvalidIndex)?
-                .iter()
-                .map(|entry| entry.cell);
-            let contact = ambiguity_contact::contact_prepared_candidates(
-                prepared.get(source).ok_or(ResourceError::InvalidIndex)?,
-                prepared.get(partner).ok_or(ResourceError::InvalidIndex)?,
-                radius,
-                minimum,
-                cells,
-                workspace.budget,
-            )
-            .map_err(|error| Error::Contact {
-                source: path.id,
-                partner: other.id,
-                error,
-            })?;
-            if contact {
-                tick(workspace.budget, &mut stats.contacts)?;
-                callback(path.id, other.id, workspace.budget).map_err(|error| Error::Callback {
-                    source: path.id,
-                    partner: other.id,
-                    error,
-                })?;
+            if self.pair((source, partner), pair, budget, stats)? {
+                self.emit((source, partner), budget, stats, callback)?;
             }
             start = end;
         }
+        Ok(())
     }
-    Ok(*stats)
+    /// The exact CPU route of one complete pair run, shared by CPU enumeration
+    /// and GPU fallback: the participation bound first (source side, then the
+    /// partner side after its in-place partner sort), then the contact kernel
+    /// only when participation remains possible. Returns whether they contact.
+    fn pair<E, T: CellRecord>(
+        &self,
+        (source, partner): (usize, usize),
+        cells: &mut [T],
+        budget: &mut Budget,
+        stats: &mut Statistics,
+    ) -> Result<bool, Error<E>> {
+        let path = self
+            .ordered
+            .get(source)
+            .ok_or(ResourceError::InvalidIndex)?;
+        let other = self
+            .ordered
+            .get(partner)
+            .ok_or(ResourceError::InvalidIndex)?;
+        if !participation_possible(
+            cells,
+            (source, partner),
+            self.prepared,
+            self.minimum,
+            budget,
+        )? {
+            return Ok(false);
+        }
+        tick(budget, &mut stats.narrow_pairs)?;
+        ambiguity_contact::contact_prepared_candidates(
+            self.prepared
+                .get(source)
+                .ok_or(ResourceError::InvalidIndex)?,
+            self.prepared
+                .get(partner)
+                .ok_or(ResourceError::InvalidIndex)?,
+            self.radius,
+            self.minimum,
+            cells.iter().map(CellRecord::cell),
+            budget,
+        )
+        .map_err(|error| Error::Contact {
+            source: path.id,
+            partner: other.id,
+            error,
+        })
+    }
+    /// The one canonical contact emission: count it, then call the callback once.
+    fn emit<E>(
+        &self,
+        (source, partner): (usize, usize),
+        budget: &mut Budget,
+        stats: &mut Statistics,
+        callback: &mut impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
+    ) -> Result<(), Error<E>> {
+        let path = self
+            .ordered
+            .get(source)
+            .ok_or(ResourceError::InvalidIndex)?;
+        let other = self
+            .ordered
+            .get(partner)
+            .ok_or(ResourceError::InvalidIndex)?;
+        tick(budget, &mut stats.contacts)?;
+        callback(path.id, other.id, budget).map_err(|error| Error::Callback {
+            source: path.id,
+            partner: other.id,
+            error,
+        })
+    }
 }
 
 fn build<E>(
@@ -720,8 +969,8 @@ fn prepare_paths<'a, E>(
 // participating original segments. Count each distinct segment once. Round each
 // addition upward, and add one upward step per candidate to cover rounding in
 // the narrow phase's interval-union multiply-adds. This is rejection only.
-fn participation_possible(
-    candidates: &mut [Candidate],
+fn participation_possible<T: CellRecord>(
+    candidates: &mut [T],
     edges: (usize, usize),
     prepared: &[ambiguity_contact::PreparedCurve<'_>],
     minimum: f64,
@@ -729,12 +978,17 @@ fn participation_possible(
 ) -> Result<bool, ResourceError> {
     let source = prepared.get(edges.0).ok_or(ResourceError::InvalidIndex)?;
     let partner = prepared.get(edges.1).ok_or(ResourceError::InvalidIndex)?;
-    if !participation_bound(candidates.iter().map(|c| c.cell.0), source, minimum, budget)? {
+    if !participation_bound(
+        candidates.iter().map(|c| c.cell().0),
+        source,
+        minimum,
+        budget,
+    )? {
         return Ok(false);
     }
-    candidates.sort_unstable_by_key(|c| (c.cell.1, c.cell.0));
+    candidates.sort_unstable_by_key(|c| (c.cell().1, c.cell().0));
     participation_bound(
-        candidates.iter().map(|c| c.cell.1),
+        candidates.iter().map(|c| c.cell().1),
         partner,
         minimum,
         budget,

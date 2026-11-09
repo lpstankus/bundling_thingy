@@ -481,6 +481,30 @@ impl Gpu {
         decoder.finish()
     }
 
+    /// Shared device handles for GPU ambiguity contact acceleration.
+    pub fn ambiguity_candidates(
+        &self,
+        settings: bundling_wgpu::ambiguity_gpu::Settings,
+    ) -> Result<bundling_wgpu::ambiguity_gpu::Candidates> {
+        Ok(bundling_wgpu::ambiguity_gpu::Candidates::new(
+            self.device.clone(),
+            self.queue.clone(),
+            settings,
+        )?)
+    }
+
+    /// Clone handles to the current point and reservation buffers; nothing is copied.
+    /// The buffers must not be mutated while an ambiguity enumeration reads them.
+    pub fn candidate_geometry(&self) -> Result<bundling_wgpu::ambiguity_gpu::Geometry> {
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        Ok(bundling_wgpu::ambiguity_gpu::Geometry {
+            points: graph.geometry.points.clone(),
+            paths: graph.geometry.paths.clone(),
+            samples: graph.samples,
+            reservations: u32::try_from(graph.geometry.paths.size() / 12)?,
+        })
+    }
+
     fn wait(&self) -> Result<()> {
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,

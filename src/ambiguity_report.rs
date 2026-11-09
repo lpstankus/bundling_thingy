@@ -2,7 +2,7 @@ use crate::{Options, gpu::SIZE};
 use bundling_wgpu::{
     ambiguity::{self, Bounds, CohortView, Evaluator, Row, View},
     ambiguity_cohorts::{Membership, Route},
-    ambiguity_index, ambiguity_similarity,
+    ambiguity_gpu, ambiguity_index, ambiguity_similarity,
     geometry::Snapshot,
     weak_frechet::{Budget, Statistics, WorkBreakdown},
 };
@@ -36,6 +36,40 @@ pub struct Parameters {
     /// Global stored-pair capacity, including fixed tables and temporary candidate records.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-stored-pair-limit", default_value_t = 5_000_000, value_parser = positive_capacity)]
     stored_pair_limit: usize,
+    /// Contact backend. Both produce the same CPU-f64 contact decisions and scores.
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-backend", value_enum, default_value_t = Backend::Cpu)]
+    pub backend: Backend,
+    /// Combined byte limit for all GPU ambiguity buffers per frame (candidates,
+    /// certification, sorting, scratch and staging), in MiB.
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-memory-mib", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..=1 << 40))]
+    gpu_memory_mib: u64,
+    /// Cap on GPU candidate records per batch; defaults to the stored-pair limit.
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-batch-records", value_parser = clap::value_parser!(u32).range(1..))]
+    gpu_batch_records: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// CPU AABB hierarchy and CPU contact kernel (reference).
+    Cpu,
+    /// GPU candidates and certified GPU contact decisions on resident geometry,
+    /// with the complete CPU pair route for every uncertain pair.
+    Gpu,
+}
+
+/// Contact backend identity and GPU accounting for one frame.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CandidateStage {
+    backend: Backend,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    gpu: Option<ambiguity_gpu::Statistics>,
+}
+impl CandidateStage {
+    const CPU: Self = Self {
+        backend: Backend::Cpu,
+        gpu: None,
+    };
 }
 
 fn positive_capacity(text: &str) -> std::result::Result<usize, String> {
@@ -84,6 +118,20 @@ impl Parameters {
             "ambiguity resource limits must be positive"
         );
         Ok(())
+    }
+    /// GPU candidate limits. The radius comes from each enumeration.
+    pub fn gpu_settings(&self) -> Result<ambiguity_gpu::Settings> {
+        Ok(ambiguity_gpu::Settings {
+            memory_bytes: self
+                .gpu_memory_mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| eyre!("GPU candidate memory overflow"))?,
+            // The CPU cannot retain more candidate records than the stored-pair limit.
+            batch_records: Some(
+                self.gpu_batch_records
+                    .unwrap_or_else(|| u32::try_from(self.stored_pair_limit).unwrap_or(u32::MAX)),
+            ),
+        })
     }
     fn config(&self, routes: usize) -> Result<(ambiguity::Config, Capacities)> {
         let pairs = routes
@@ -230,9 +278,15 @@ pub struct Image {
     resources: Statistics,
     #[serde(with = "IndexStatistics")]
     index: ambiguity_index::Statistics,
+    candidates: CandidateStage,
 }
 impl Image {
-    pub fn new(file: String, iteration: u32, row: &Row, baseline: &Row) -> Result<Self> {
+    pub fn new(
+        file: String,
+        iteration: u32,
+        (row, baseline): (&Row, &Row),
+        candidates: &CandidateStage,
+    ) -> Result<Self> {
         Ok(Self {
             file,
             iteration,
@@ -244,6 +298,7 @@ impl Image {
             cohorts: row.cohorts,
             resources: row.resources,
             index: row.index,
+            candidates: *candidates,
         })
     }
 }
@@ -259,21 +314,47 @@ struct Report<'a> {
     images: &'a [Image],
 }
 
-pub fn run(
-    opts: &Options,
-    baseline: &Snapshot<'_>,
-    operation: impl FnOnce(&mut Evaluator<'_, '_>, &mut Vec<Image>) -> Result<()>,
-) -> Result<()> {
-    let params = &opts.ambiguity;
-    let count = baseline.layout().edge_count();
-    let (config, capacities) = params.config(count)?;
-    let rows = if opts.neighbor_radius.is_some() {
-        usize::try_from(opts.iterations)?
-            .checked_add(1)
-            .ok_or_else(|| eyre!("image count overflow"))?
-    } else {
-        1
+/// Evaluate one frame with the selected contact backend.
+/// # Errors
+/// Evaluation failures. GPU resource, device and protocol failures abort and
+/// never switch to the CPU index; per-pair numerical fallback is expected.
+pub fn evaluate(
+    evaluator: &mut Evaluator<'_, '_>,
+    paths: &[ambiguity_index::Path<'_>],
+    candidates: Option<(&ambiguity_gpu::Candidates, ambiguity_gpu::Geometry)>,
+) -> Result<(Row, CandidateStage)> {
+    let Some((candidates, geometry)) = candidates else {
+        return Ok((
+            evaluator.evaluate(paths).map_err(|error| eyre!(error))?,
+            CandidateStage::CPU,
+        ));
     };
+    let mut frame = candidates.frame(geometry);
+    let row = evaluator
+        .evaluate_with(paths, ambiguity_index::BroadPhase::Gpu(&mut frame))
+        .map_err(|error| eyre!(error))?;
+    Ok((row, gpu_stage(&frame)))
+}
+
+fn gpu_stage(frame: &ambiguity_gpu::Frame) -> CandidateStage {
+    let timings = frame.timings();
+    tracing::info!(
+        validation_wait_seconds = timings.validation.as_secs_f64(),
+        setup_wait_seconds = timings.setup.as_secs_f64(),
+        count_wait_seconds = timings.count.as_secs_f64(),
+        fill_wait_seconds = timings.fill.as_secs_f64(),
+        contact_seconds = timings.contact.as_secs_f64(),
+        statistics = ?frame.statistics(),
+        "GPU ambiguity contact"
+    );
+    CandidateStage {
+        backend: Backend::Gpu,
+        gpu: Some(frame.statistics()),
+    }
+}
+
+/// Route views and typed report rows reserved by this integration.
+fn integration_bytes(count: usize, rows: usize) -> Result<(usize, usize, usize)> {
     let route_bytes = count
         .checked_mul(
             size_of::<Route<'_>>()
@@ -291,6 +372,26 @@ pub fn run(
     let caller_bytes = route_bytes
         .checked_add(row_bytes)
         .ok_or_else(|| eyre!("integration buffer overflow"))?;
+    Ok((route_bytes, row_bytes, caller_bytes))
+}
+
+pub fn run(
+    opts: &Options,
+    baseline: &Snapshot<'_>,
+    candidates: Option<(&ambiguity_gpu::Candidates, ambiguity_gpu::Geometry)>,
+    operation: impl FnOnce(&mut Evaluator<'_, '_>, CandidateStage, &mut Vec<Image>) -> Result<()>,
+) -> Result<()> {
+    let params = &opts.ambiguity;
+    let count = baseline.layout().edge_count();
+    let (config, capacities) = params.config(count)?;
+    let rows = if opts.neighbor_radius.is_some() {
+        usize::try_from(opts.iterations)?
+            .checked_add(1)
+            .ok_or_else(|| eyre!("image count overflow"))?
+    } else {
+        1
+    };
+    let (route_bytes, row_bytes, caller_bytes) = integration_bytes(count, rows)?;
     let mut budget = Budget::with_record_limit(
         params.work_limit,
         params.workspace_bytes,
@@ -309,14 +410,16 @@ pub fn run(
         );
         let mut images = Vec::new();
         images.try_reserve_exact(rows)?;
+        let mut frame = candidates.map(|(candidates, geometry)| candidates.frame(geometry));
         // The inner Result preserves GPU/I/O failures; the outer Result owns evaluator cleanup.
-        ambiguity::with_evaluator(&originals, &config, &mut budget, |evaluator| {
+        ambiguity::with_evaluator_using(&originals, &config, frame.as_mut(), &mut budget, |evaluator, frame| {
             Ok((|| -> Result<()> {
-                operation(evaluator, &mut images)?;
+                let stage = frame.map_or(CandidateStage::CPU, |frame| gpu_stage(frame));
+                operation(evaluator, stage, &mut images)?;
                 let cohorts = evaluator.memberships();
                 let report = Report {
                     metadata: serde_json::json!({
-                        "schema_version": 1, "metric_version": 1, "metric": "ambiguity",
+                        "schema_version": 2, "metric_version": 1, "metric": "ambiguity",
                         "baseline": {"source": "gpu_resampled_iteration_0", "preprocessing_distortion_included": false},
                         "input": opts.input.display().to_string(),
                         "geometry": {"geometry_contract_version": 1, "coordinate_space": "clip", "distance_output_units": "export_pixels", "squared_distance_output_units": "export_pixels_squared", "width": SIZE, "height": SIZE, "pixels_per_clip_unit": pixels_per_clip(), "normalization": "initial graph bounds, centered uniform 95% fit, fixed across snapshots", "active_samples": baseline.layout().sample_count()},
@@ -340,8 +443,9 @@ pub fn run(
                             "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
                             "edge_ids": "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels.",
                             "contact": "One connected continuous radius-proximity component must have projected arc-interval union length at least the minimum on both curves. Point/tangent patches connect cells. Exact closed current paths use periodic adjacency.",
+                            "candidates": "ambiguity_backend selects the contact backend. Both produce the same contact decisions in the same source/partner order and feed the unchanged similarity, orientation, baseline evidence, cohorts and aggregation. cpu: f64 AABB hierarchy over bounded pieces, then the CPU contact kernel for every candidate pair the participation bound admits. gpu: before any work, the resident GPU points and reservations are read back and compared bit for bit with this frame's CPU paths; the enumeration's own radius, minimum, ordered IDs, positive-segment offsets and CPU-f64 segment lengths are used; mismatches fail. S1 enumerates a conservative superset of candidate cells with widened f32 boxes on a clamped uniform grid; candidate work items examine at most images[].candidates.partner_entries_per_item entries and are dispatched at most items_per_dispatch per submission. S2 sorts each whole-source batch by an exact key and certifies every cell and complete source/partner pair with outward f32 intervals that enclose the ordinary CPU-f64 values; certified contacts and certified negatives are decided on the GPU. Uncertain certificates, unsupported scalars or lengths, pairs above 4096 cells and component labels that do not settle within 128 rounds take the complete CPU pair route (participation bound, then contact kernel): this per-pair numerical fallback is expected. Resource, device and protocol failures abort with no report; there is no silent switch to the CPU index. index.narrow_pairs counts actual CPU contact-kernel pairs after the participation bound and index.contacts every emitted contact. images[].candidates keeps the S1 counters; images[].candidates.contact reports GPU decisions, CPU fallback pairs and cells by reason, schedule buckets, rounds, work estimates against the grouping target, submissions and maximum host submit-through-completion waits (not per-pair GPU durations). GPU work is not charged CPU work units. images[].candidates.memory reports the combined GPU byte limit, the simultaneous allocated peak of all owned buffers, device stored-record slots and owner-local host peaks; renderer-owned geometry is reported as borrowed and excluded, as are driver, pipeline and allocator overhead, so this is a buffer-byte limit, not a VRAM guarantee. Each frame's GPU buffers are destroyed when its enumeration ends.",
                             "short_path_count": "index.short_paths counts positive paths whose ordinary f64 total is below the minimum. This is diagnostic only; they remain indexed and use the conservative candidate participation test.",
-                            "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
+                            "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. With the gpu backend, resident candidate cells, sorted cells, pair results, readback staging that holds those records, and host pair decisions and fallback runs each count as stored records while they exist; certificates, keys, permutations, offsets, schedules and scratch count only as GPU bytes. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
                             "work": "One work limit per preparation/baseline/current snapshot; no per-pair reset. Total work is charged before operations. The disjoint work_breakdown fields sum to work_consumed in charged work units: weak_cell_visits counts settled nonstale free-space cell visits, heap_operations counts individual pushes/pops, simplifier_point_visits counts interior point examinations for shortcut correspondence certificates, and other contains all remaining charges, including label initialization and geometry validation. Counts record successful pre-operation charges; failed charges change no counters. Detailed index counters accompany each row and overlap total work; do not add them to this full breakdown. Sort comparisons are not work units.",
                             "workspace": "Requested capacities include canonical/cohort data, evaluator metadata/tables, index/kernel temporaries, original/current route views and typed report rows with 32 filename bytes each. Shared GPU/CPU snapshots, allocator overhead, small report metadata and streaming serializer/I/O buffers are separate from requested evaluation workspace; this is not process RSS."
                         },
@@ -356,7 +460,7 @@ pub fn run(
                 };
                 crate::report::publish(&opts.out, "ambiguity.json", &report)
             })())
-        }).wrap_err("ambiguity preparation/evaluation failed; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit; baseline/cohort capacities derive from the stored-pair limit")??;
+        }).wrap_err("ambiguity preparation/evaluation failed; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit (baseline/cohort capacities derive from the stored-pair limit); GPU contact errors name their own limit or device/protocol cause")??;
         Ok(())
     })();
     budget.release(caller_bytes)?;
