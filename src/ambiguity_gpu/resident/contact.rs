@@ -21,9 +21,6 @@ const ROUNDS_PER_CHECK: u64 = 4;
 /// Label rounds after which an unconverged batch fails. A resource limit, not
 /// a convergence bound.
 const ROUND_LIMIT: u64 = 1 << 20;
-/// Device bytes per batch cell: records, chains, links, covered ends, labels
-/// with sums and up to four bucket heads, marks and scan sums.
-const CELL_BYTES: u64 = 104;
 const MAXIMUM_BATCH_CELLS: u64 = 1 << 26;
 const MAXIMUM_GRID: u32 = 2048;
 const S_PENDING: usize = 1;
@@ -478,36 +475,57 @@ fn workspace_words(cells: u64) -> Result<[u64; 7]> {
     ])
 }
 
-/// Largest padded storage binding during classification and pair logging.
-fn largest_buffer_bytes(cells: u64) -> Result<u64> {
-    let histogram = histogram_words(cells)?;
-    let largest = workspace_words(cells)?
+/// Word counts shared by capacity planning and sustained-component logging.
+fn logging_words(components: u64) -> Result<[u64; 5]> {
+    let histogram = histogram_words(components)?;
+    let marks = add(components, 1)?;
+    Ok([
+        mul(components, 3)?,
+        mul(components, 3)?,
+        histogram,
+        scan_words(marks.max(histogram))?,
+        marks,
+    ])
+}
+
+struct BatchMemory {
+    total: u64,
+    largest: u64,
+}
+
+/// Peak batch storage, including logging while the workspace is still live.
+/// Every cell can be a sustained component. All allocation sizes grow with
+/// their counts, so using the largest batch for both bounds covers every batch.
+fn batch_memory(cells: u64) -> Result<BatchMemory> {
+    let mut memory = BatchMemory {
+        total: 0,
+        largest: 0,
+    };
+    if cells == 0 {
+        return Ok(memory);
+    }
+    for words in workspace_words(cells)?
         .into_iter()
-        .chain([
-            mul(cells, 3)?,
-            histogram,
-            scan_words(add(cells, 1)?.max(histogram))?,
-        ])
-        .max()
-        .unwrap_or(0);
-    mul(largest, 4)?
-        .max(16)
-        .checked_next_multiple_of(16)
-        .ok_or(Error::SizeOverflow)
+        .chain(logging_words(cells)?)
+    {
+        let bytes = mul(words, 4)?
+            .max(16)
+            .checked_next_multiple_of(16)
+            .ok_or(Error::SizeOverflow)?;
+        memory.total = add(memory.total, bytes)?;
+        memory.largest = memory.largest.max(bytes);
+    }
+    Ok(memory)
 }
 
 fn batch_capacity(available: u64, storage: u64) -> Result<Capacity> {
-    let global = available
-        .checked_div(CELL_BYTES)
-        .unwrap_or(0)
-        .saturating_sub(4096)
-        .min(MAXIMUM_BATCH_CELLS);
     // Every allocation grows monotonically, including power-of-two bucket
-    // jumps. Find the largest cell count whose entire bindings still fit.
-    let (mut low, mut high) = (0, global);
+    // jumps. Require both the combined peak and each binding to fit.
+    let (mut low, mut high) = (0, MAXIMUM_BATCH_CELLS);
     while low < high {
         let middle = add(low, high.saturating_sub(low).div_ceil(2))?;
-        if largest_buffer_bytes(middle)? <= storage {
+        let memory = batch_memory(middle)?;
+        if memory.total <= available && memory.largest <= storage {
             low = middle;
         } else {
             high = middle.saturating_sub(1);
@@ -515,7 +533,7 @@ fn batch_capacity(available: u64, storage: u64) -> Result<Capacity> {
     }
     Ok(Capacity {
         cells: low,
-        limit: if low < global {
+        limit: if low < MAXIMUM_BATCH_CELLS && batch_memory(add(low, 1)?)?.total <= available {
             Limit::AdapterBuffer("ambiguity f32 contact workspace")
         } else {
             Limit::DeviceMemory("ambiguity f32 contact batch")
@@ -814,18 +832,13 @@ impl Run<'_> {
         }
         let workspace = self.workspace;
         core.scoped(|core| {
+            let [first, second, histogram, scratch, unique] = logging_words(components)?;
             let store = &mut core.store;
-            let first = store.words("ambiguity f32 component pairs", mul(components, 3)?)?;
-            let second = store.words("ambiguity f32 component pairs", mul(components, 3)?)?;
-            let histogram = store.words(
-                "ambiguity f32 component pair histogram",
-                histogram_words(components)?,
-            )?;
-            let scratch = store.words(
-                "ambiguity f32 component pair scan sums",
-                scan_words(add(components, 1)?.max(histogram_words(components)?))?,
-            )?;
-            let unique = store.words("ambiguity f32 component pair marks", add(components, 1)?)?;
+            let first = store.words("ambiguity f32 component pairs", first)?;
+            let second = store.words("ambiguity f32 component pairs", second)?;
+            let histogram = store.words("ambiguity f32 component pair histogram", histogram)?;
+            let scratch = store.words("ambiguity f32 component pair scan sums", scratch)?;
+            let unique = store.words("ambiguity f32 component pair marks", unique)?;
             core.run(
                 Stage::Contact,
                 "sustained_pairs",
