@@ -41,6 +41,7 @@ use std::{
 };
 
 mod contact;
+pub mod resident;
 mod resources;
 
 pub(crate) use contact::Decision;
@@ -93,6 +94,10 @@ pub enum Limit {
     StoredRecords,
     /// The shared host workspace ledger.
     HostWorkspace,
+    /// Contact pairs one gpu-f32 frame may log.
+    ContactPairs,
+    /// Host metadata of the gpu-f32 backend.
+    HostMetadata,
 }
 impl fmt::Display for Limit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -109,6 +114,8 @@ impl fmt::Display for Limit {
             Self::BatchRecords => f.write_str("--ambiguity-gpu-batch-records"),
             Self::StoredRecords => f.write_str("--ambiguity-stored-pair-limit"),
             Self::HostWorkspace => f.write_str("--ambiguity-workspace-bytes"),
+            Self::ContactPairs => f.write_str("--ambiguity-gpu-contact-pairs"),
+            Self::HostMetadata => f.write_str("--ambiguity-gpu-host-mib"),
         }
     }
 }
@@ -208,6 +215,8 @@ pub enum Error {
     Protocol(Protocol),
     /// The shared CPU evaluation ledger rejected a reservation.
     Workspace(ResourceError),
+    /// A failure of the GPU-resident f32 backend.
+    Fault(resident::Fault),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -242,6 +251,7 @@ impl fmt::Display for Error {
             Self::Geometry(text) => f.write_str(text),
             Self::Protocol(protocol) => write!(f, "GPU ambiguity protocol: {protocol}"),
             Self::Workspace(error) => write!(f, "GPU ambiguity host workspace: {error}"),
+            Self::Fault(fault) => fault.fmt(f),
         }
     }
 }

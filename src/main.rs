@@ -100,17 +100,18 @@ pub struct Options {
 fn main() -> Result<()> {
     color_eyre::install()?;
     profiling::init()?;
-    let opts = Options::parse();
+    let matches = <Options as clap::CommandFactory>::command().get_matches();
+    let opts = <Options as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
     if opts.headless {
-        headless(&opts)
+        headless(&opts, &matches)
     } else {
         window::run(opts)
     }
 }
 
 #[tracing::instrument(name = "headless", skip_all, fields(input = %opts.input.display()), err)]
-fn headless(opts: &Options) -> Result<()> {
+fn headless(opts: &Options, matches: &clap::ArgMatches) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
@@ -119,6 +120,7 @@ fn headless(opts: &Options) -> Result<()> {
     report::invalidate(&opts.out, "noisiness.json")?;
     if opts.evaluate_ambiguity {
         opts.ambiguity.validate()?;
+        ambiguity_report::check_backend_flags(matches, opts.ambiguity.backend)?;
     }
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
     let noisiness = if opts.evaluate_noisiness {
@@ -132,8 +134,10 @@ fn headless(opts: &Options) -> Result<()> {
     };
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
-    let layout = opts
-        .geometry_evaluation()
+    // The gpu-f32 ambiguity backend keeps all geometry on the device.
+    let resident =
+        opts.evaluate_ambiguity && opts.ambiguity.backend == ambiguity_report::Backend::GpuF32;
+    let layout = (opts.evaluate_distortion || opts.evaluate_ambiguity && !resident)
         .then(|| gpu.geometry_layout())
         .transpose()?;
     let baseline = layout
@@ -146,7 +150,21 @@ fn headless(opts: &Options) -> Result<()> {
             .ok_or_else(|| color_eyre::eyre::eyre!("missing distortion baseline"))?
             .validate_baseline()?;
     }
-    if opts.evaluate_ambiguity {
+    if resident {
+        // Freezes the baseline points on the device before any bundling step.
+        let mut session = gpu.ambiguity_resident(&opts.ambiguity.resident_settings()?)?;
+        let mut images = Vec::new();
+        image_flow(
+            opts,
+            &mut gpu,
+            baseline.as_ref(),
+            noisiness,
+            None,
+            &mut Vec::new(),
+            Some((&mut session, &mut images)),
+        )?;
+        ambiguity_report::publish_resident(opts, &session, &images, samples)?;
+    } else if opts.evaluate_ambiguity {
         // The GPU backend reuses this device and the resident geometry buffers.
         let candidates = (opts.ambiguity.backend == ambiguity_report::Backend::Gpu)
             .then(|| gpu.ambiguity_candidates(opts.ambiguity.gpu_settings()?))
@@ -173,6 +191,7 @@ fn headless(opts: &Options) -> Result<()> {
                         candidates: candidates.as_ref(),
                     }),
                     images,
+                    None,
                 )
             },
         )?;
@@ -184,6 +203,7 @@ fn headless(opts: &Options) -> Result<()> {
             noisiness,
             None,
             &mut Vec::new(),
+            None,
         )?;
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
@@ -209,6 +229,10 @@ fn image_flow(
     mut noisiness: Option<noisiness::Report>,
     mut ambiguity: Option<Ambiguity<'_, '_, '_>>,
     ambiguity_images: &mut Vec<ambiguity_report::Image>,
+    mut resident: Option<(
+        &mut bundling_wgpu::ambiguity_gpu::resident::Session,
+        &mut Vec<ambiguity_report::ResidentImage>,
+    )>,
 ) -> Result<()> {
     let mut distortion_images = Vec::new();
     let iterations = if opts.neighbor_radius.is_some() {
@@ -275,10 +299,25 @@ fn image_flow(
                 (evaluator.baseline(), *baseline_stage)
             };
             ambiguity_images.push(ambiguity_report::Image::new(
-                name,
+                name.clone(),
                 iteration,
                 (&row, &evaluator.baseline()),
                 &stage,
+            )?);
+        }
+        if let Some((session, images)) = resident.as_mut() {
+            let frame = if iteration > 0 {
+                session
+                    .evaluate(&gpu.candidate_geometry()?)
+                    .wrap_err("evaluate gpu-f32 ambiguity frame")?
+            } else {
+                session.baseline()
+            };
+            images.push(ambiguity_report::ResidentImage::new(
+                name,
+                iteration,
+                &frame,
+                &session.baseline(),
             )?);
         }
     }
