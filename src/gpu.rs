@@ -493,6 +493,20 @@ impl Gpu {
         )?)
     }
 
+    /// Freeze the current resident points as the gpu-f32 ambiguity baseline and
+    /// prepare its originals, cohorts and baseline scores on this device.
+    pub fn ambiguity_resident(
+        &self,
+        settings: &bundling_wgpu::ambiguity_gpu::resident::Settings,
+    ) -> Result<bundling_wgpu::ambiguity_gpu::resident::Session> {
+        Ok(bundling_wgpu::ambiguity_gpu::resident::Session::new(
+            &self.device,
+            &self.queue,
+            &self.candidate_geometry()?,
+            settings,
+        )?)
+    }
+
     /// Clone handles to the current point and reservation buffers; nothing is copied.
     /// The buffers must not be mutated while an ambiguity enumeration reads them.
     pub fn candidate_geometry(&self) -> Result<bundling_wgpu::ambiguity_gpu::Geometry> {

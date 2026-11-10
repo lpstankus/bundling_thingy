@@ -2,7 +2,8 @@ use crate::{Options, gpu::SIZE};
 use bundling_wgpu::{
     ambiguity::{self, Bounds, CohortView, Evaluator, Row, View},
     ambiguity_cohorts::{Membership, Route},
-    ambiguity_gpu, ambiguity_index, ambiguity_similarity,
+    ambiguity_gpu::{self, resident},
+    ambiguity_index, ambiguity_similarity,
     geometry::Snapshot,
     weak_frechet::{Budget, Statistics, WorkBreakdown},
 };
@@ -24,28 +25,79 @@ pub struct Parameters {
     /// Required contact length along both curves in export pixels.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-minimum-contact-pixels", default_value_t = 24.0, value_parser = positive_pixels)]
     minimum_contact_pixels: f64,
-    /// Certified correspondence error in export pixels. Zero uses full curves.
+    /// Correspondence simplification error in export pixels. Zero uses full
+    /// curves. Certified for cpu and gpu; an f32 estimate for gpu-f32.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-simplification-pixels", default_value_t = 0.1, value_parser = nonnegative_pixels)]
     simplification_pixels: f64,
-    /// Work units per preparation or snapshot, shared across all pair evaluations.
+    /// Work units per preparation or snapshot, shared across all pair
+    /// evaluations (cpu and gpu backends; rejected with gpu-f32, which bounds
+    /// work per GPU dispatch instead).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-work-limit", default_value_t = 2_000_000_000, value_parser = clap::value_parser!(u64).range(1..))]
     work_limit: u64,
-    /// Requested evaluation workspace bytes, excluding shared snapshots and allocator overhead.
+    /// Requested evaluation workspace bytes, excluding shared snapshots and
+    /// allocator overhead (cpu and gpu backends; rejected with gpu-f32).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-workspace-bytes", default_value_t = 1_073_741_824, value_parser = positive_capacity)]
     workspace_bytes: usize,
-    /// Global stored-pair capacity, including fixed tables and temporary candidate records.
+    /// Global stored-pair capacity, including fixed tables and temporary
+    /// candidate records (cpu and gpu backends; rejected with gpu-f32).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-stored-pair-limit", default_value_t = 5_000_000, value_parser = positive_capacity)]
     stored_pair_limit: usize,
-    /// Contact backend. Both produce the same CPU-f64 contact decisions and scores.
+    /// Ambiguity backend. cpu and gpu produce the same CPU-f64 decisions and
+    /// scores; gpu-f32 evaluates everything on the GPU in f32.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-backend", value_enum, default_value_t = Backend::Cpu)]
     pub backend: Backend,
-    /// Combined byte limit for all GPU ambiguity buffers per frame (candidates,
-    /// certification, sorting, scratch and staging), in MiB.
+    /// Combined byte limit for all GPU ambiguity buffers (gpu: per frame;
+    /// gpu-f32: everything it owns, including the frozen baseline), in MiB.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-memory-mib", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..=1 << 40))]
     gpu_memory_mib: u64,
-    /// Cap on GPU candidate records per batch; defaults to the stored-pair limit.
+    /// Cap on GPU candidate records per batch; defaults to the stored-pair
+    /// limit (gpu backend; rejected with gpu-f32).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-batch-records", value_parser = clap::value_parser!(u32).range(1..))]
     gpu_batch_records: Option<u32>,
+    /// gpu-f32 only: largest free-space cell count of one whole-route distance
+    /// search, enforced exactly.
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-search-cells", default_value_t = resident::SEARCH_CELLS_LIMIT, value_parser = clap::value_parser!(u64).range(1..=resident::SEARCH_CELLS_LIMIT))]
+    #[serde(skip)]
+    gpu_search_cells: u64,
+    /// gpu-f32 only: contact pairs one frame may log.
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-contact-pairs", default_value_t = 5_000_000, value_parser = clap::value_parser!(u64).range(1..=1 << 28))]
+    #[serde(skip)]
+    gpu_contact_pairs: u64,
+    /// gpu-f32 only: MiB of host metadata it may allocate from input or GPU
+    /// counts (readbacks, membership tables, batch plans).
+    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-host-mib", default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..=1 << 20))]
+    #[serde(skip)]
+    gpu_host_mib: u64,
+}
+
+/// Resource flags of the cpu and gpu backends that gpu-f32 does not implement.
+const REFERENCE_ONLY: [(&str, &str); 4] = [
+    ("work_limit", "--ambiguity-work-limit"),
+    ("workspace_bytes", "--ambiguity-workspace-bytes"),
+    ("stored_pair_limit", "--ambiguity-stored-pair-limit"),
+    ("gpu_batch_records", "--ambiguity-gpu-batch-records"),
+];
+/// Resource flags only gpu-f32 implements.
+const RESIDENT_ONLY: [(&str, &str); 3] = [
+    ("gpu_search_cells", "--ambiguity-gpu-search-cells"),
+    ("gpu_contact_pairs", "--ambiguity-gpu-contact-pairs"),
+    ("gpu_host_mib", "--ambiguity-gpu-host-mib"),
+];
+
+/// Reject resource flags given explicitly for a backend that would ignore them.
+pub fn check_backend_flags(matches: &clap::ArgMatches, backend: Backend) -> Result<()> {
+    let (flags, name) = if backend == Backend::GpuF32 {
+        (REFERENCE_ONLY.as_slice(), "gpu-f32")
+    } else {
+        (RESIDENT_ONLY.as_slice(), "the cpu and gpu backends")
+    };
+    for (id, flag) in flags {
+        ensure!(
+            matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine),
+            "{flag} has no effect with {name}; remove it"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
@@ -56,6 +108,11 @@ pub enum Backend {
     /// GPU candidates and certified GPU contact decisions on resident geometry,
     /// with the complete CPU pair route for every uncertain pair.
     Gpu,
+    /// Every numerical stage on the GPU in f32, with no CPU fallback. Results
+    /// are f32 estimates and can differ from the reference near thresholds.
+    #[value(name = "gpu-f32")]
+    #[serde(rename = "gpu-f32")]
+    GpuF32,
 }
 
 /// Contact backend identity and GPU accounting for one frame.
@@ -132,6 +189,69 @@ impl Parameters {
                     .unwrap_or_else(|| u32::try_from(self.stored_pair_limit).unwrap_or(u32::MAX)),
             ),
         })
+    }
+    /// Thresholds and limits of the gpu-f32 backend. The combined GPU byte limit
+    /// covers every buffer it owns; the contact-pair limit caps logged contacts.
+    pub fn resident_settings(&self) -> Result<resident::Settings> {
+        Ok(resident::Settings {
+            route_tolerance: self.route_tolerance_pixels / pixels_per_clip(),
+            endpoint_tolerance: self.endpoint_tolerance_pixels / pixels_per_clip(),
+            sigma: self.simplification_pixels / pixels_per_clip(),
+            radius: self.contact_radius_pixels / pixels_per_clip(),
+            minimum_contact: self.minimum_contact_pixels / pixels_per_clip(),
+            memory_bytes: self
+                .gpu_memory_mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| eyre!("GPU memory overflow"))?,
+            pair_capacity: self.gpu_contact_pairs,
+            host_bytes: self
+                .gpu_host_mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| eyre!("host metadata limit overflow"))?,
+            search_cells: self.gpu_search_cells,
+        })
+    }
+    /// What gpu-f32 was asked for and what it applies. The flags of the other
+    /// backends are named as not applicable instead of being echoed.
+    fn resident_parameters(&self) -> Result<serde_json::Value> {
+        let settings = self.resident_settings()?;
+        // The thresholds the kernels compare with: the nearest f32.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "Reports the same f32 rounding of each threshold that the device receives."
+        )]
+        let applied = |value: f64| f64::from(value as f32);
+        Ok(serde_json::json!({
+            "requested": {
+                "route_tolerance_pixels": self.route_tolerance_pixels,
+                "endpoint_tolerance_pixels": self.endpoint_tolerance_pixels,
+                "contact_radius_pixels": self.contact_radius_pixels,
+                "minimum_contact_pixels": self.minimum_contact_pixels,
+                "simplification_pixels": self.simplification_pixels,
+                "backend": self.backend,
+                "gpu_memory_mib": self.gpu_memory_mib,
+                "gpu_contact_pairs": self.gpu_contact_pairs,
+                "gpu_search_cells": self.gpu_search_cells,
+                "gpu_host_mib": self.gpu_host_mib
+            },
+            "effective": {
+                "thresholds_clip_units_f32": {
+                    "route_tolerance": applied(settings.route_tolerance),
+                    "endpoint_tolerance": applied(settings.endpoint_tolerance),
+                    "contact_radius": applied(settings.radius),
+                    "minimum_contact": applied(settings.minimum_contact),
+                    "simplification": applied(settings.sigma)
+                },
+                "owned_gpu_buffer_bytes_limit": settings.memory_bytes,
+                "contact_pairs_per_frame": settings.pair_capacity,
+                "search_cells_per_distance_search": settings.search_cells,
+                "host_metadata_bytes_limit": settings.host_bytes,
+                "work_units_per_dispatch_and_submission": resident::WORK_TARGET,
+                "work_units_per_invocation": resident::INVOCATION_TARGET
+            },
+            "not_applicable": REFERENCE_ONLY.map(|(_, flag)| flag)
+        }))
     }
     fn config(&self, routes: usize) -> Result<(ambiguity::Config, Capacities)> {
         let pairs = routes
@@ -503,4 +623,131 @@ struct ClassifiedWork {
     weak_cell_visits: u64,
     heap_operations: u64,
     simplifier_point_visits: u64,
+}
+
+/// One gpu-f32 frame in export units.
+#[derive(Serialize)]
+pub struct ResidentImage {
+    file: String,
+    iteration: u32,
+    contact_pairs: u64,
+    baseline_contact_pairs: u64,
+    current_collapsed_paths: u64,
+    general: General,
+    endpoints: Endpoints,
+    cohorts: resident::CohortScores,
+    device: resident::FrameStatistics,
+}
+
+/// Widen a device view to the report's types; values stay f32 estimates.
+fn resident_view(view: &resident::View, baseline: &resident::View) -> Result<View> {
+    let bounds = |interval: resident::Interval| Bounds {
+        lower: f64::from(interval.lower),
+        upper: f64::from(interval.upper),
+    };
+    Ok(View {
+        squared_excess: bounds(view.squared_excess),
+        rms_excess: bounds(view.rms_excess),
+        ratio: bounds(view.ratio),
+        current: usize::try_from(view.current)?,
+        baseline: usize::try_from(baseline.current)?,
+        introduced: usize::try_from(view.introduced)?,
+        resolved: usize::try_from(view.resolved)?,
+        introduced_squared_excess: bounds(view.introduced_squared_excess),
+        resolved_squared_excess: bounds(view.resolved_squared_excess),
+    })
+}
+
+impl ResidentImage {
+    pub fn new(
+        file: String,
+        iteration: u32,
+        frame: &resident::Frame,
+        baseline: &resident::Frame,
+    ) -> Result<Self> {
+        let view = |current: &resident::View, original: &resident::View| -> Result<General> {
+            General::new(
+                resident_view(current, original)?,
+                resident_view(original, original)?,
+            )
+        };
+        Ok(Self {
+            file,
+            iteration,
+            contact_pairs: frame.contacts,
+            baseline_contact_pairs: baseline.contacts,
+            current_collapsed_paths: frame.statistics.collapsed_paths,
+            general: view(&frame.general, &baseline.general)?,
+            endpoints: view(&frame.endpoints, &baseline.endpoints)?.into(),
+            cohorts: frame.cohorts,
+            device: frame.statistics,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ResidentMembership {
+    edge_id: u32,
+    cohort: u32,
+}
+
+/// Publish the gpu-f32 report atomically.
+pub fn publish_resident(
+    opts: &Options,
+    session: &resident::Session,
+    images: &[ResidentImage],
+    samples: u32,
+) -> Result<()> {
+    let preparation = session.preparation();
+    let memberships: Vec<ResidentMembership> = session
+        .memberships()
+        .iter()
+        .map(|[edge_id, cohort]| ResidentMembership {
+            edge_id: *edge_id,
+            cohort: *cohort,
+        })
+        .collect();
+    let report = serde_json::json!({
+        "schema_version": 2, "metric_version": 1, "metric": "ambiguity",
+        "numerical_contract": {
+            "backend": "gpu-f32", "precision": "f32", "contract_version": resident::CONTRACT_VERSION,
+            "cpu_fallback": false, "certified_bounds": false, "cpu_f64_parity": false,
+            "summary": "Every numerical stage runs in WGSL f32 on the GPU. Values are ordinary f32 point estimates; the device may flush subnormal intermediates to zero. Results are not bit-compatible with the cpu and gpu backends and classifications at a threshold can differ from them. Range, resource, convergence and protocol failures abort without a report."
+        },
+        "baseline": {"source": "gpu_resampled_iteration_0", "storage": "device copy frozen before bundling", "preprocessing_distortion_included": false},
+        "input": opts.input.display().to_string(),
+        "geometry": {"geometry_contract_version": 1, "coordinate_space": "clip", "distance_output_units": "export_pixels", "squared_distance_output_units": "export_pixels_squared", "width": SIZE, "height": SIZE, "pixels_per_clip_unit": pixels_per_clip(), "normalization": "initial graph bounds, centered uniform 95% fit, fixed across snapshots", "active_samples": samples},
+        "counts": {"eligible_routes": preparation.eligible_routes, "skipped_reservations": preparation.skipped_reservations, "total_reservations": preparation.eligible_routes.saturating_add(preparation.skipped_reservations), "original_constants": preparation.original_constants, "closed_stored_start_routes": preparation.closed_stored_start_routes, "unique_canonical_routes": preparation.unique_canonical_routes, "cohorts": preparation.cohorts},
+        "definitions": {
+            "general": "For sustained current contacts, sqrt(mean(max(d-T,0)^2))/T, with original whole-route continuous endpoint-constrained weak Frechet distance d in the joint selected orientation. Introduced/resolved incompatible edge counts and squared-excess sums are co-primary alongside RMS.",
+            "endpoints": "Separate sqrt(mean(max(e-U,0)^2))/U over the same contacts, where e is the larger matched endpoint distance in that same orientation. Introduced/resolved counts and sums are co-primary.",
+            "cohorts": "Deduplicated unordered cohort pairs witnessed by an incompatible contacting edge pair. Introduced cohort associations are primary; denominator counts all distinct cross-cohort pairs contacting in this snapshot.",
+            "interpretation": "Lower excess means less original-route mismatch among current sustained contacts. Ratios are dimensionless and can exceed 1. Compatible contacts can dilute RMS. No combined score or overall quality claim.",
+            "empty_contacts": "count 0, sums 0, RMS 0, ratios 0; empty cohort denominator gives fraction 0"
+        },
+        "policies": {
+            "residency": "The host parses the input, uploads thresholds as f32, sizes and schedules bounded dispatches, enforces limits, and reads counts used for sizing and batching, the membership table and the finished counts and scalars. Baseline points are copied on the device before bundling. Layout validation, positive segments, canonical originals and their order, simplification, cohort inference, contact, whole-route distances, orientation, baseline evidence, cohort associations, counts and reductions all run on the device. Pixel conversion of the finished f32 scalars for this report is done in f64 on the host.",
+            "ranges": "Coordinates must be finite and below 2^20 clip units in magnitude; thresholds must lie within [2^-20, 2^20] clip units (radius and simplification may be zero); a route may store at most 32768 points. Violations abort before use.",
+            "bounds": "general lower/upper values are f32 estimates d-e and d+e from the index-correspondence simplification error e, clamped below by the endpoint distance; they are not certified enclosures. Undecidable orientations and tolerance-straddling pairs are refined on the full canonical curves, where lower equals upper. Endpoint values are single f32 estimates.",
+            "orientation": "Minimize max(d/T,e/U) jointly over forward/reversed matching, then smaller d, smaller e, then forward. Inclusive thresholds, no epsilon halo. Cohort inference and scoring assess the representatives of both routes with the later canonical route first, with the same kernels.",
+            "canonicalization": "Normalize signed zero; remove consecutive duplicates and exact redundant forward-collinear vertices (exact integer determinant) while retaining retracing. Lexicographically smaller forward/reverse sequence, geometry order with stable edge ID ties, all by exact integer comparison of bit patterns. Closed routes retain stored starts.",
+            "cohorts": "First-fit complete-link over all unique canonical originals in canonical order, with full membership mapping and duplicate multiplicity retained. Every earlier unique route with compatible endpoints is assessed; a route joins the earliest cohort all of whose members are compatible. Crossing a partition alone is not incompatibility.",
+            "distance": "Continuous endpoint-constrained weak Frechet distance: point, single-segment, synchronized-vertex and staircase certificates, otherwise the exact minimax search over free-space cells. The search settles cells in increasing bottleneck order from the first cell and stops at the last, in bounded resumable steps with a fixed-capacity frontier; a search that exceeds the capacity runs tiled atomic label relaxation to a complete unchanged round instead. Both give the same f32 minimax value. The endpoint-nearer orientation is assessed first and the other only when its endpoint key does not already exceed the first's upper key. No sampling, rasterization or discrete Frechet substitute.",
+            "contact": "One connected continuous radius-proximity component must have projected arc-interval union length at least the minimum on both curves. Point/tangent boundary joins connect cells; exact closed current paths use periodic adjacency. Endpoint distance tests seed both intervals and determine joins. Only a cell without any endpoint hit may use a crossing seed, and its unexpanded segment boxes must overlap. This prevents orientation noise near collinearity from stretching an endpoint-seeded interval. Crossing signs and interval endpoints are f32 estimates. Endpoint-seeded patches extend with strip/disk clips. A crossing-only cell uses each computed extent directly, retaining a zero-length seed only where no extent is available; it never takes the hull of two independently rounded crossing estimates. Extent endpoints can be sensitive near tangency or parallelism and have no uniform arc-length error bound. Missing joined neighbors cause an explicit failure. Distances are compared unsquared after scale-based unit normalization. Every divisor is normal with a bounded quotient: segment normalization uses a 2^-100 scale threshold, while clipping and crossing permit divisors down to 2^-126. Segments below the scale threshold are points and never infinite strips. Subnormal operands/results may flush to zero. Exact shared stored vertices have distance zero by direct comparison; other radius-zero contacts follow the evaluated f32 distance and crossing tests and may depend on rounding. No neighbor cap or downsampling. Components are the fixpoint of atomic label propagation. At radius zero, segments collinear within f32 resolution may contribute arc length along the near-overlap.",
+            "contact_lengths": "A component's length on a route is the sum of its cells' uncovered interval lengths. Each contribution is an f32 value in units of the minimum, capped at one and truncated to a multiple of 2^-32, and the truncated values are added as 64-bit integers, so the sum does not depend on evaluation order. It is exact for the truncated contributions, not an exact arc length: K contributions lose less than K * 2^-32 of the minimum, below 1/64 of it at the largest batch. A decision exactly at the minimum can differ from an unquantized evaluation.",
+            "reductions": "Counts are exact integers. Sums are f32, added in pair order within blocks of 256 and then across blocks level by level; RMS and ratios are f32.",
+            "baseline_evidence": "The baseline frame's incompatible contact records and witnessed cohort pairs stay on the device. A later contact of the same edge pair reuses its stored flags and excesses; same-cohort contacts score zero; every other cross-cohort contact is assessed again with the same kernels.",
+            "limits": "Explicit fail limits, never truncation. --ambiguity-gpu-memory-mib bounds all owned GPU buffers including the frozen baseline copy (renderer geometry is borrowed; driver, pipeline and allocator overhead are outside it). --ambiguity-gpu-contact-pairs bounds the contact pairs one frame logs. --ambiguity-gpu-search-cells bounds one distance search, compared exactly with its cell count. --ambiguity-gpu-host-mib bounds the host metadata this backend allocates from input or device counts (readback vectors, membership and ID tables, batch and chunk plans, pair listings); report rows, the JSON serializer and the renderer are outside it. A single route whose cells exceed a batch fails; batches are whole lower-route ranges, so no component is split. The flags listed under parameters.not_applicable belong to the cpu and gpu backends and are rejected when given with gpu-f32.",
+            "work": "Every dispatch declares a worst-case unit count; a dispatch above parameters.effective.work_units_per_dispatch_and_submission is refused rather than run, and pending work is submitted before a submission would exceed it. A work unit is one innermost-loop iteration or straight-line block touching at most 32 buffer elements. Long work is resumable on the device (simplification, first-fit, frontier searches, chain walks). Uniform-bound dispatches are sliced into whole workgroups. A dispatch with a caller-proven Total bound is encoded whole or refused before execution. Work is never truncated. Round limits for simplification, relaxation, label propagation and chain walks are resource limits, not convergence proofs: an input that exceeds one fails with no report. These are operation-count bounds, not wall-time guarantees; device.work.maximum_wait_seconds is the longest observed submission on this machine. There is no global work budget in this backend.",
+            "limitations": "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.",
+            "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
+            "edge_ids": "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels."
+        },
+        "bundling": {"neighbor_radius": opts.neighbor_radius, "iterations": images.len().saturating_sub(1)},
+        "parameters": opts.ambiguity.resident_parameters()?,
+        "memberships": memberships,
+        "preparation": preparation,
+        "images": images,
+    });
+    crate::report::publish(&opts.out, "ambiguity.json", &report)
 }
