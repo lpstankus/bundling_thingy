@@ -428,6 +428,15 @@ impl Runner {
         Module { label, pipelines }
     }
 
+    /// Per-buffer storage capacity, including the allocator's 16-byte padding.
+    pub(super) fn storage_buffer_bytes(&self) -> u64 {
+        let limits = self.device.limits();
+        limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size))
+            & !15
+    }
+
     fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
         self.encoder.get_or_insert_with(|| {
             self.device

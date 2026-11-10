@@ -22,6 +22,8 @@ const TILE_SLICE: u64 = 1 << 18;
 const SWEEPS: u32 = 1;
 /// Device bytes per label cell: the label and two boundary weights.
 const CELL_BYTES: u64 = 12;
+/// Two buckets, each with three 256-cell arrays and 35 words of flags.
+const BUCKET_WORDS: u64 = 1606;
 /// Complete relaxation rounds between convergence checks; only the last one
 /// is counted.
 const ROUNDS_PER_CHECK: u64 = 8;
@@ -110,12 +112,28 @@ impl Assessor {
             .available()
             .checked_div(mul(CELL_BYTES, 8)?)
             .unwrap_or(0);
-        let bucket = cells.max(affordable.min(LABEL_TARGET / 2)).div_ceil(256);
-        // Two buckets of labels and of both boundary weights.
-        let label_cells = mul(mul(bucket, 256)?, 6)?;
+        let wanted = cells.max(affordable.min(LABEL_TARGET / 2)).div_ceil(256);
+        // Task metadata and both buckets share one storage binding. Cap the
+        // entire padded allocation, not just its label-cell region.
+        let task_words = mul(add(tasks, 1)?, 2)?;
+        let adapter_bytes = core.runner.storage_buffer_bytes();
+        let available_words = adapter_bytes / 4;
+        let maximum = available_words.saturating_sub(task_words) / BUCKET_WORDS;
+        let minimum = cells.div_ceil(256);
+        if maximum < minimum {
+            let demand = mul(add(mul(minimum, BUCKET_WORDS)?, task_words)?, 4)?
+                .checked_next_multiple_of(16)
+                .ok_or_else(overflow)?;
+            return Err(Error::Limit {
+                limit: super::super::Limit::AdapterBuffer("ambiguity f32 search labels"),
+                demand,
+                available: adapter_bytes,
+            });
+        }
+        let bucket = wanted.min(maximum);
         let table = mul(add(tasks, 1)?, 4)?;
         let grid_words = add(table, mul(add(tasks, 2)?, 2)?)?;
-        let label_words = add(label_cells, mul(add(mul(bucket, 35)?, add(tasks, 1)?)?, 2)?)?;
+        let label_words = add(mul(bucket, BUCKET_WORDS)?, task_words)?;
         let store = &mut core.store;
         Ok(Self {
             pairs: store.words("ambiguity f32 assessment pairs", mul(PAIRS, 16)?)?,
@@ -412,80 +430,82 @@ impl Assessor {
         tasks: u64,
         searches: u64,
     ) -> Result<()> {
-        let table = add(tasks, 1)?;
-        let base = P {
-            a: word(table)?,
-            b: word(mul(table, 2)?)?,
-            c: word(mul(table, 3)?)?,
-            d: word(self.bucket)?,
-            e: word(mul(table, 4)?)?,
-            k: originals.knots,
-            ..P::default()
-        };
-        let chunks = self.chunks(core, originals, (tasks, searches), base)?;
-        for chunk in &chunks {
-            let registers = P {
-                n: chunk.tiles.1,
-                f: chunk.index,
-                h: chunk.searches.0,
-                i: chunk.searches.1,
-                j: SWEEPS,
-                ..base
+        core.scoped(|core| {
+            let table = add(tasks, 1)?;
+            let base = P {
+                a: word(table)?,
+                b: word(mul(table, 2)?)?,
+                c: word(mul(table, 3)?)?,
+                d: word(self.bucket)?,
+                e: word(mul(table, 4)?)?,
+                k: originals.knots,
+                ..P::default()
             };
-            let search_count = u64::from(chunk.searches.1.saturating_sub(chunk.searches.0));
-            let tile_count = chunk.tiles.1.saturating_sub(chunk.tiles.0);
-            self.tiles(core, originals, "grid_init", chunk, registers)?;
-            let mut rounds = 0;
-            loop {
-                // Complete rounds over every tile of the chunk. After each
-                // round the tiles to sweep next are those marked during it.
-                // The status is reset before the last round, so a zero count
-                // means one complete round changed nothing anywhere.
-                for round in 0..ROUNDS_PER_CHECK {
-                    if round.checked_add(1) == Some(ROUNDS_PER_CHECK) {
-                        core.runner.reset();
+            let chunks = self.chunks(core, originals, (tasks, searches), base)?;
+            for chunk in &chunks {
+                let registers = P {
+                    n: chunk.tiles.1,
+                    f: chunk.index,
+                    h: chunk.searches.0,
+                    i: chunk.searches.1,
+                    j: SWEEPS,
+                    ..base
+                };
+                let search_count = u64::from(chunk.searches.1.saturating_sub(chunk.searches.0));
+                let tile_count = chunk.tiles.1.saturating_sub(chunk.tiles.0);
+                self.tiles(core, originals, "grid_init", chunk, registers)?;
+                let mut rounds = 0;
+                loop {
+                    // Complete rounds over every tile of the chunk. After each
+                    // round the tiles to sweep next are those marked during it.
+                    // The status is reset before the last round, so a zero count
+                    // means one complete round changed nothing anywhere.
+                    for round in 0..ROUNDS_PER_CHECK {
+                        if round.checked_add(1) == Some(ROUNDS_PER_CHECK) {
+                            core.runner.reset();
+                        }
+                        self.tiles(core, originals, "grid_relax", chunk, registers)?;
+                        core.run(
+                            STAGE,
+                            "grid_roll",
+                            &self.binds(originals),
+                            P {
+                                n: tile_count,
+                                ..registers
+                            },
+                            u64::from(tile_count),
+                        )?;
                     }
-                    self.tiles(core, originals, "grid_relax", chunk, registers)?;
-                    core.run(
-                        STAGE,
-                        "grid_roll",
-                        &self.binds(originals),
-                        P {
-                            n: tile_count,
-                            ..registers
-                        },
-                        u64::from(tile_count),
-                    )?;
+                    rounds = add(rounds, ROUNDS_PER_CHECK)?;
+                    let status = core.runner.status("route distance relaxation")?;
+                    if status_word(&status, S_CHANGED) == 0 {
+                        break;
+                    }
+                    if rounds >= ROUND_LIMIT {
+                        return Err(Error::Fault(Fault::Rounds {
+                            stage: "route distance relaxation",
+                            limit: ROUND_LIMIT,
+                        }));
+                    }
                 }
-                rounds = add(rounds, ROUNDS_PER_CHECK)?;
-                let status = core.runner.status("route distance relaxation")?;
-                if status_word(&status, S_CHANGED) == 0 {
-                    break;
-                }
-                if rounds >= ROUND_LIMIT {
-                    return Err(Error::Fault(Fault::Rounds {
-                        stage: "route distance relaxation",
-                        limit: ROUND_LIMIT,
-                    }));
-                }
+                self.statistics.relaxation_rounds = add(self.statistics.relaxation_rounds, rounds)?;
+                core.run(
+                    STAGE,
+                    "grid_finish",
+                    &self.binds(originals),
+                    registers,
+                    search_count,
+                )?;
             }
-            self.statistics.relaxation_rounds = add(self.statistics.relaxation_rounds, rounds)?;
-            core.run(
-                STAGE,
-                "grid_finish",
-                &self.binds(originals),
-                registers,
-                search_count,
+            // A search that ended without a finite label fails here, before the
+            // refinement that would consume it is encoded.
+            core.runner.status("route distance searches")?;
+            self.statistics.cell_searches = add(self.statistics.cell_searches, searches)?;
+            self.statistics.cell_search_chunks = add(
+                self.statistics.cell_search_chunks,
+                u64::try_from(chunks.len()).map_err(|_| overflow())?,
             )?;
-        }
-        // A search that ended without a finite label fails here, before the
-        // refinement that would consume it is encoded.
-        core.runner.status("route distance searches")?;
-        self.statistics.cell_searches = add(self.statistics.cell_searches, searches)?;
-        self.statistics.cell_search_chunks = add(
-            self.statistics.cell_search_chunks,
-            u64::try_from(chunks.len()).map_err(|_| overflow())?,
-        )?;
-        Ok(())
+            Ok(())
+        })
     }
 }
