@@ -62,6 +62,12 @@ struct Batch {
     cells: u64,
 }
 
+#[derive(Clone, Copy)]
+struct Capacity {
+    cells: u64,
+    limit: Limit,
+}
+
 /// Positive-segment marks and per-route offsets, both scanned; returns the
 /// segment count.
 fn positive(
@@ -405,24 +411,29 @@ impl Broad {
 
 /// Whole-route batches in increasing source order under the cell capacity and
 /// the source bits left in the 64-bit key.
-fn plan(host: &mut Host, cells: &[u32], capacity: u64, source_bits: u32) -> Result<Vec<Batch>> {
+fn plan(
+    host: &mut Host,
+    cells: &[u32],
+    capacity: Capacity,
+    source_bits: u32,
+) -> Result<Vec<Batch>> {
     let span = 1_u64.checked_shl(source_bits).unwrap_or(u64::MAX);
     let mut batches = host.vector(u64::try_from(cells.len()).map_err(|_| Error::SizeOverflow)?)?;
     let mut current: Option<Batch> = None;
     for (route, count) in (0_u32..).zip(cells) {
         let count = u64::from(*count);
-        if count > capacity {
+        if count > capacity.cells {
             return Err(Error::SourceCapacity {
                 source: route,
-                limit: Limit::DeviceMemory("ambiguity f32 contact batch"),
+                limit: capacity.limit,
                 demand: count,
-                available: capacity,
+                available: capacity.cells,
             });
         }
         let next = route.checked_add(1).ok_or(Error::SizeOverflow)?;
         match &mut current {
             Some(batch)
-                if add(batch.cells, count)? <= capacity
+                if add(batch.cells, count)? <= capacity.cells
                     && u64::from(route.saturating_sub(batch.first)) < span =>
             {
                 batch.cells = add(batch.cells, count)?;
@@ -453,20 +464,77 @@ struct Workspace {
     marks: wgpu::Buffer,
     scratch: wgpu::Buffer,
 }
+
+/// Word counts shared by capacity planning and workspace allocation.
+fn workspace_words(cells: u64) -> Result<[u64; 7]> {
+    Ok([
+        mul(cells, 8)?,
+        mul(cells, 2)?,
+        mul(cells, 2)?,
+        mul(cells, 2)?,
+        add(mul(cells, 5)?, mul(buckets(cells), 2)?)?,
+        add(cells, 1)?,
+        scan_words(add(cells, 1)?)?,
+    ])
+}
+
+/// Largest padded storage binding during classification and pair logging.
+fn largest_buffer_bytes(cells: u64) -> Result<u64> {
+    let histogram = histogram_words(cells)?;
+    let largest = workspace_words(cells)?
+        .into_iter()
+        .chain([
+            mul(cells, 3)?,
+            histogram,
+            scan_words(add(cells, 1)?.max(histogram))?,
+        ])
+        .max()
+        .unwrap_or(0);
+    mul(largest, 4)?
+        .max(16)
+        .checked_next_multiple_of(16)
+        .ok_or(Error::SizeOverflow)
+}
+
+fn batch_capacity(available: u64, storage: u64) -> Result<Capacity> {
+    let global = available
+        .checked_div(CELL_BYTES)
+        .unwrap_or(0)
+        .saturating_sub(4096)
+        .min(MAXIMUM_BATCH_CELLS);
+    // Every allocation grows monotonically, including power-of-two bucket
+    // jumps. Find the largest cell count whose entire bindings still fit.
+    let (mut low, mut high) = (0, global);
+    while low < high {
+        let middle = add(low, high.saturating_sub(low).div_ceil(2))?;
+        if largest_buffer_bytes(middle)? <= storage {
+            low = middle;
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    Ok(Capacity {
+        cells: low,
+        limit: if low < global {
+            Limit::AdapterBuffer("ambiguity f32 contact workspace")
+        } else {
+            Limit::DeviceMemory("ambiguity f32 contact batch")
+        },
+    })
+}
+
 impl Workspace {
     fn new(core: &mut Core, cells: u64) -> Result<Self> {
+        let [records, chains, links, covered, state, marks, scratch] = workspace_words(cells)?;
         let store = &mut core.store;
         Ok(Self {
-            records: store.words("ambiguity f32 cell records", mul(cells, 8)?)?,
-            chains: store.words("ambiguity f32 cell chains", mul(cells, 2)?)?,
-            links: store.words("ambiguity f32 cell links", mul(cells, 2)?)?,
-            covered: store.words("ambiguity f32 covered ends", mul(cells, 2)?)?,
-            state: store.words(
-                "ambiguity f32 labels, sums and buckets",
-                add(mul(cells, 5)?, mul(buckets(cells), 2)?)?,
-            )?,
-            marks: store.words("ambiguity f32 component marks", add(cells, 1)?)?,
-            scratch: store.words("ambiguity f32 cell scan sums", scan_words(add(cells, 1)?)?)?,
+            records: store.words("ambiguity f32 cell records", records)?,
+            chains: store.words("ambiguity f32 cell chains", chains)?,
+            links: store.words("ambiguity f32 cell links", links)?,
+            covered: store.words("ambiguity f32 covered ends", covered)?,
+            state: store.words("ambiguity f32 labels, sums and buckets", state)?,
+            marks: store.words("ambiguity f32 component marks", marks)?,
+            scratch: store.words("ambiguity f32 cell scan sums", scratch)?,
         })
     }
 }
@@ -520,13 +588,7 @@ pub(super) fn contacts(
                 required: used.saturating_add(1),
             });
         }
-        let capacity = core
-            .store
-            .available()
-            .checked_div(CELL_BYTES)
-            .unwrap_or(0)
-            .saturating_sub(4096)
-            .min(MAXIMUM_BATCH_CELLS);
+        let capacity = batch_capacity(core.store.available(), core.runner.storage_buffer_bytes())?;
         let batches = plan(
             &mut core.runner.host,
             &broad.cells,
@@ -534,7 +596,7 @@ pub(super) fn contacts(
             64_u32.saturating_sub(used),
         )?;
         let largest = batches.iter().map(|batch| batch.cells).max().unwrap_or(0);
-        statistics.batch_capacity_cells = capacity;
+        statistics.batch_capacity_cells = capacity.cells;
         statistics.largest_batch_cells = largest;
         statistics.batches = u64::try_from(batches.len()).map_err(|_| Error::SizeOverflow)?;
         if largest == 0 {
