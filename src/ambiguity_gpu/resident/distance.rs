@@ -3,9 +3,9 @@
 //! distance, bound or flag is computed on the host.
 use super::super::{Error, Protocol, Result, overflow};
 use super::{
-    Core, Fault, Originals, Stage,
-    runner::{Bind, Bound, P, WORK_TARGET, add, mul, scan_words, slice_size, word},
-    status_word,
+    Core, Fault, Originals,
+    runner::{Bind, Bound, P, WORK_TARGET, add, mul, scan_words, slice_size, spans, word},
+    status_word, unfinished,
 };
 
 /// Assessment pairs of one chunk.
@@ -45,7 +45,6 @@ const FRONTIER_STEPS: u32 = 512;
 /// and one pop through at most 13 heap levels, four boundary weights.
 const POP_UNITS: u64 = 448;
 const FRONTIER_TIERS: [(u32, u32); 2] = [(1 << 10, 1 << 10), (1 << 12, 1 << 12)];
-const STAGE: Stage = Stage::Distance;
 
 /// Buffers of the assessment stage, sized once for the frozen originals.
 pub(super) struct Assessor {
@@ -134,15 +133,14 @@ impl Assessor {
         let table = mul(add(tasks, 1)?, 4)?;
         let grid_words = add(table, mul(add(tasks, 2)?, 2)?)?;
         let label_words = add(mul(bucket, BUCKET_WORDS)?, task_words)?;
-        let store = &mut core.store;
         Ok(Self {
-            pairs: store.words("ambiguity f32 assessment pairs", mul(PAIRS, 16)?)?,
-            tasks: store.words("ambiguity f32 distance tasks", mul(tasks, 8)?)?,
-            grid: store.words("ambiguity f32 search tables", grid_words)?,
+            pairs: core.words("ambiguity f32 assessment pairs", mul(PAIRS, 16)?)?,
+            tasks: core.words("ambiguity f32 distance tasks", mul(tasks, 8)?)?,
+            grid: core.words("ambiguity f32 search tables", grid_words)?,
             // A chunk's local span stays below two buckets; boundary weights
             // and two flags per tile follow.
-            labels: store.words("ambiguity f32 search labels", label_words)?,
-            scratch: store.words(
+            labels: core.words("ambiguity f32 search labels", label_words)?,
+            scratch: core.words(
                 "ambiguity f32 search scan sums",
                 scan_words(add(tasks, 1)?)?,
             )?,
@@ -190,20 +188,15 @@ impl Assessor {
             ..P::default()
         };
         let tasks = mul(count, 2)?;
-        core.run(STAGE, "assess_begin", &self.binds(originals), pairs, count)?;
+        core.run("assess_begin", &self.binds(originals), pairs, count)?;
         self.statistics.assessed_pairs = add(self.statistics.assessed_pairs, count)?;
         // One simplified orientation, both, both full curves, then the chosen
         // full orientation.
+        let size = TASK_SLICE.min(slice_size(self.task_units));
         for _ in 0..4 {
             core.runner.reset();
-            let mut first = 0;
-            while first < tasks {
-                let slice = tasks
-                    .saturating_sub(first)
-                    .min(TASK_SLICE)
-                    .min(slice_size(self.task_units));
+            for (first, slice) in spans(0, tasks, size) {
                 core.run_bounded(
-                    STAGE,
                     "task_fast",
                     &self.binds(originals),
                     P {
@@ -216,7 +209,6 @@ impl Assessor {
                     slice,
                     Bound::Each(self.task_units),
                 )?;
-                first = add(first, slice)?;
             }
             let status = core.runner.status("route distance tasks")?;
             let mut searches = status_word(&status, S_A);
@@ -227,16 +219,13 @@ impl Assessor {
                 self.search(core, originals, tasks, searches)?;
             }
             core.runner.reset();
-            core.run(STAGE, "assess_step", &self.binds(originals), pairs, count)?;
+            core.run("assess_step", &self.binds(originals), pairs, count)?;
             let status = core.runner.status("route distance refinement")?;
             if status_word(&status, S_PENDING) == 0 {
                 return Ok(());
             }
         }
-        Err(Error::Fault(Fault::Rounds {
-            stage: "route distance refinement",
-            limit: 4,
-        }))
+        Err(unfinished("route distance refinement", 4))
     }
 
     /// Bounded frontier searches of the pending tasks, tier by tier, as many
@@ -259,11 +248,8 @@ impl Assessor {
             if slots == 0 {
                 continue;
             }
-            let marks = P {
-                n: word(tasks)?,
-                ..P::default()
-            };
-            core.run(STAGE, "grid_marks", &self.binds(originals), marks, table)?;
+            let marks = P::count(tasks)?;
+            core.run("grid_marks", &self.binds(originals), marks, table)?;
             core.scan(&self.grid, (0, table), &self.scratch)?;
             let tier = P {
                 a: seen,
@@ -293,9 +279,7 @@ impl Assessor {
                 .unwrap_or(1)
                 .max(1);
             let mut finished = 0;
-            let mut first = 0;
-            while first < pending {
-                let group = pending.saturating_sub(first).min(slots).min(active);
+            for (first, group) in spans(0, pending, slots.min(active)) {
                 let bound = Bound::Total {
                     each: units,
                     total: add(mul(group, units)?, tasks)?,
@@ -304,7 +288,6 @@ impl Assessor {
                 loop {
                     core.runner.reset();
                     core.run_bounded(
-                        STAGE,
                         "grid_frontier",
                         &self.binds(originals),
                         P {
@@ -323,13 +306,9 @@ impl Assessor {
                     }
                     round = add(round, 1)?;
                     if round > limit {
-                        return Err(Error::Fault(Fault::Rounds {
-                            stage: "route distance frontier searches",
-                            limit,
-                        }));
+                        return Err(unfinished("route distance frontier searches", limit));
                     }
                 }
-                first = add(first, group)?;
             }
             self.statistics.frontier_searches = add(self.statistics.frontier_searches, finished)?;
             pending = pending.saturating_sub(finished);
@@ -352,9 +331,9 @@ impl Assessor {
             d: word(searches)?,
             ..base
         };
-        core.run(STAGE, "grid_marks", &binds, task_n, table)?;
+        core.run("grid_marks", &binds, task_n, table)?;
         core.scan(&self.grid, (0, table), &self.scratch)?;
-        core.run(STAGE, "grid_list", &binds, task_n, table)?;
+        core.run("grid_list", &binds, task_n, table)?;
         let scanned = add(searches, 1)?;
         core.scan(&self.grid, (u64::from(base.b), scanned), &self.scratch)?;
         core.scan(&self.grid, (u64::from(base.c), scanned), &self.scratch)?;
@@ -363,7 +342,7 @@ impl Assessor {
             n: word(searches)?,
             ..base
         };
-        core.run(STAGE, "grid_chunks", &binds, search_n, searches)?;
+        core.run("grid_chunks", &binds, search_n, searches)?;
         let status = core.runner.status("route distance search chunks")?;
         let count = add(status_word(&status, S_B), 1)?;
         let heads = core
@@ -404,11 +383,8 @@ impl Assessor {
         registers: P,
     ) -> Result<()> {
         let (first, end) = (u64::from(chunk.tiles.0), u64::from(chunk.tiles.1));
-        let mut tile = first;
-        while tile < end {
-            let slice = end.saturating_sub(tile).min(TILE_SLICE);
+        for (tile, slice) in spans(first, end, TILE_SLICE) {
             core.run(
-                STAGE,
                 entry,
                 &self.binds(originals),
                 P {
@@ -417,7 +393,6 @@ impl Assessor {
                 },
                 slice,
             )?;
-            tile = add(tile, slice)?;
         }
         Ok(())
     }
@@ -466,7 +441,6 @@ impl Assessor {
                         }
                         self.tiles(core, originals, "grid_relax", chunk, registers)?;
                         core.run(
-                            STAGE,
                             "grid_roll",
                             &self.binds(originals),
                             P {
@@ -482,15 +456,11 @@ impl Assessor {
                         break;
                     }
                     if rounds >= ROUND_LIMIT {
-                        return Err(Error::Fault(Fault::Rounds {
-                            stage: "route distance relaxation",
-                            limit: ROUND_LIMIT,
-                        }));
+                        return Err(unfinished("route distance relaxation", ROUND_LIMIT));
                     }
                 }
                 self.statistics.relaxation_rounds = add(self.statistics.relaxation_rounds, rounds)?;
                 core.run(
-                    STAGE,
                     "grid_finish",
                     &self.binds(originals),
                     registers,

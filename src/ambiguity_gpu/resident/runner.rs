@@ -58,15 +58,21 @@ pub(super) struct P {
     pub o: u32,
     pub pad: [u32; 3],
 }
+impl P {
+    /// Registers of a kernel that takes only the element count.
+    pub(super) fn count(n: u64) -> Result<Self> {
+        Ok(Self {
+            n: word(n)?,
+            ..Self::default()
+        })
+    }
+}
 
 pub(super) fn add(a: u64, b: u64) -> Result<u64> {
     a.checked_add(b).ok_or_else(overflow)
 }
 pub(super) fn mul(a: u64, b: u64) -> Result<u64> {
     a.checked_mul(b).ok_or_else(overflow)
-}
-pub(super) fn sub(a: u64, b: u64) -> Result<u64> {
-    a.checked_sub(b).ok_or(Error::Protocol(Protocol::Inventory))
 }
 /// A device index or count; values beyond u32 are a count overflow.
 pub(super) fn word(value: u64) -> Result<u32> {
@@ -92,6 +98,22 @@ pub(super) fn scan_words(count: u64) -> Result<u64> {
         }
         current = blocks;
     }
+}
+/// Consecutive `(first, count)` spans of at most `size` elements covering
+/// `first..end` in increasing order. Callers pass a positive size; zero is
+/// treated as one. `next + count <= end`, so the saturating add is exact.
+pub(super) fn spans(first: u64, end: u64, size: u64) -> impl Iterator<Item = (u64, u64)> {
+    let size = size.max(1);
+    let mut next = first;
+    std::iter::from_fn(move || {
+        let count = end.saturating_sub(next).min(size);
+        if count == 0 {
+            return None;
+        }
+        let span = (next, count);
+        next = next.saturating_add(count);
+        Some(span)
+    })
 }
 /// Histogram words of a radix sort over `count` records.
 pub(super) fn histogram_words(count: u64) -> Result<u64> {
@@ -395,23 +417,35 @@ impl Runner {
         })
     }
 
-    /// Compile `source` after the shared prelude with one pipeline per entry.
-    pub(super) fn module(&self, label: &'static str, source: &str, entries: &[Entry]) -> Module {
-        let module = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(
-                    format!(
-                        "{}\n{source}",
-                        include_str!("../../shaders/ambiguity_f32_prelude.wgsl")
-                    )
-                    .into(),
-                ),
-            });
-        let pipelines = entries
-            .iter()
-            .map(|entry| {
+    /// Compile each `(label, source, entries)` after the shared prelude, in
+    /// order, into one table with one pipeline per entry. Entry names must be
+    /// unique across all sources.
+    pub(super) fn kernels(
+        &self,
+        label: &'static str,
+        sources: &[(&'static str, &str, &[Entry])],
+    ) -> Result<Module> {
+        let mut pipelines: Vec<(Entry, wgpu::ComputePipeline)> = Vec::new();
+        for (module_label, source, entries) in sources {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(module_label),
+                    source: wgpu::ShaderSource::Wgsl(
+                        format!(
+                            "{}\n{source}",
+                            include_str!("../../shaders/ambiguity_f32_prelude.wgsl")
+                        )
+                        .into(),
+                    ),
+                });
+            for entry in *entries {
+                let repeated = pipelines.iter().any(|((name, _), _)| *name == entry.0);
+                if repeated {
+                    return Err(Error::Fault(Fault::Schedule(
+                        "kernel entry name repeats across modules",
+                    )));
+                }
                 let pipeline =
                     self.device
                         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -422,10 +456,10 @@ impl Runner {
                             compilation_options: wgpu::PipelineCompilationOptions::default(),
                             cache: None,
                         });
-                (*entry, pipeline)
-            })
-            .collect();
-        Module { label, pipelines }
+                pipelines.push((*entry, pipeline));
+            }
+        }
+        Ok(Module { label, pipelines })
     }
 
     /// Per-buffer storage capacity, including the allocator's 16-byte padding.
@@ -498,9 +532,7 @@ impl Runner {
         // Every lane of a slice is charged the full bound.
         let lane = mul(WORKGROUP, each)?;
         let slice = WORK_TARGET.checked_div(lane).unwrap_or(1).clamp(1, maximum);
-        let mut first = 0;
-        while first < workgroups {
-            let count = workgroups.saturating_sub(first).min(slice);
+        for (first, count) in spans(0, workgroups, slice) {
             let sliced = P {
                 o: word(first)?,
                 ..registers
@@ -513,7 +545,6 @@ impl Runner {
                 (count, 1),
                 mul(count, lane)?,
             )?;
-            first = add(first, count)?;
         }
         Ok(())
     }
@@ -719,12 +750,9 @@ impl Runner {
         count: u64,
     ) -> Result<Vec<u32>> {
         let mut values = self.host.vector(count)?;
-        let mut done = 0;
-        while done < count {
-            let chunk = sub(count, done)?.min(STAGING_BYTES / 4);
+        for (done, chunk) in spans(0, count, STAGING_BYTES / 4) {
             let offset = mul(add(first, done)?, 4)?;
             self.read_chunk(source, (offset, mul(chunk, 4)?), &mut values)?;
-            done = add(done, chunk)?;
         }
         Ok(values)
     }
@@ -751,16 +779,16 @@ impl Runner {
     /// Exclusive in-place scan of `count` words of `values` from word `first`.
     pub(super) fn scan(
         &mut self,
-        util: &Module,
+        kernels: &Module,
         values: &wgpu::Buffer,
         (first, count): (u64, u64),
         scratch: &wgpu::Buffer,
     ) -> Result<()> {
-        self.scan_level(util, Some(values), (first, count), 0, scratch)
+        self.scan_level(kernels, Some(values), (first, count), 0, scratch)
     }
     fn scan_level(
         &mut self,
-        util: &Module,
+        kernels: &Module,
         values: Option<&wgpu::Buffer>,
         (first, count): (u64, u64),
         sums: u64,
@@ -781,10 +809,17 @@ impl Runner {
         if let Some(values) = values {
             binds.push((5, values));
         }
-        self.run_groups(util, "scan_blocks", &binds, registers, blocks, Bound::Fixed)?;
+        self.run_groups(
+            kernels,
+            "scan_blocks",
+            &binds,
+            registers,
+            blocks,
+            Bound::Fixed,
+        )?;
         if blocks > 1 {
-            self.scan_level(util, None, (sums, blocks), add(sums, blocks)?, scratch)?;
-            self.run_groups(util, "scan_add", &binds, registers, blocks, Bound::Fixed)?;
+            self.scan_level(kernels, None, (sums, blocks), add(sums, blocks)?, scratch)?;
+            self.run_groups(kernels, "scan_add", &binds, registers, blocks, Bound::Fixed)?;
         }
         Ok(())
     }
@@ -794,7 +829,7 @@ impl Runner {
     /// whether the result is in `b`.
     pub(super) fn sort(
         &mut self,
-        util: &Module,
+        kernels: &Module,
         (a, b): (&wgpu::Buffer, &wgpu::Buffer),
         (histogram, scratch): (&wgpu::Buffer, &wgpu::Buffer),
         count: u64,
@@ -814,10 +849,17 @@ impl Runner {
                     ..P::default()
                 };
                 let binds = [(3, a), (4, b), (5, histogram)];
-                self.run(util, "radix_count", &binds, registers, blocks, Bound::Fixed)?;
-                self.scan(util, histogram, (0, mul(blocks, 256)?), scratch)?;
                 self.run(
-                    util,
+                    kernels,
+                    "radix_count",
+                    &binds,
+                    registers,
+                    blocks,
+                    Bound::Fixed,
+                )?;
+                self.scan(kernels, histogram, (0, mul(blocks, 256)?), scratch)?;
+                self.run(
+                    kernels,
                     "radix_scatter",
                     &binds,
                     registers,

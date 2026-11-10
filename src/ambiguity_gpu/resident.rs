@@ -282,92 +282,56 @@ pub struct Preparation {
     pub host_peak_bytes: u64,
 }
 
-/// Shader modules of the backend.
-#[derive(Clone, Copy)]
-pub(crate) enum Stage {
-    Originals,
-    Distance,
-    Frame,
-    Broad,
-    Contact,
-    Score,
-}
-
-pub(crate) struct Kernels {
-    util: Module,
-    originals: Module,
-    distance: Module,
-    frame: Module,
-    broad: Module,
-    contact: Module,
-    score: Module,
+/// The failure of a bounded iteration that used up its `limit`.
+const fn unfinished(stage: &'static str, limit: u64) -> Error {
+    Error::Fault(Fault::Rounds { stage, limit })
 }
 
 pub(crate) struct Core {
     runner: Runner,
     store: Store,
-    kernels: Kernels,
-}
-const fn pick(kernels: &Kernels, stage: Stage) -> &Module {
-    match stage {
-        Stage::Originals => &kernels.originals,
-        Stage::Distance => &kernels.distance,
-        Stage::Frame => &kernels.frame,
-        Stage::Broad => &kernels.broad,
-        Stage::Contact => &kernels.contact,
-        Stage::Score => &kernels.score,
-    }
+    /// Every kernel of the backend; entry names are unique.
+    kernels: Module,
 }
 impl Core {
     /// Encode one invocation of `entry` per element at the kernel's fixed
     /// work bound.
     fn run(
         &mut self,
-        stage: Stage,
         entry: &str,
         binds: &[runner::Bind<'_>],
         registers: runner::P,
         invocations: u64,
     ) -> Result<()> {
-        self.run_bounded(stage, entry, binds, registers, invocations, Bound::Fixed)
+        self.run_bounded(entry, binds, registers, invocations, Bound::Fixed)
     }
     /// Encode one invocation of `entry` per element at a work bound the
     /// caller derived from registers or counts.
     fn run_bounded(
         &mut self,
-        stage: Stage,
         entry: &str,
         binds: &[runner::Bind<'_>],
         registers: runner::P,
         invocations: u64,
         bound: Bound,
     ) -> Result<()> {
-        self.runner.run(
-            pick(&self.kernels, stage),
-            entry,
-            binds,
-            registers,
-            invocations,
-            bound,
-        )
+        self.runner
+            .run(&self.kernels, entry, binds, registers, invocations, bound)
     }
     /// Encode a single-invocation kernel.
     fn run_once(
         &mut self,
-        stage: Stage,
         entry: &str,
         binds: &[runner::Bind<'_>],
         registers: runner::P,
         bound: Bound,
     ) -> Result<()> {
-        self.runner.run_groups(
-            pick(&self.kernels, stage),
-            entry,
-            binds,
-            registers,
-            1,
-            bound,
-        )
+        self.runner
+            .run_groups(&self.kernels, entry, binds, registers, 1, bound)
+    }
+    /// Zeroed storage of `count` words, released with the current scope.
+    fn words(&mut self, label: &'static str, count: u64) -> Result<wgpu::Buffer> {
+        self.store.words(label, count)
     }
     fn scan(
         &mut self,
@@ -375,8 +339,7 @@ impl Core {
         range: (u64, u64),
         scratch: &wgpu::Buffer,
     ) -> Result<()> {
-        self.runner
-            .scan(&self.kernels.util, values, range, scratch)?;
+        self.runner.scan(&self.kernels, values, range, scratch)?;
         self.runner.status("prefix scan")?;
         Ok(())
     }
@@ -395,7 +358,7 @@ impl Core {
     ) -> Result<u64> {
         let padded = runner::add(count, 1)?;
         self.runner
-            .scan(&self.kernels.util, values, (0, padded), scratch)?;
+            .scan(&self.kernels, values, (0, padded), scratch)?;
         self.runner.status(what)?;
         self.word(values, count)
     }
@@ -418,13 +381,9 @@ impl Core {
         count: u64,
         key_bits: (u32, u32),
     ) -> Result<(&'a wgpu::Buffer, &'a wgpu::Buffer)> {
-        let flipped = self.runner.sort(
-            &self.kernels.util,
-            (first, second),
-            scratch,
-            count,
-            key_bits,
-        )?;
+        let flipped = self
+            .runner
+            .sort(&self.kernels, (first, second), scratch, count, key_bits)?;
         Ok(if flipped {
             (second, first)
         } else {
@@ -646,45 +605,47 @@ const SCORE: &[Entry] = &[
     ("score_finish", 16),
 ];
 
-fn kernels(runner: &Runner) -> Kernels {
-    let module = |label, source, entries| runner.module(label, source, entries);
-    Kernels {
-        util: module(
-            "ambiguity f32 util",
-            include_str!("../shaders/ambiguity_f32_util.wgsl"),
-            UTIL,
-        ),
-        originals: module(
-            "ambiguity f32 originals",
-            include_str!("../shaders/ambiguity_f32_originals.wgsl"),
-            ORIGINALS,
-        ),
-        distance: module(
-            "ambiguity f32 distance",
-            include_str!("../shaders/ambiguity_f32_distance.wgsl"),
-            DISTANCE,
-        ),
-        frame: module(
-            "ambiguity f32 frame",
-            include_str!("../shaders/ambiguity_f32_frame.wgsl"),
-            FRAME,
-        ),
-        broad: module(
-            "ambiguity f32 broad",
-            include_str!("../shaders/ambiguity_f32_broad.wgsl"),
-            BROAD,
-        ),
-        contact: module(
-            "ambiguity f32 contact",
-            include_str!("../shaders/ambiguity_f32_contact.wgsl"),
-            CONTACT,
-        ),
-        score: module(
-            "ambiguity f32 score",
-            include_str!("../shaders/ambiguity_f32_score.wgsl"),
-            SCORE,
-        ),
-    }
+fn kernels(runner: &Runner) -> Result<Module> {
+    runner.kernels(
+        "ambiguity f32 kernels",
+        &[
+            (
+                "ambiguity f32 util",
+                include_str!("../shaders/ambiguity_f32_util.wgsl"),
+                UTIL,
+            ),
+            (
+                "ambiguity f32 originals",
+                include_str!("../shaders/ambiguity_f32_originals.wgsl"),
+                ORIGINALS,
+            ),
+            (
+                "ambiguity f32 distance",
+                include_str!("../shaders/ambiguity_f32_distance.wgsl"),
+                DISTANCE,
+            ),
+            (
+                "ambiguity f32 frame",
+                include_str!("../shaders/ambiguity_f32_frame.wgsl"),
+                FRAME,
+            ),
+            (
+                "ambiguity f32 broad",
+                include_str!("../shaders/ambiguity_f32_broad.wgsl"),
+                BROAD,
+            ),
+            (
+                "ambiguity f32 contact",
+                include_str!("../shaders/ambiguity_f32_contact.wgsl"),
+                CONTACT,
+            ),
+            (
+                "ambiguity f32 score",
+                include_str!("../shaders/ambiguity_f32_score.wgsl"),
+                SCORE,
+            ),
+        ],
+    )
 }
 
 impl Session {
@@ -708,7 +669,7 @@ impl Session {
                 &mut store,
                 runner::Host::new(settings.host_bytes),
             )?;
-            let kernels = kernels(&runner);
+            let kernels = kernels(&runner)?;
             let mut core = Core {
                 runner,
                 store,
@@ -821,20 +782,14 @@ impl Session {
                 // Input validation leaves the session healthy; device work may
                 // invalidate it. The outer scope accounts for ordinals throughout.
                 *valid = false;
-                let log = core
-                    .store
-                    .words("ambiguity f32 probe pairs", mul(count, 2)?)?;
+                let log = core.words("ambiguity f32 probe pairs", mul(count, 2)?)?;
                 core.runner.flush()?;
                 core.upload(&log, bytemuck::cast_slice(&ordinals));
                 let pair_buffer = assessor.pairs.clone();
                 core.run(
-                    Stage::Score,
                     "probe_pairs",
                     &[(1, &log), (3, &originals.routes), (6, &pair_buffer)],
-                    runner::P {
-                        n: runner::word(count)?,
-                        ..runner::P::default()
-                    },
+                    runner::P::count(count)?,
                     count,
                 )?;
                 assessor.assess(
@@ -875,9 +830,7 @@ impl Session {
             ..
         } = self;
         let (contacts, scored) = core.scoped(|core| {
-            let log = core
-                .store
-                .words("ambiguity f32 contact pairs", mul(config.pair_capacity, 2)?)?;
+            let log = core.words("ambiguity f32 contact pairs", mul(config.pair_capacity, 2)?)?;
             let contacts = contact::contacts(
                 core,
                 originals,

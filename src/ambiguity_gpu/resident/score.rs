@@ -3,9 +3,9 @@
 //! the final counts and scalars only.
 use super::super::{Error, Protocol, Result};
 use super::{
-    CohortScores, Config, Core, Fault, Interval, Originals, Stage, View,
+    CohortScores, Config, Core, Fault, Interval, Originals, View,
     distance::{Assessor, PAIRS},
-    runner::{Bound, P, add, bits, histogram_words, mul, scan_words, word},
+    runner::{Bound, P, add, bits, histogram_words, mul, scan_words, spans, word},
     status_word,
 };
 
@@ -15,7 +15,6 @@ const RESULT_WORDS: u64 = 16;
 const S_A: usize = 3;
 const S_G: u32 = 9;
 const S_H: u32 = 10;
-const STAGE: Stage = Stage::Score;
 
 /// Frozen baseline evidence on the device: the baseline frame's incompatible
 /// contact records and witnessed cohort pairs, both in increasing order.
@@ -57,7 +56,6 @@ impl Records<'_> {
     /// return how many are marked.
     fn marked(&self, core: &mut Core, kind: u32) -> Result<u64> {
         core.run(
-            STAGE,
             "record_marks",
             &[(4, &self.scores), (5, &self.marks)],
             P {
@@ -86,7 +84,6 @@ impl Records<'_> {
         ];
         binds.extend(evidence.map(|(buffer, _)| (2, buffer)));
         core.run(
-            STAGE,
             "score_init",
             &binds,
             P {
@@ -96,9 +93,7 @@ impl Records<'_> {
             add(self.contacts, 1)?,
         )?;
         let needed = core.total(&self.marks, self.contacts, &self.scratch)?;
-        let mut first = 0;
-        while first < needed {
-            let chunk = needed.saturating_sub(first).min(PAIRS);
+        for (first, chunk) in spans(0, needed, PAIRS) {
             let registers = P {
                 a: word(first)?,
                 b: word(chunk)?,
@@ -111,12 +106,12 @@ impl Records<'_> {
                 (5, &self.marks),
                 (6, &pairs),
             ];
-            core.run(STAGE, "score_pairs", &binds, registers, self.contacts)?;
+            core.run("score_pairs", &binds, registers, self.contacts)?;
             assessor.assess(core, originals, chunk, tolerances)?;
-            core.run(STAGE, "score_collect", &binds, registers, self.contacts)?;
+            core.run("score_collect", &binds, registers, self.contacts)?;
             core.runner.status("pair assessments")?;
-            first = add(first, chunk)?;
-            tracing::debug!(assessed = first, needed, "gpu-f32 pair assessments");
+            let assessed = add(first, chunk)?;
+            tracing::debug!(assessed, needed, "gpu-f32 pair assessments");
         }
         Ok(needed)
     }
@@ -132,14 +127,11 @@ impl Records<'_> {
         let evidence_count = evidence.map_or(0, |(_, count)| count);
         let rows = add(self.contacts, evidence_count)?;
         let row_space = add(add(rows, rows.div_ceil(REDUCE.saturating_sub(1)))?, 4)?;
-        let row_buffer = core
-            .store
-            .words("ambiguity f32 reduction rows", mul(row_space, ROW_WORDS)?)?;
+        let row_buffer = core.words("ambiguity f32 reduction rows", mul(row_space, ROW_WORDS)?)?;
         let mut binds = vec![(1, self.log), (4, &self.scores), (5, &row_buffer)];
         binds.extend(evidence.map(|(buffer, _)| (2, buffer)));
         core.runner.reset();
         core.run(
-            STAGE,
             "score_rows",
             &binds,
             P {
@@ -154,7 +146,6 @@ impl Records<'_> {
             let blocks = level.div_ceil(REDUCE);
             let next = add(start, level)?;
             core.run(
-                STAGE,
                 "reduce",
                 &[(5, &row_buffer)],
                 P {
@@ -184,16 +175,14 @@ impl Records<'_> {
                 contacting: 0,
             });
         }
-        let store = &mut core.store;
-        let first = store.words("ambiguity f32 cohort pair records", mul(crossing, 3)?)?;
-        let second = store.words("ambiguity f32 cohort pair records", mul(crossing, 3)?)?;
-        let histogram = store.words(
+        let first = core.words("ambiguity f32 cohort pair records", mul(crossing, 3)?)?;
+        let second = core.words("ambiguity f32 cohort pair records", mul(crossing, 3)?)?;
+        let histogram = core.words(
             "ambiguity f32 cohort pair histogram",
             histogram_words(crossing)?,
         )?;
-        let unique = store.words("ambiguity f32 cohort pair marks", add(crossing, 1)?)?;
+        let unique = core.words("ambiguity f32 cohort pair marks", add(crossing, 1)?)?;
         core.run(
-            STAGE,
             "cross_keys",
             &[(4, &self.scores), (5, &self.marks), (6, &first)],
             self.count,
@@ -206,26 +195,18 @@ impl Records<'_> {
             crossing,
             (cohort_bits, cohort_bits),
         )?;
-        let crossing_n = P {
-            n: word(crossing)?,
-            ..P::default()
-        };
+        let crossing_n = P::count(crossing)?;
         let padded = add(crossing, 1)?;
         let keyed = [(4, sorted), (5, &unique)];
-        core.run(Stage::Originals, "key_marks", &keyed, crossing_n, padded)?;
+        core.run("key_marks", &keyed, crossing_n, padded)?;
         let contacting = core.total(&unique, crossing, &self.scratch)?;
-        let flags = core
-            .store
-            .words("ambiguity f32 witness marks", add(contacting, 1)?)?;
+        let flags = core.words("ambiguity f32 witness marks", add(contacting, 1)?)?;
         let marked = [(4, sorted), (5, &unique), (7, &flags)];
-        core.run(STAGE, "witness_marks", &marked, crossing_n, crossing)?;
+        core.run("witness_marks", &marked, crossing_n, crossing)?;
         let witnessed = core.total(&flags, contacting, &self.scratch)?;
         let list = if witnessed > 0 {
-            let list = core
-                .store
-                .words("ambiguity f32 witnessed cohort pairs", mul(witnessed, 2)?)?;
+            let list = core.words("ambiguity f32 witnessed cohort pairs", mul(witnessed, 2)?)?;
             core.run(
-                STAGE,
                 "witness_list",
                 &[(4, sorted), (5, &unique), (6, &list), (7, &flags)],
                 crossing_n,
@@ -254,13 +235,12 @@ impl Evidence {
     ) -> Result<()> {
         self.record_count = records.marked(core, 0)?;
         if self.record_count > 0 {
-            let buffer = core.store.words(
+            let buffer = core.words(
                 "ambiguity f32 baseline evidence",
                 mul(self.record_count, 8)?,
             )?;
             core.store.retain(&buffer);
             core.run(
-                STAGE,
                 "evidence_write",
                 &[(4, &records.scores), (5, &records.marks), (6, &buffer)],
                 records.count,
@@ -299,7 +279,6 @@ impl Evidence {
             let mut binds = vec![(4, list)];
             binds.extend(other.as_ref().map(|other| (5, other)));
             core.run(
-                STAGE,
                 "witness_difference",
                 &binds,
                 P {
@@ -362,12 +341,11 @@ pub(super) fn score(
 ) -> Result<Scored> {
     core.scoped(|core| {
         let tolerances = (config.route_tolerance, config.endpoint_tolerance);
-        let store = &mut core.store;
         let records = Records {
             log,
-            scores: store.words("ambiguity f32 score records", mul(contacts.max(1), 8)?)?,
-            marks: store.words("ambiguity f32 score marks", add(contacts, 1)?)?,
-            scratch: store.words(
+            scores: core.words("ambiguity f32 score records", mul(contacts.max(1), 8)?)?,
+            marks: core.words("ambiguity f32 score marks", add(contacts, 1)?)?,
+            scratch: core.words(
                 "ambiguity f32 score scan sums",
                 scan_words(add(contacts, 1)?.max(histogram_words(contacts)?))?,
             )?,
@@ -394,9 +372,8 @@ pub(super) fn score(
         } else {
             evidence.differences(core, &current)?;
         }
-        let result = core.store.words("ambiguity f32 scores", RESULT_WORDS)?;
+        let result = core.words("ambiguity f32 scores", RESULT_WORDS)?;
         core.run_once(
-            STAGE,
             "score_finish",
             &[(5, &rows), (6, &result)],
             P {
