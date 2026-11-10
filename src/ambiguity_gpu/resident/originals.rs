@@ -4,10 +4,10 @@
 //! and the final membership table.
 use super::super::{Error, Geometry, Result};
 use super::{
-    Config, Core, Fault, Preparation, Stage,
+    Config, Core, Preparation,
     distance::{Assessor, PAIRS},
-    runner::{Bound, P, add, bits, histogram_words, mul, scan_words, step_budget, word},
-    status_word,
+    runner::{Bound, P, add, bits, histogram_words, mul, scan_words, spans, step_budget, word},
+    status_word, unfinished,
 };
 
 /// Largest stored point count of one route; bounds every per-route loop.
@@ -22,7 +22,6 @@ const S_PENDING: usize = 1;
 const S_A: usize = 3;
 const S_B: usize = 4;
 const S_C: usize = 5;
-const STAGE: Stage = Stage::Originals;
 
 /// Device-resident frozen originals.
 pub(super) struct Originals {
@@ -42,13 +41,6 @@ pub(super) struct Originals {
     pub memberships: Vec<[u32; 2]>,
     /// Eligible reservation IDs in increasing order (ordinal order).
     pub ids: Vec<u32>,
-}
-
-fn count(n: u64) -> Result<P> {
-    Ok(P {
-        n: word(n)?,
-        ..P::default()
-    })
 }
 
 struct Canonical {
@@ -73,10 +65,9 @@ fn layout(
     let samples = u64::from(geometry.samples);
     let reservations = u64::from(geometry.reservations);
     core.run(
-        STAGE,
         "route_mark",
         &[(2, &geometry.paths), (4, marks)],
-        count(reservations)?,
+        P::count(reservations)?,
         add(reservations, 1)?,
     )?;
     let route_count = core.total(marks, reservations, scratch)?;
@@ -85,13 +76,10 @@ fn layout(
             "gpu-f32 ambiguity needs an eligible route",
         ));
     }
-    let routes = core
-        .store
-        .words("ambiguity f32 routes", mul(route_count, 16)?)?;
+    let routes = core.words("ambiguity f32 routes", mul(route_count, 16)?)?;
     core.store.promote(&routes);
     core.runner.reset();
     core.run_bounded(
-        STAGE,
         "route_init",
         &[
             (1, frozen),
@@ -117,7 +105,6 @@ fn layout(
     core.runner.status("original route layout")?;
     tracing::debug!(route_count, "gpu-f32 route layout validated");
     core.run(
-        STAGE,
         "point_mark",
         &[(1, frozen), (2, &geometry.paths), (4, marks), (7, ordinals)],
         P {
@@ -143,49 +130,38 @@ fn canonicalize(
     let samples = u64::from(geometry.samples);
     let span = add(samples.max(u64::from(geometry.reservations)), 1)?;
     core.scoped(|core| {
-        let scratch = core
-            .store
-            .words("ambiguity f32 scan sums", scan_words(span)?)?;
-        let marks = core.store.words("ambiguity f32 point marks", span)?;
+        let scratch = core.words("ambiguity f32 scan sums", scan_words(span)?)?;
+        let marks = core.words("ambiguity f32 point marks", span)?;
         let (routes, route_count, distinct) =
             layout(core, geometry, (frozen, ordinals), (&marks, &scratch))?;
-        let deduplicated = core
-            .store
-            .words("ambiguity f32 deduplicated points", mul(distinct, 3)?)?;
+        let deduplicated = core.words("ambiguity f32 deduplicated points", mul(distinct, 3)?)?;
         core.run(
-            STAGE,
             "dedup_write",
             &[(1, frozen), (4, &marks), (5, &deduplicated), (7, ordinals)],
-            count(samples)?,
+            P::count(samples)?,
             samples,
         )?;
-        let routes_n = count(route_count)?;
+        let routes_n = P::count(route_count)?;
         let per_route = [(3, &routes), (4, &marks)];
-        core.run(STAGE, "route_dedup", &per_route, routes_n, route_count)?;
-        let kept = core
-            .store
-            .words("ambiguity f32 vertex marks", add(distinct, 1)?)?;
+        core.run("route_dedup", &per_route, routes_n, route_count)?;
+        let kept = core.words("ambiguity f32 vertex marks", add(distinct, 1)?)?;
         core.run(
-            STAGE,
             "collinear_mark",
             &[(3, &routes), (5, &deduplicated), (6, &kept)],
-            count(distinct)?,
+            P::count(distinct)?,
             add(distinct, 1)?,
         )?;
         let points = core.total(&kept, distinct, &scratch)?;
         tracing::debug!(points, "gpu-f32 collinear vertices removed");
-        let unoriented = core
-            .store
-            .words("ambiguity f32 unoriented points", mul(points, 3)?)?;
+        let unoriented = core.words("ambiguity f32 unoriented points", mul(points, 3)?)?;
         core.run(
-            STAGE,
             "canon_tmp",
             &[(5, &deduplicated), (6, &kept), (7, &unoriented)],
-            count(distinct)?,
+            P::count(distinct)?,
             distinct,
         )?;
         let ranges = [(3, &routes), (6, &kept)];
-        core.run(STAGE, "route_canon", &ranges, routes_n, route_count)?;
+        core.run("route_canon", &ranges, routes_n, route_count)?;
         core.runner.reset();
         let oriented = [(3, &routes), (7, &unoriented)];
         // Each route compares its own canonical points from both ends.
@@ -193,26 +169,16 @@ fn canonicalize(
             each: u64::from(ROUTE_LIMIT),
             total: add(points, route_count)?,
         };
-        core.run_bounded(
-            STAGE,
-            "route_orient",
-            &oriented,
-            routes_n,
-            route_count,
-            orient,
-        )?;
+        core.run_bounded("route_orient", &oriented, routes_n, route_count, orient)?;
         let status = core.runner.status("canonical orientation")?;
-        let canon = core
-            .store
-            .words("ambiguity f32 canonical points", mul(points, 2)?)?;
-        let owners = core.store.words("ambiguity f32 canonical owners", points)?;
+        let canon = core.words("ambiguity f32 canonical points", mul(points, 2)?)?;
+        let owners = core.words("ambiguity f32 canonical owners", points)?;
         core.store.promote(&canon);
         core.store.promote(&owners);
         core.run(
-            STAGE,
             "canon_write",
             &[(3, &routes), (4, &canon), (5, &owners), (7, &unoriented)],
-            count(points)?,
+            P::count(points)?,
             points,
         )?;
         Ok(Canonical {
@@ -248,12 +214,11 @@ impl Naming {
         let [histogram, scratch] = &self.sorter;
         let (sorted, _) = core.sort((first, second), (histogram, scratch), n, key_bits)?;
         core.run(
-            STAGE,
             "key_marks",
             &[(4, sorted), (5, &self.marks)],
             P {
                 a: u32::from(high_only),
-                ..count(n)?
+                ..P::count(n)?
             },
             add(n, 1)?,
         )?;
@@ -272,18 +237,17 @@ fn names(
 ) -> Result<wgpu::Buffer> {
     let points = canonical.points;
     let [first, _] = &naming.records;
-    let mut current = core.store.words("ambiguity f32 block names", points)?;
-    let mut next = core.store.words("ambiguity f32 block names", points)?;
-    let all = count(points)?;
+    let mut current = core.words("ambiguity f32 block names", points)?;
+    let mut next = core.words("ambiguity f32 block names", points)?;
+    let all = P::count(points)?;
     let entries = [(4, &canonical.canon), (5, first)];
-    core.run(STAGE, "name_entries0", &entries, all, points)?;
+    core.run("name_entries0", &entries, all, points)?;
     let mut key_bits = (32, 32);
     let mut level = 0_u32;
     loop {
         let sorted = naming.rank(core, points, key_bits, false)?;
         tracing::debug!(level, "gpu-f32 block naming level");
         core.run(
-            STAGE,
             "name_write",
             &[(4, &naming.marks), (5, sorted), (6, &current)],
             all,
@@ -294,7 +258,6 @@ fn names(
         }
         level = level.saturating_add(1);
         core.run(
-            STAGE,
             "name_entries",
             &[
                 (3, &canonical.routes),
@@ -315,30 +278,23 @@ fn names(
 fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(wgpu::Buffer, u64)> {
     let (points, route_count) = (canonical.points, canonical.route_count);
     core.scoped(|core| {
-        let records = |core: &mut Core| {
-            core.store
-                .words("ambiguity f32 sort records", mul(points, 3)?)
-        };
+        let records = |core: &mut Core| core.words("ambiguity f32 sort records", mul(points, 3)?);
         let naming = Naming {
             records: [records(core)?, records(core)?],
             sorter: [
-                core.store
-                    .words("ambiguity f32 sort histogram", histogram_words(points)?)?,
-                core.store.words(
+                core.words("ambiguity f32 sort histogram", histogram_words(points)?)?,
+                core.words(
                     "ambiguity f32 scan sums",
                     scan_words(add(points, 1)?.max(histogram_words(points)?))?,
                 )?,
             ],
-            marks: core
-                .store
-                .words("ambiguity f32 key marks", add(points, 1)?)?,
+            marks: core.words("ambiguity f32 key marks", add(points, 1)?)?,
         };
         let name_bits = bits(add(points, 2)?);
         let named = names(core, canonical, &naming, name_bits)?;
-        let routes_n = count(route_count)?;
+        let routes_n = P::count(route_count)?;
         let [first, _] = &naming.records;
         core.run(
-            STAGE,
             "route_entries",
             &[(3, &canonical.routes), (4, &named), (5, first)],
             routes_n,
@@ -346,7 +302,7 @@ fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(w
         )?;
         let sorted = naming.rank(core, route_count, (bits(reservations), name_bits), true)?;
         let unique = core.word(&naming.marks, route_count)?;
-        let words = core.store.words(
+        let words = core.words(
             "ambiguity f32 order, representatives and knots",
             add(mul(route_count, 2)?, points)?,
         )?;
@@ -356,7 +312,6 @@ fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(w
             ..routes_n
         };
         core.run(
-            STAGE,
             "route_place",
             &[
                 (3, &canonical.routes),
@@ -368,7 +323,7 @@ fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(w
             route_count,
         )?;
         let representatives = [(3, &canonical.routes), (6, &words)];
-        core.run(STAGE, "route_rep", &representatives, placed, route_count)?;
+        core.run("route_rep", &representatives, placed, route_count)?;
         Ok((words, unique))
     })
 }
@@ -376,9 +331,7 @@ fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(w
 /// Simplified knots of every unique route.
 fn simplify(core: &mut Core, originals: &Originals, unique: u64, sigma: f32) -> Result<()> {
     core.scoped(|core| {
-        let state = core
-            .store
-            .words("ambiguity f32 simplifier state", mul(unique, 4)?)?;
+        let state = core.words("ambiguity f32 simplifier state", mul(unique, 4)?)?;
         // Every route advances at most `steps` vertex examinations per dispatch.
         let steps = step_budget(unique, 1).min(SIMPLIFY_STEPS);
         // A resource limit, not a proven bound: 16 examinations per stored
@@ -387,7 +340,6 @@ fn simplify(core: &mut Core, originals: &Originals, unique: u64, sigma: f32) -> 
         for round in 0..limit {
             core.runner.reset();
             core.run_bounded(
-                STAGE,
                 "simplify_step",
                 &[
                     (3, &originals.routes),
@@ -412,10 +364,7 @@ fn simplify(core: &mut Core, originals: &Originals, unique: u64, sigma: f32) -> 
                 return Ok(());
             }
         }
-        Err(Error::Fault(Fault::Rounds {
-            stage: "original simplification",
-            limit,
-        }))
+        Err(unfinished("original simplification", limit))
     })
 }
 
@@ -437,9 +386,7 @@ fn endpoint_pass(
 ) -> Result<()> {
     // Every route tests at most `width` earlier routes per dispatch.
     let width = step_budget(unique, 1).min(PARTNERS);
-    let mut first = 0;
-    while first < unique {
-        let end = add(first, width)?.min(unique);
+    for (first, count) in spans(0, unique, width) {
         let mut binds = vec![
             (3, &originals.routes),
             (4, &originals.canon),
@@ -448,13 +395,12 @@ fn endpoint_pass(
         ];
         binds.extend(list.map(|list| (7, list)));
         core.run_bounded(
-            STAGE,
             entry,
             &binds,
             P {
                 n: word(unique)?,
                 a: word(first)?,
-                b: word(end)?,
+                b: word(add(first, count)?)?,
                 c: originals.route_count,
                 x: tolerance,
                 ..P::default()
@@ -462,7 +408,6 @@ fn endpoint_pass(
             unique,
             Bound::Each(add(width, 1)?),
         )?;
-        first = end;
     }
     Ok(())
 }
@@ -479,16 +424,12 @@ fn candidates(
     if unique >= 1 << 31 {
         return Err(Error::SizeOverflow);
     }
-    let offsets = core
-        .store
-        .words("ambiguity f32 endpoint candidate offsets", add(unique, 1)?)?;
+    let offsets = core.words("ambiguity f32 endpoint candidate offsets", add(unique, 1)?)?;
     let scale = (unique, config.endpoint_tolerance);
     endpoint_pass(core, originals, "endpoint_count", (&offsets, None), scale)?;
     let total = core.count("endpoint candidate count", &offsets, unique, scratch)?;
     tracing::info!(candidates = total, "gpu-f32 endpoint candidates counted");
-    let list = core
-        .store
-        .words("ambiguity f32 endpoint candidates", total.max(1))?;
+    let list = core.words("ambiguity f32 endpoint candidates", total.max(1))?;
     endpoint_pass(
         core,
         originals,
@@ -496,9 +437,7 @@ fn candidates(
         (&offsets, Some(&list)),
         scale,
     )?;
-    let mut first = 0;
-    while first < total {
-        let chunk = total.saturating_sub(first).min(PAIRS);
+    for (first, chunk) in spans(0, total, PAIRS) {
         let registers = P {
             n: word(chunk)?,
             a: word(first)?,
@@ -508,7 +447,6 @@ fn candidates(
         };
         let pairs = assessor.pairs.clone();
         core.run(
-            STAGE,
             "cohort_pairs",
             &[
                 (4, &list),
@@ -526,9 +464,8 @@ fn candidates(
             (config.route_tolerance, config.endpoint_tolerance),
         )?;
         let collected = [(4, &list), (7, &pairs)];
-        core.run(STAGE, "cohort_collect", &collected, registers, chunk)?;
+        core.run("cohort_collect", &collected, registers, chunk)?;
         core.runner.status("cohort assessments")?;
-        first = add(first, chunk)?;
     }
     Ok(Candidates {
         offsets,
@@ -553,7 +490,6 @@ fn first_fit(
     loop {
         core.runner.reset();
         core.run_once(
-            STAGE,
             "first_fit",
             &[(4, &candidates.list), (5, &candidates.offsets), (6, state)],
             P {
@@ -572,10 +508,7 @@ fn first_fit(
         }
         round = add(round, 1)?;
         if round > limit {
-            return Err(Error::Fault(Fault::Rounds {
-                stage: "cohort assignment",
-                limit,
-            }));
+            return Err(unfinished("cohort assignment", limit));
         }
     }
 }
@@ -590,38 +523,27 @@ fn cohorts(
 ) -> Result<()> {
     let route_count = u64::from(originals.route_count);
     core.scoped(|core| {
-        let scratch = core
-            .store
-            .words("ambiguity f32 scan sums", scan_words(add(unique, 1)?)?)?;
+        let scratch = core.words("ambiguity f32 scan sums", scan_words(add(unique, 1)?)?)?;
         let candidates = candidates(core, originals, assessor, &scratch, (unique, config))?;
-        let state = core
-            .store
-            .words("ambiguity f32 cohort state", add(mul(unique, 3)?, 4)?)?;
+        let state = core.words("ambiguity f32 cohort state", add(mul(unique, 3)?, 4)?)?;
         first_fit(core, &candidates, &state, unique)?;
-        let flags = core
-            .store
-            .words("ambiguity f32 cohort marks", add(unique, 1)?)?;
+        let flags = core.words("ambiguity f32 cohort marks", add(unique, 1)?)?;
         core.run(
-            STAGE,
             "cohort_flags",
             &[(6, &state), (7, &flags)],
-            count(unique)?,
+            P::count(unique)?,
             add(unique, 1)?,
         )?;
         let cohort_count = core.total(&flags, unique, &scratch)?;
-        let routes_n = count(route_count)?;
+        let routes_n = P::count(route_count)?;
         core.run(
-            STAGE,
             "cohort_write",
             &[(3, &originals.routes), (6, &state), (7, &flags)],
             routes_n,
             route_count,
         )?;
-        let table = core
-            .store
-            .words("ambiguity f32 memberships", mul(route_count, 2)?)?;
+        let table = core.words("ambiguity f32 memberships", mul(route_count, 2)?)?;
         core.run(
-            STAGE,
             "membership",
             &[(3, &originals.routes), (6, &originals.words), (7, &table)],
             routes_n,
@@ -655,16 +577,12 @@ pub(super) fn prepare(
             "gpu-f32 ambiguity geometry buffers are smaller than their counts",
         ));
     }
-    let frozen = core
-        .store
-        .words("ambiguity f32 frozen baseline points", mul(samples, 3)?)?;
+    let frozen = core.words("ambiguity f32 frozen baseline points", mul(samples, 3)?)?;
     // An actual device copy: later mutation of the renderer's points cannot
     // reach the originals.
     core.runner
         .copy(&geometry.points, &frozen, mul(samples, 12)?);
-    let ordinals = core
-        .store
-        .words("ambiguity f32 route ordinals", reservations.max(1))?;
+    let ordinals = core.words("ambiguity f32 route ordinals", reservations.max(1))?;
     // The canonical owners are only needed for naming.
     let (canonical, words, unique) = core.scoped(|core| {
         let canonical = canonicalize(core, geometry, &frozen, &ordinals)?;

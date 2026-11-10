@@ -4,10 +4,12 @@
 //! every geometric decision is made on the device.
 use super::super::{Error, Geometry, Limit, Protocol, Result};
 use super::{
-    Config, Core, Fault, FrameStatistics, Originals, Stage,
+    Config, Core, Fault, FrameStatistics, Originals,
     originals::ROUTE_LIMIT,
-    runner::{Bind, Bound, Host, P, add, bits, histogram_words, mul, scan_words, slice_size, word},
-    status_word,
+    runner::{
+        Bind, Bound, Host, P, add, bits, histogram_words, mul, scan_words, slice_size, spans, word,
+    },
+    status_word, unfinished,
 };
 
 /// Work items per dispatch; each examines at most 64 partner entries.
@@ -78,7 +80,6 @@ fn positive(
     let route_count = u64::from(originals.route_count);
     core.runner.reset();
     core.run(
-        Stage::Frame,
         "frame_mark",
         &[
             (1, points),
@@ -97,7 +98,6 @@ fn positive(
     core.runner.status("frame points")?;
     core.scan(marks, (0, add(samples, 1)?), scratch)?;
     core.run_bounded(
-        Stage::Frame,
         "frame_counts",
         &[
             (1, points),
@@ -132,28 +132,19 @@ fn tables(
     let samples = u64::from(geometry.samples);
     let route_count = u64::from(originals.route_count);
     core.scoped(|core| {
-        let scratch = core
-            .store
-            .words("ambiguity f32 scan sums", scan_words(add(samples, 1)?)?)?;
-        let marks = core
-            .store
-            .words("ambiguity f32 positive marks", add(samples, 1)?)?;
-        let offsets = core
-            .store
-            .words("ambiguity f32 segment offsets", add(route_count, 1)?)?;
+        let scratch = core.words("ambiguity f32 scan sums", scan_words(add(samples, 1)?)?)?;
+        let marks = core.words("ambiguity f32 positive marks", add(samples, 1)?)?;
+        let offsets = core.words("ambiguity f32 segment offsets", add(route_count, 1)?)?;
         let buffers = (&marks, &offsets, &scratch);
         let segment_count = positive(core, originals, geometry, points, buffers)?;
-        let segments = core.store.words(
+        let segments = core.words(
             "ambiguity f32 positive segments",
             mul(segment_count.max(1), 6)?,
         )?;
-        let routes = core
-            .store
-            .words("ambiguity f32 frame routes", mul(route_count, 4)?)?;
+        let routes = core.words("ambiguity f32 frame routes", mul(route_count, 4)?)?;
         core.store.promote(&segments);
         core.store.promote(&routes);
         core.run(
-            Stage::Frame,
             "frame_segments",
             &[
                 (1, points),
@@ -176,7 +167,6 @@ fn tables(
         };
         core.runner.reset();
         core.run(
-            Stage::Frame,
             "frame_routes",
             &[
                 (1, points),
@@ -193,14 +183,7 @@ fn tables(
             each: u64::from(ROUTE_LIMIT),
             total: add(segment_count, route_count)?,
         };
-        core.run_bounded(
-            Stage::Frame,
-            "frame_short",
-            &lengths,
-            routes_n,
-            route_count,
-            short,
-        )?;
+        core.run_bounded("frame_short", &lengths, routes_n, route_count, short)?;
         let status = core.runner.status("frame tables")?;
         statistics.collapsed_paths = status_word(&status, S_A);
         statistics.short_paths = status_word(&status, S_B);
@@ -256,16 +239,14 @@ fn footprints(
     let cells = mul(u64::from(registers.h), u64::from(registers.h))?;
     let counts = add(mul(cells, 2)?, 1)?;
     let cursor = add(counts, route_count)?;
-    let store = &mut core.store;
-    let grid = store.words("ambiguity f32 grid", add(cursor, 1)?)?;
-    let offsets = store.words("ambiguity f32 footprint offsets", add(segment_count, 1)?)?;
-    let scratch = store.words(
+    let grid = core.words("ambiguity f32 grid", add(cursor, 1)?)?;
+    let offsets = core.words("ambiguity f32 footprint offsets", add(segment_count, 1)?)?;
+    let scratch = core.words(
         "ambiguity f32 scan sums",
         scan_words(add(segment_count.max(cells), 1)?)?,
     )?;
     core.runner.reset();
     core.run(
-        Stage::Broad,
         "foot_count",
         &[(1, &tables.segments), (6, &offsets)],
         P {
@@ -275,11 +256,10 @@ fn footprints(
         add(segment_count, 1)?,
     )?;
     let total = core.count("segment footprint count", &offsets, segment_count, &scratch)?;
-    let store = &mut core.store;
-    let footprint = store.words("ambiguity f32 footprint", mul(total.max(1), 2)?)?;
-    let entries = store.words("ambiguity f32 cell entries", total.max(1))?;
-    let weights = store.words("ambiguity f32 item offsets", add(total, 1)?)?;
-    let wide = store.words(
+    let footprint = core.words("ambiguity f32 footprint", mul(total.max(1), 2)?)?;
+    let entries = core.words("ambiguity f32 cell entries", total.max(1))?;
+    let weights = core.words("ambiguity f32 item offsets", add(total, 1)?)?;
+    let wide = core.words(
         "ambiguity f32 footprint scan sums",
         scan_words(add(total, 1)?)?,
     )?;
@@ -294,20 +274,17 @@ fn footprints(
         (4, &footprint),
         (6, &offsets),
     ];
-    core.run(Stage::Broad, "foot_emit", &emitted, footprint_n, total)?;
+    core.run("foot_emit", &emitted, footprint_n, total)?;
     core.scan(&grid, (0, add(cells, 1)?), &scratch)?;
     let filled = [(3, &grid), (4, &footprint), (5, &entries)];
-    core.run(Stage::Broad, "cell_fill", &filled, footprint_n, total)?;
+    core.run("cell_fill", &filled, footprint_n, total)?;
     let weighed = [(3, &grid), (4, &footprint), (6, &weights)];
     let padded = add(total, 1)?;
-    core.run(Stage::Broad, "item_weights", &weighed, footprint_n, padded)?;
+    core.run("item_weights", &weighed, footprint_n, padded)?;
     // The total is validated before any offset is used.
     core.count("work-item count", &weights, total, &wide)?;
-    let route_items = core
-        .store
-        .words("ambiguity f32 route items", add(route_count, 1)?)?;
+    let route_items = core.words("ambiguity f32 route items", add(route_count, 1)?)?;
     core.run(
-        Stage::Broad,
         "route_items",
         &[
             (2, &tables.routes),
@@ -362,11 +339,8 @@ impl Broad {
             (6, &self.weights),
         ];
         binds.extend(output.map(|output| (7, output)));
-        let mut item = first;
-        while item < end {
-            let slice = end.saturating_sub(item).min(ITEM_SLICE);
+        for (item, slice) in spans(first, end, ITEM_SLICE) {
             core.run(
-                Stage::Broad,
                 entry,
                 &binds,
                 P {
@@ -376,7 +350,6 @@ impl Broad {
                 },
                 slice,
             )?;
-            item = add(item, slice)?;
         }
         Ok(())
     }
@@ -544,15 +517,14 @@ fn batch_capacity(available: u64, storage: u64) -> Result<Capacity> {
 impl Workspace {
     fn new(core: &mut Core, cells: u64) -> Result<Self> {
         let [records, chains, links, covered, state, marks, scratch] = workspace_words(cells)?;
-        let store = &mut core.store;
         Ok(Self {
-            records: store.words("ambiguity f32 cell records", records)?,
-            chains: store.words("ambiguity f32 cell chains", chains)?,
-            links: store.words("ambiguity f32 cell links", links)?,
-            covered: store.words("ambiguity f32 covered ends", covered)?,
-            state: store.words("ambiguity f32 labels, sums and buckets", state)?,
-            marks: store.words("ambiguity f32 component marks", marks)?,
-            scratch: store.words("ambiguity f32 cell scan sums", scratch)?,
+            records: core.words("ambiguity f32 cell records", records)?,
+            chains: core.words("ambiguity f32 cell chains", chains)?,
+            links: core.words("ambiguity f32 cell links", links)?,
+            covered: core.words("ambiguity f32 covered ends", covered)?,
+            state: core.words("ambiguity f32 labels, sums and buckets", state)?,
+            marks: core.words("ambiguity f32 component marks", marks)?,
+            scratch: core.words("ambiguity f32 cell scan sums", scratch)?,
         })
     }
 }
@@ -713,24 +685,20 @@ impl Run<'_> {
         let mut round = 0;
         loop {
             core.runner.reset();
-            let mut first = 0;
-            while first < self.cells {
-                let end = add(first, slice)?.min(self.cells);
+            for (first, count) in spans(0, self.cells, slice) {
                 core.run_bounded(
-                    Stage::Contact,
                     entry,
                     binds,
                     P {
                         a: word(first)?,
-                        b: word(end)?,
+                        b: word(add(first, count)?)?,
                         c: WALK_STEPS,
                         g: u32::from(round == 0),
                         ..registers
                     },
-                    end.saturating_sub(first),
+                    count,
                     Bound::Each(units),
                 )?;
-                first = end;
             }
             let status = core.runner.status(stage)?;
             if status_word(&status, S_PENDING) == 0 {
@@ -738,10 +706,7 @@ impl Run<'_> {
             }
             round = add(round, 1)?;
             if round > WALK_ROUNDS {
-                return Err(Error::Fault(Fault::Rounds {
-                    stage,
-                    limit: WALK_ROUNDS,
-                }));
+                return Err(unfinished(stage, WALK_ROUNDS));
             }
         }
     }
@@ -755,7 +720,7 @@ impl Run<'_> {
             (3, &workspace.state),
             (4, &workspace.chains),
         ];
-        core.run(Stage::Contact, "chain", &chained, self.keys, self.cells)?;
+        core.run("chain", &chained, self.keys, self.cells)?;
         self.walk(
             core,
             ("links", "free-space cell joins"),
@@ -777,7 +742,7 @@ impl Run<'_> {
         loop {
             core.runner.reset();
             for _ in 0..ROUNDS_PER_CHECK {
-                core.run(Stage::Contact, "label_round", &binds, self.keys, self.cells)?;
+                core.run("label_round", &binds, self.keys, self.cells)?;
             }
             rounds = add(rounds, ROUNDS_PER_CHECK)?;
             let status = core.runner.status("contact components")?;
@@ -785,10 +750,7 @@ impl Run<'_> {
                 break;
             }
             if rounds >= ROUND_LIMIT {
-                return Err(Error::Fault(Fault::Rounds {
-                    stage: "contact components",
-                    limit: ROUND_LIMIT,
-                }));
+                return Err(unfinished("contact components", ROUND_LIMIT));
             }
         }
         statistics.label_rounds = add(statistics.label_rounds, rounds)?;
@@ -820,7 +782,7 @@ impl Run<'_> {
         )?;
         let marked = [(3, &workspace.state), (6, &workspace.marks)];
         let padded = add(self.cells, 1)?;
-        core.run(Stage::Contact, "sustained", &marked, self.keys, padded)?;
+        core.run("sustained", &marked, self.keys, padded)?;
         core.total(&workspace.marks, self.cells, &workspace.scratch)
     }
 
@@ -833,14 +795,12 @@ impl Run<'_> {
         let workspace = self.workspace;
         core.scoped(|core| {
             let [first, second, histogram, scratch, unique] = logging_words(components)?;
-            let store = &mut core.store;
-            let first = store.words("ambiguity f32 component pairs", first)?;
-            let second = store.words("ambiguity f32 component pairs", second)?;
-            let histogram = store.words("ambiguity f32 component pair histogram", histogram)?;
-            let scratch = store.words("ambiguity f32 component pair scan sums", scratch)?;
-            let unique = store.words("ambiguity f32 component pair marks", unique)?;
+            let first = core.words("ambiguity f32 component pairs", first)?;
+            let second = core.words("ambiguity f32 component pairs", second)?;
+            let histogram = core.words("ambiguity f32 component pair histogram", histogram)?;
+            let scratch = core.words("ambiguity f32 component pair scan sums", scratch)?;
+            let unique = core.words("ambiguity f32 component pair marks", unique)?;
             core.run(
-                Stage::Contact,
                 "sustained_pairs",
                 &[(1, &workspace.records), (6, &workspace.marks), (7, &first)],
                 self.keys,
@@ -860,13 +820,7 @@ impl Run<'_> {
             };
             let keyed = [(4, sorted), (5, &unique)];
             let padded = add(components, 1)?;
-            core.run(
-                Stage::Originals,
-                "key_marks",
-                &keyed,
-                P { a: 0, ..count },
-                padded,
-            )?;
+            core.run("key_marks", &keyed, P { a: 0, ..count }, padded)?;
             let contacts = core.total(&unique, components, &scratch)?;
             let total = add(logged, contacts)?;
             if total > log.capacity {
@@ -877,7 +831,7 @@ impl Run<'_> {
                 });
             }
             let written = [(4, sorted), (5, &unique), (7, log.buffer)];
-            core.run(Stage::Contact, "pair_out", &written, count, components)?;
+            core.run("pair_out", &written, count, components)?;
             Ok(contacts)
         })
     }
