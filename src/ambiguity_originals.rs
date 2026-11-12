@@ -1,77 +1,52 @@
-//! Canonical original routes and scoped, lazily retained distance preparations.
+//! Canonical original routes and their lazily retained distance preparations.
+mod similarity;
+
 use crate::{
-    ambiguity_similarity::{self, Config},
+    geometry::Snapshot,
     weak_frechet::{Budget, Error},
 };
+use similarity::Prepared;
+pub use similarity::{Assessment, Config};
 use std::{cmp::Ordering, mem::size_of};
 
-pub struct Route<'a> {
-    pub edge_id: u32,
-    pub points: &'a [[f32; 2]],
-}
 #[derive(Clone, Copy)]
-pub(crate) struct Canonical {
-    pub(crate) id: u32,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
+struct Canonical {
+    id: u32,
+    start: usize,
+    end: usize,
 }
-#[derive(Clone, Copy)]
-pub struct Originals<'a> {
-    pub(crate) points: &'a [[f32; 2]],
-    pub(crate) routes: &'a [Canonical],
-    pub closed_route_count: usize,
-    pub unique_route_count: usize,
+/// Geometry-ordered canonical originals owning their certified preparations.
+///
+/// All storage is persistent on the evaluator's ledger. Preparations are made on
+/// demand with one sigma and remain until this owner drops.
+pub struct Originals {
+    points: Vec<[f32; 2]>,
+    routes: Vec<Canonical>,
+    preparations: Vec<Option<Prepared>>,
+    closed_route_count: usize,
+    unique_route_count: usize,
+    constant_route_count: usize,
 }
-impl<'a> Originals<'a> {
-    #[must_use]
-    pub fn canonical_points(&self, index: usize) -> Option<&'a [[f32; 2]]> {
-        let route = self.routes.get(index)?;
-        self.points.get(route.start..route.end)
-    }
-    #[must_use]
-    pub fn edge_id(&self, index: usize) -> Option<u32> {
-        self.routes.get(index).map(|route| route.id)
-    }
-}
-/// Lend geometry-ordered canonical originals and preparations under one ledger.
-/// # Errors
-/// Invalid geometry, duplicate IDs, configuration or exhausted resources abort.
-pub fn with_originals<R>(
-    input: &[Route<'_>],
-    config: &Config,
-    budget: &mut Budget,
-    operation: impl for<'a> FnOnce(
-        Originals<'a>,
-        &mut [Option<ambiguity_similarity::Prepared<'a>>],
-        &mut Budget,
-    ) -> Result<R, Error>,
-) -> Result<R, Error> {
-    validate_config(config)?;
-    let mut count = 0usize;
-    for route in input {
-        budget.charge(1)?;
-        count = count
-            .checked_add(route.points.len())
-            .ok_or(Error::SizeOverflow)?;
-    }
-    let bytes = storage::<[f32; 2]>(count)?
-        .checked_add(storage::<Canonical>(input.len())?)
-        .and_then(|n| {
-            n.checked_add(storage::<Option<ambiguity_similarity::Prepared<'_>>>(input.len()).ok()?)
-        })
-        .ok_or(Error::SizeOverflow)?;
-    budget.reserve(bytes)?;
-    let result = (|| {
-        let mut points = allocated(count)?;
-        let mut routes = allocated(input.len())?;
-        let closed_route_count = canonicalize(input, &mut points, &mut routes, budget)?;
-        routes.sort_unstable_by_key(|r| r.id);
-        if routes
-            .windows(2)
-            .any(|r| r.first().map(|x| x.id) == r.last().map(|x| x.id))
-        {
-            return Err(Error::InvalidCurve);
+impl Originals {
+    /// Canonicalize every snapshot route. Snapshot IDs are unique and its
+    /// samples are finite, with at least two per route.
+    /// # Errors
+    /// Exhausted resources or size overflow.
+    pub fn new(snapshot: &Snapshot<'_>, budget: &mut Budget) -> Result<Self, Error> {
+        let mut count = 0usize;
+        for (_, points) in snapshot.edges() {
+            budget.charge(1)?;
+            count = count.checked_add(points.len()).ok_or(Error::SizeOverflow)?;
         }
+        let routes = snapshot.layout().edge_count();
+        let bytes = storage::<[f32; 2]>(count)?
+            .checked_add(storage::<Canonical>(routes)?)
+            .and_then(|n| n.checked_add(storage::<Option<Prepared>>(routes).ok()?))
+            .ok_or(Error::SizeOverflow)?;
+        budget.reserve(bytes)?;
+        let mut points = allocated(count)?;
+        let mut routes = allocated(routes)?;
+        let closed_route_count = canonicalize(snapshot, &mut points, &mut routes, budget)?;
         routes.sort_unstable_by(|a, b| {
             compare(
                 points.get(a.start..a.end).unwrap_or_default(),
@@ -80,6 +55,7 @@ pub fn with_originals<R>(
             .then(a.id.cmp(&b.id))
         });
         let mut unique_route_count = 0usize;
+        let mut constant_route_count = 0usize;
         for (i, route) in routes.iter().enumerate() {
             budget.charge(1)?;
             let curve = points
@@ -95,27 +71,90 @@ pub fn with_originals<R>(
                     .checked_add(1)
                     .ok_or(Error::SizeOverflow)?;
             }
+            if curve.len() == 1 {
+                constant_route_count = constant_route_count
+                    .checked_add(1)
+                    .ok_or(Error::SizeOverflow)?;
+            }
         }
-        let mut preparations = allocated(input.len())?;
-        budget.charge(u64::try_from(input.len()).map_err(|_| Error::SizeOverflow)?)?;
-        preparations.resize_with(input.len(), || None);
-        let result = operation(
-            Originals {
-                points: &points,
-                routes: &routes,
-                closed_route_count,
-                unique_route_count,
-            },
-            &mut preparations,
-            budget,
-        );
-        for prepared in preparations.into_iter().flatten() {
-            prepared.release(budget)?;
+        let mut preparations = allocated(routes.len())?;
+        budget.charge(u64::try_from(routes.len()).map_err(|_| Error::SizeOverflow)?)?;
+        preparations.resize_with(routes.len(), || None);
+        Ok(Self {
+            points,
+            routes,
+            preparations,
+            closed_route_count,
+            unique_route_count,
+            constant_route_count,
+        })
+    }
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.routes.len()
+    }
+    #[must_use]
+    pub fn edge_id(&self, index: usize) -> Option<u32> {
+        self.routes.get(index).map(|route| route.id)
+    }
+    #[must_use]
+    pub const fn closed_route_count(&self) -> usize {
+        self.closed_route_count
+    }
+    #[must_use]
+    pub const fn unique_route_count(&self) -> usize {
+        self.unique_route_count
+    }
+    #[must_use]
+    pub const fn constant_route_count(&self) -> usize {
+        self.constant_route_count
+    }
+    fn canonical_points(&self, index: usize) -> Result<&[[f32; 2]], Error> {
+        let route = self.routes.get(index).ok_or(Error::InvalidIndex)?;
+        self.points
+            .get(route.start..route.end)
+            .ok_or(Error::InvalidIndex)
+    }
+    /// Assess canonical routes `a` and `b`, passing the later canonical route first.
+    ///
+    /// Missing preparations of `a`, then `b`, are retained on the ledger even if
+    /// a later step fails. `config` must be the configuration of every assessment.
+    /// # Errors
+    /// Invalid indices, size overflow and exhausted shared resources.
+    pub fn assess(
+        &mut self,
+        a: usize,
+        b: usize,
+        config: &Config,
+        budget: &mut Budget,
+    ) -> Result<Assessment, Error> {
+        for index in [a, b] {
+            budget.charge(1)?;
+            if self
+                .preparations
+                .get(index)
+                .ok_or(Error::InvalidIndex)?
+                .is_none()
+            {
+                let prepared =
+                    similarity::prepare(self.canonical_points(index)?, config.sigma, budget)?;
+                *self
+                    .preparations
+                    .get_mut(index)
+                    .ok_or(Error::InvalidIndex)? = Some(prepared);
+            }
         }
-        result
-    })();
-    budget.release(bytes)?;
-    result
+        let route = |index: usize| -> Result<(&[[f32; 2]], &Prepared), Error> {
+            Ok((
+                self.canonical_points(index)?,
+                self.preparations
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or(Error::InvalidIndex)?,
+            ))
+        };
+        similarity::assess(route(a.max(b))?, route(a.min(b))?, config, budget)
+    }
 }
 fn compare(a: &[[f32; 2]], b: &[[f32; 2]]) -> Ordering {
     for (p, q) in a.iter().zip(b) {
@@ -175,22 +214,16 @@ fn allocated<T>(count: usize) -> Result<Vec<T>, Error> {
     Ok(values)
 }
 fn canonicalize(
-    input: &[Route<'_>],
+    snapshot: &Snapshot<'_>,
     points: &mut Vec<[f32; 2]>,
     routes: &mut Vec<Canonical>,
     budget: &mut Budget,
 ) -> Result<usize, Error> {
     let mut closed = 0usize;
-    for route in input {
+    for (id, route) in snapshot.edges() {
         let start = points.len();
-        if route.points.is_empty() {
-            return Err(Error::InvalidCurve);
-        }
-        for &point in route.points {
+        for &point in route {
             budget.charge(1)?;
-            if point.iter().any(|x| !x.is_finite()) {
-                return Err(Error::InvalidCurve);
-            }
             let point = point.map(|x| if x == 0.0 { 0.0 } else { x });
             if points.len() > start && points.last() == Some(&point) {
                 continue;
@@ -234,23 +267,11 @@ fn canonicalize(
             curve.reverse();
         }
         routes.push(Canonical {
-            id: route.edge_id,
+            id,
             start,
             end: points.len(),
         });
     }
 
     Ok(closed)
-}
-fn validate_config(config: &Config) -> Result<(), Error> {
-    if !config.route_tolerance.is_finite()
-        || config.route_tolerance <= 0.0
-        || !config.endpoint_tolerance.is_finite()
-        || config.endpoint_tolerance <= 0.0
-        || !config.sigma.is_finite()
-        || config.sigma < 0.0
-    {
-        return Err(Error::InvalidCurve);
-    }
-    Ok(())
 }

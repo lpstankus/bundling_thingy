@@ -7,39 +7,17 @@
 //! Inconsistent projection existence or endpoint membership returns an error.
 //! Workspace estimates count requested capacities, including both buffers during
 //! growth. Allocator overhead and caller-owned candidate storage are excluded.
-use crate::weak_frechet::{Budget, Error as BudgetError};
-use std::{fmt, mem::size_of};
-
-/// Contact-specific failures preserve the shared kernel's resource errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Error {
-    Budget(BudgetError),
-    InvalidParameters,
-    NumericalFailure,
-    IncompleteCandidates,
-}
-impl From<BudgetError> for Error {
-    fn from(value: BudgetError) -> Self {
-        Self::Budget(value)
-    }
-}
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Budget(error) => error.fmt(formatter),
-            Self::InvalidParameters => formatter.write_str("contact requires finite nonnegative radius with representable square and finite positive minimum length"),
-            Self::NumericalFailure => formatter.write_str("contact geometry exceeds f64 arc precision or has inconsistent free-space predicates"),
-            Self::IncompleteCandidates => formatter.write_str("contact candidates omit a nonempty neighboring cell"),
-        }
-    }
-}
-impl std::error::Error for Error {}
+//! Radius and minimum come from a validated `ambiguity::Config`.
+use crate::{
+    ambiguity::Cause as Error,
+    weak_frechet::{Error as BudgetError, Storage, Workspace},
+};
 
 type Point = [f64; 2];
 #[derive(Clone, Copy)]
-struct Segment {
-    start: Point,
-    end: Point,
+pub struct Segment {
+    pub start: Point,
+    pub end: Point,
     length: f64,
 }
 #[derive(Clone, Copy)]
@@ -115,112 +93,37 @@ fn at<T: Copy>(values: &[T], index: usize) -> Result<T, Error> {
         .ok_or_else(|| BudgetError::InvalidIndex.into())
 }
 
-/// Owns only this invocation's reservations. All vectors drop before this ledger.
-struct Workspace<'a> {
-    budget: &'a mut Budget,
-    reserved: usize,
-}
-impl Drop for Workspace<'_> {
-    fn drop(&mut self) {
-        // Only this owner changes `reserved`; every addition follows a successful reserve.
-        let _ = self.budget.release(self.reserved);
-    }
-}
-impl Workspace<'_> {
-    fn charge(&mut self, units: u64) -> Result<(), Error> {
-        Ok(self.budget.charge(units)?)
-    }
-    fn reserve(&mut self, bytes: usize) -> Result<(), Error> {
-        let total = self
-            .reserved
-            .checked_add(bytes)
-            .ok_or(BudgetError::SizeOverflow)?;
-        self.budget.reserve(bytes)?;
-        self.reserved = total;
-        Ok(())
-    }
-    fn vector<T>(&mut self, capacity: usize) -> Result<Vec<T>, Error> {
-        let bytes = capacity
-            .checked_mul(size_of::<T>())
-            .ok_or(BudgetError::SizeOverflow)?;
-        self.reserve(bytes)?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(capacity)
-            .map_err(|_| BudgetError::Allocation)?;
-        Ok(values)
-    }
-    fn push<T>(
-        &mut self,
-        values: &mut Vec<T>,
-        requested: &mut usize,
-        value: T,
-    ) -> Result<(), Error> {
-        if values.len() == *requested {
-            let capacity = requested
-                .checked_mul(2)
-                .ok_or(BudgetError::SizeOverflow)?
-                .max(8);
-            // Allocate a separate buffer to account for simultaneous old/new capacities.
-            let mut replacement = self.vector(capacity)?;
-            self.charge(u64::try_from(values.len()).map_err(|_| BudgetError::SizeOverflow)?)?;
-            replacement.append(values);
-            *values = replacement;
-            let bytes = requested
-                .checked_mul(size_of::<T>())
-                .ok_or(BudgetError::SizeOverflow)?;
-            self.budget.release(bytes)?;
-            self.reserved = self
-                .reserved
-                .checked_sub(bytes)
-                .ok_or(BudgetError::InvalidRelease)?;
-            *requested = capacity;
-        }
-        values.push(value);
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy)]
 struct PositiveSegment {
     end: usize,
     length: f64,
 }
-/// Validated snapshot-local geometry borrowing the caller's points.
+/// Snapshot-local geometry borrowing finite snapshot points.
 ///
-/// Storage stays charged to the budget used by `prepare` until `release`.
-/// Dropping this value frees storage but does not release its ledger reservation.
-/// A containing workspace may instead own and release `workspace_bytes` after drop.
+/// Its storage is charged to the workspace passed to `prepare` and must drop
+/// before that workspace.
 pub struct PreparedCurve<'a> {
     points: &'a [[f32; 2]],
     segments: Vec<PositiveSegment>,
     total_length: f64,
-    workspace_bytes: usize,
 }
 impl<'a> PreparedCurve<'a> {
-    /// Validate once and retain positive-point indices and exact kernel lengths.
+    /// Retain positive-point indices and exact kernel lengths.
     /// # Errors
-    /// Invalid curves, arc precision failures and shared allocation/resource limits.
-    pub fn prepare(points: &'a [[f32; 2]], budget: &mut Budget) -> Result<Self, Error> {
-        let mut workspace = Workspace {
-            budget,
-            reserved: 0,
-        };
+    /// Empty curves, arc precision failures and shared allocation/resource limits.
+    pub fn prepare(points: &'a [[f32; 2]], workspace: &mut Workspace<'_>) -> Result<Self, Error> {
         let first = points.first().ok_or(BudgetError::InvalidCurve)?;
         let mut previous = first.map(f64::from);
         let mut count = 0;
         for point in points {
             workspace.charge(1)?;
-            if point.iter().any(|v| !v.is_finite()) {
-                return Err(BudgetError::InvalidCurve.into());
-            }
             let current = point.map(f64::from);
             if !same_point(current, previous) {
                 count = increment(count)?;
                 previous = current;
             }
         }
-        let mut segments = workspace.vector(count)?;
+        let mut segments = workspace.vector(count, Storage::Bytes)?;
         previous = first.map(f64::from);
         let mut total_length = 0.0;
         for (end, point) in points.iter().enumerate() {
@@ -239,18 +142,11 @@ impl<'a> PreparedCurve<'a> {
             total_length = next;
             previous = current;
         }
-        let workspace_bytes = workspace.reserved;
-        workspace.reserved = 0;
         Ok(Self {
             points,
             segments,
             total_length,
-            workspace_bytes,
         })
-    }
-    #[must_use]
-    pub const fn workspace_bytes(&self) -> usize {
-        self.workspace_bytes
     }
     #[must_use]
     pub const fn total_length(&self) -> f64 {
@@ -265,15 +161,9 @@ impl<'a> PreparedCurve<'a> {
     pub fn segment_length(&self, index: usize) -> Result<f64, Error> {
         Ok(at(&self.segments, index)?.length)
     }
-    /// Drop preparation and release its storage from the same ledger.
     /// # Errors
-    /// Rejects an inconsistent reservation ledger.
-    pub fn release(self, budget: &mut Budget) -> Result<(), Error> {
-        let bytes = self.workspace_bytes;
-        drop(self);
-        Ok(budget.release(bytes)?)
-    }
-    fn segment(&self, index: usize) -> Result<Segment, Error> {
+    /// Rejects an index outside the positive segments.
+    pub fn segment(&self, index: usize) -> Result<Segment, Error> {
         let metadata = at(&self.segments, index)?;
         let start = if let Some(previous) = index.checked_sub(1) {
             at(&self.segments, previous)?.end
@@ -410,7 +300,7 @@ fn insert_patch(
     let along_a = projection(source, target, radius, radius * radius)?;
     let along_b = projection(target, source, radius, radius * radius)?;
     match (along_a, along_b) {
-        (Some(along_a), Some(along_b)) => workspace.push(
+        (Some(along_a), Some(along_b)) => Ok(workspace.push(
             patches,
             capacity,
             Patch {
@@ -418,7 +308,8 @@ fn insert_patch(
                 along_a,
                 along_b,
             },
-        ),
+            Storage::Bytes,
+        )?),
         (None, None) => Ok(()),
         _ => Err(Error::NumericalFailure),
     }
@@ -614,99 +505,24 @@ fn merged_length(
     Ok(total)
 }
 
-/// Exhaustive segment enumeration followed by the same sparse narrow phase.
-/// Constant curves have no contact. Radius zero is supported.
-/// # Errors
-/// Rejects empty/nonfinite curves, invalid parameters, inconsistent f64 geometry,
-/// and shared resource failures. Caller reservations survive every exit.
-pub fn contact(
-    a: &[[f32; 2]],
-    b: &[[f32; 2]],
-    radius: f64,
-    minimum_length: f64,
-    budget: &mut Budget,
-) -> Result<bool, Error> {
-    evaluate(
-        a,
-        b,
-        radius,
-        minimum_length,
-        None::<std::iter::Empty<(usize, usize)>>,
-        budget,
-    )
-}
-/// Candidate indices refer to positive segments in path order after duplicate removal.
+/// Sustained contact from candidate cells indexing positive segments in path order.
 ///
 /// The caller must include every nonempty cell, including tangent connectors.
 /// Duplicates and arbitrary candidate order do not change the result. Caller-owned
-/// iteration/storage is outside this function's workspace, and each yield is charged.
+/// iteration/storage is outside this workspace, and each yield is charged.
+/// Constant curves have no contact. Radius zero is supported.
 /// # Errors
-/// Same failures as `contact`, plus invalid indices and detected missing neighbors.
-/// Completeness of disconnected candidate regions is the caller's responsibility.
-pub fn contact_candidates(
-    a: &[[f32; 2]],
-    b: &[[f32; 2]],
-    radius: f64,
-    minimum_length: f64,
-    candidates: impl IntoIterator<Item = (usize, usize)>,
-    budget: &mut Budget,
-) -> Result<bool, Error> {
-    evaluate(
-        a,
-        b,
-        radius,
-        minimum_length,
-        Some(candidates.into_iter()),
-        budget,
-    )
-}
-fn evaluate(
-    a: &[[f32; 2]],
-    b: &[[f32; 2]],
-    radius: f64,
-    minimum: f64,
-    candidates: Option<impl Iterator<Item = (usize, usize)>>,
-    budget: &mut Budget,
-) -> Result<bool, Error> {
-    validate_parameters(radius, minimum)?;
-    let mut workspace = Workspace {
-        budget,
-        reserved: 0,
-    };
-    let source = PreparedCurve::prepare(a, workspace.budget)?;
-    workspace.reserved = source.workspace_bytes();
-    let target = PreparedCurve::prepare(b, workspace.budget)?;
-    workspace.reserved = workspace
-        .reserved
-        .checked_add(target.workspace_bytes())
-        .ok_or(BudgetError::SizeOverflow)?;
-    let rows = if candidates.is_some() {
-        0
-    } else {
-        source.segment_count()
-    };
-    let columns = target.segment_count();
-    let exhaustive = (0..rows).flat_map(|row| (0..columns).map(move |column| (row, column)));
-    let cells = candidates.into_iter().flatten().chain(exhaustive);
-    contact_prepared_candidates(&source, &target, radius, minimum, cells, workspace.budget)
-}
-/// Reuse validated snapshot geometry with the same exact candidate contract.
-/// # Errors
-/// Invalid parameters, indices, numerical predicates, missing neighboring cells,
-/// or shared resource failures. Preparation reservations survive every exit.
-pub fn contact_prepared_candidates(
+/// Invalid indices, inconsistent f64 geometry, detected missing neighbors and
+/// shared resource failures. Completeness of disconnected candidate regions is
+/// the caller's responsibility.
+pub fn contact(
     a: &PreparedCurve<'_>,
     b: &PreparedCurve<'_>,
     radius: f64,
     minimum: f64,
     candidates: impl IntoIterator<Item = (usize, usize)>,
-    budget: &mut Budget,
+    workspace: &mut Workspace<'_>,
 ) -> Result<bool, Error> {
-    validate_parameters(radius, minimum)?;
-    let mut workspace = Workspace {
-        budget,
-        reserved: 0,
-    };
     let source = a;
     let target = b;
     if source.segment_count() == 0 || target.segment_count() == 0 {
@@ -721,13 +537,13 @@ pub fn contact_prepared_candidates(
             cell,
             (source, target),
             radius,
-            &mut workspace,
+            workspace,
         )?;
     }
     patches.sort_unstable_by_key(|patch| patch.cell);
     workspace.charge(u64::try_from(patches.len()).map_err(|_| BudgetError::SizeOverflow)?)?;
     patches.dedup_by_key(|patch| patch.cell);
-    let mut nodes = workspace.vector(patches.len())?;
+    let mut nodes = workspace.vector(patches.len(), Storage::Bytes)?;
     for index in 0..patches.len() {
         workspace.charge(1)?;
         nodes.push(Node {
@@ -741,11 +557,11 @@ pub fn contact_prepared_candidates(
         (source, target),
         (a.closed(), b.closed()),
         radius * radius,
-        &mut workspace,
+        workspace,
     )?;
-    let mut records = workspace.vector(patches.len())?;
+    let mut records = workspace.vector(patches.len(), Storage::Bytes)?;
     for (index, patch) in patches.iter().enumerate() {
-        let root = root(&mut nodes, index, &mut workspace)?;
+        let root = root(&mut nodes, index, workspace)?;
         records.push(Participation {
             root,
             along_a: Projection {
@@ -760,19 +576,5 @@ pub fn contact_prepared_candidates(
             },
         });
     }
-    component_lengths(&mut records, minimum, &mut workspace)
-}
-
-fn validate_parameters(radius: f64, minimum: f64) -> Result<(), Error> {
-    let squared_radius = radius * radius;
-    if !radius.is_finite()
-        || radius < 0.0
-        || !squared_radius.is_finite()
-        || radius > 0.0 && squared_radius == 0.0
-        || !minimum.is_finite()
-        || minimum <= 0.0
-    {
-        return Err(Error::InvalidParameters);
-    }
-    Ok(())
+    component_lengths(&mut records, minimum, workspace)
 }

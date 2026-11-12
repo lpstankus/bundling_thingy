@@ -1,28 +1,23 @@
-//! Conservative piece bounds and streaming whole-drawing contact enumeration.
+//! Conservative segment bounds and streaming whole-drawing contact enumeration.
 //!
-//! Long-segment AABBs split into closed rectangles whose union covers the
-//! original bound. Shared split boundaries prevent gaps without interpolating
-//! segment geometry. Empty parts of those rectangles may add false candidates.
+//! Each positive segment has one rounded AABB entry and one rounded query box.
 //! Sort comparisons are outside the work counter. Requested capacities include
 //! simultaneous growth buffers, excluding allocator overhead and borrowed points.
-//! The index releases only its own reservations on every exit. Callbacks own
-//! their retained reservations on success and failure and must clean them up.
+//! The index releases only its own temporary reservations on every exit.
+//! Callback reservations are the callback owner's.
 use crate::{
-    ambiguity_contact,
-    weak_frechet::{Budget, Error as ResourceError},
+    ambiguity::Cause,
+    ambiguity_contact::{self, PreparedCurve},
+    geometry::Snapshot,
+    weak_frechet::{Budget, Error as ResourceError, Storage, Workspace},
 };
-use std::{fmt, mem::size_of};
 
-#[derive(Clone, Copy)]
-pub struct Path<'a> {
-    pub id: u32,
-    pub points: &'a [[f32; 2]],
-}
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct Statistics {
     pub constant_paths: usize,
     /// Positive paths with a rounded total below the minimum; they remain indexed.
     pub short_paths: usize,
+    /// Positive-segment AABB entries.
     pub pieces_generated: u64,
     pub entries_visited: u64,
     pub candidate_examinations: u64,
@@ -30,50 +25,25 @@ pub struct Statistics {
     pub narrow_pairs: u64,
     pub contacts: u64,
 }
-#[derive(Debug)]
-pub enum Error<E> {
-    Resource(ResourceError, Statistics),
-    InvalidParameters,
-    InvalidPath(u32),
-    DuplicateId(u32),
-    Contact {
-        source: u32,
-        partner: u32,
-        error: ambiguity_contact::Error,
-    },
-    Callback {
-        source: u32,
-        partner: u32,
-        error: E,
-    },
+/// An enumeration failure with the source/partner edge IDs it occurred for.
+pub struct Failure {
+    pub pair: Option<(u32, u32)>,
+    pub cause: Cause,
 }
-impl<E: fmt::Display> fmt::Display for Error<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Resource(error, statistics) => {
-                write!(f, "{error}; index statistics {statistics:?}")
-            }
-            Self::InvalidParameters => f.write_str("invalid contact index parameters"),
-            Self::InvalidPath(id) => write!(f, "empty, nonfinite or unrepresentable path {id}"),
-            Self::DuplicateId(id) => write!(f, "duplicate path ID {id}"),
-            Self::Contact {
-                source,
-                partner,
-                error,
-            } => write!(f, "contact {source}/{partner}: {error}"),
-            Self::Callback {
-                source,
-                partner,
-                error,
-            } => write!(f, "callback {source}/{partner}: {error}"),
-        }
+impl From<Cause> for Failure {
+    fn from(cause: Cause) -> Self {
+        Self { pair: None, cause }
     }
 }
-impl<E: fmt::Debug + fmt::Display> std::error::Error for Error<E> {}
-impl<E> From<ResourceError> for Error<E> {
+impl From<ResourceError> for Failure {
     fn from(error: ResourceError) -> Self {
-        Self::Resource(error, Statistics::default())
+        Cause::from(error).into()
     }
+}
+#[derive(Clone, Copy)]
+struct Path<'a> {
+    id: u32,
+    points: &'a [[f32; 2]],
 }
 #[derive(Clone, Copy)]
 struct Piece {
@@ -86,83 +56,6 @@ struct Piece {
 struct Candidate {
     partner: usize,
     cell: (usize, usize),
-}
-struct Workspace<'a> {
-    budget: &'a mut Budget,
-    bytes: usize,
-    records: usize,
-}
-impl Drop for Workspace<'_> {
-    fn drop(&mut self) {
-        let _ = self.budget.release(self.bytes);
-        let _ = self.budget.release_records(self.records);
-    }
-}
-impl Workspace<'_> {
-    fn vector<T>(&mut self, capacity: usize, records: bool) -> Result<Vec<T>, ResourceError> {
-        let bytes = capacity
-            .checked_mul(size_of::<T>())
-            .ok_or(ResourceError::SizeOverflow)?;
-        let total = self
-            .bytes
-            .checked_add(bytes)
-            .ok_or(ResourceError::SizeOverflow)?;
-        self.budget.reserve(bytes)?;
-        self.bytes = total;
-        if records {
-            self.budget.reserve_records(capacity)?;
-            self.records = self
-                .records
-                .checked_add(capacity)
-                .ok_or(ResourceError::SizeOverflow)?;
-        }
-        let mut result = Vec::new();
-        result
-            .try_reserve_exact(capacity)
-            .map_err(|_| ResourceError::Allocation)?;
-        Ok(result)
-    }
-    fn push<T>(
-        &mut self,
-        values: &mut Vec<T>,
-        capacity: &mut usize,
-        value: T,
-        records: bool,
-    ) -> Result<(), ResourceError> {
-        if values.len() == *capacity {
-            let next = capacity
-                .checked_mul(2)
-                .ok_or(ResourceError::SizeOverflow)?
-                .max(8);
-            let mut replacement = self.vector(next, records)?;
-            self.budget
-                .charge(u64::try_from(values.len()).map_err(|_| ResourceError::SizeOverflow)?)?;
-            replacement.append(values);
-            *values = replacement;
-            self.free::<T>(*capacity, records)?;
-            *capacity = next;
-        }
-        values.push(value);
-        Ok(())
-    }
-    fn free<T>(&mut self, capacity: usize, records: bool) -> Result<(), ResourceError> {
-        let bytes = capacity
-            .checked_mul(size_of::<T>())
-            .ok_or(ResourceError::SizeOverflow)?;
-        self.budget.release(bytes)?;
-        self.bytes = self
-            .bytes
-            .checked_sub(bytes)
-            .ok_or(ResourceError::InvalidRelease)?;
-        if records {
-            self.budget.release_records(capacity)?;
-            self.records = self
-                .records
-                .checked_sub(capacity)
-                .ok_or(ResourceError::InvalidRelease)?;
-        }
-        Ok(())
-    }
 }
 fn tick(budget: &mut Budget, count: &mut u64) -> Result<(), ResourceError> {
     budget.charge(1)?;
@@ -177,138 +70,55 @@ const fn bounds(edge: usize, segment: usize, a: [f64; 2], b: [f64; 2]) -> Piece 
         high: [a[0].max(b[0]).next_up(), a[1].max(b[1]).next_up()],
     }
 }
-fn pieces(
-    identity: (usize, usize),
-    endpoints: ([f64; 2], [f64; 2]),
-    maximum: f64,
-    output: &mut Vec<Piece>,
-    capacity: &mut usize,
-    workspace: &mut Workspace<'_>,
-    stats: &mut Statistics,
-) -> Result<(), ResourceError> {
-    split_bounds(
-        bounds(identity.0, identity.1, endpoints.0, endpoints.1),
-        maximum,
-        output,
-        capacity,
-        workspace,
-        stats,
-    )
-}
-fn split_bounds(
-    piece: Piece,
-    maximum: f64,
-    output: &mut Vec<Piece>,
-    capacity: &mut usize,
-    workspace: &mut Workspace<'_>,
-    stats: &mut Statistics,
-) -> Result<(), ResourceError> {
-    tick(workspace.budget, &mut stats.entries_visited)?;
-    if let Some((left, right)) = split(piece, maximum)? {
-        split_bounds(left, maximum, output, capacity, workspace, stats)?;
-        split_bounds(right, maximum, output, capacity, workspace, stats)
-    } else {
-        tick(workspace.budget, &mut stats.pieces_generated)?;
-        workspace.push(output, capacity, piece, false)
-    }
-}
-fn split(piece: Piece, maximum: f64) -> Result<Option<(Piece, Piece)>, ResourceError> {
-    let width = piece.high[0] - piece.low[0];
-    let height = piece.high[1] - piece.low[1];
-    if width.max(height) <= maximum {
-        return Ok(None);
-    }
-    let axis = usize::from(height > width);
-    let low = *piece.low.get(axis).ok_or(ResourceError::InvalidIndex)?;
-    let high = *piece.high.get(axis).ok_or(ResourceError::InvalidIndex)?;
-    let middle = high.mul_add(0.5, low * 0.5);
-    if middle <= low || middle >= high {
-        return Err(ResourceError::SizeOverflow);
-    }
-    let mut left = piece;
-    let mut right = piece;
-    *left.high.get_mut(axis).ok_or(ResourceError::InvalidIndex)? = middle;
-    *right.low.get_mut(axis).ok_or(ResourceError::InvalidIndex)? = middle;
-    Ok(Some((left, right)))
-}
 /// Stream each qualifying unordered pair once, in stable ID order.
 ///
-/// `piece_length` bounds each piece's axis extent and changes only acceleration.
+/// Edges are visited in ID order, independently of snapshot storage order.
 /// A balanced AABB hierarchy prunes both coordinates. Dense contact remains quadratic.
 /// Callback reservations survive success and failure on the shared ledger.
-/// The callback owner must release them after either result.
 /// # Errors
-/// Invalid geometry/IDs/parameters, global resource exhaustion, narrow-phase
-/// numerical errors and callback failures abort without a successful result.
-pub fn enumerate<E>(
-    paths: &[Path<'_>],
+/// Global resource exhaustion, narrow-phase numerical errors and callback
+/// failures abort without a successful result.
+pub fn enumerate(
+    snapshot: &Snapshot<'_>,
     radius: f64,
     minimum: f64,
-    piece_length: f64,
     budget: &mut Budget,
-    mut callback: impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
-) -> Result<Statistics, Error<E>> {
+    mut callback: impl FnMut(u32, u32, &mut Budget) -> Result<(), Cause>,
+) -> Result<Statistics, Failure> {
     let mut stats = Statistics::default();
-    run(
-        paths,
-        radius,
-        minimum,
-        piece_length,
-        budget,
-        &mut callback,
-        &mut stats,
-    )
-    .map_err(|error| match error {
-        Error::Resource(resource, _) => Error::Resource(resource, stats),
-        other => other,
-    })
-}
-fn run<E>(
-    paths: &[Path<'_>],
-    radius: f64,
-    minimum: f64,
-    piece_length: f64,
-    budget: &mut Budget,
-    callback: &mut impl FnMut(u32, u32, &mut Budget) -> Result<(), E>,
-    stats: &mut Statistics,
-) -> Result<Statistics, Error<E>> {
-    validate_parameters(radius, minimum, piece_length)?;
-    let mut workspace = Workspace {
-        budget,
-        bytes: 0,
-        records: 0,
-    };
-    let ordered = ordered_paths(paths, &mut workspace)?;
+    let mut workspace = Workspace::new(budget);
+    let ordered = ordered_paths(snapshot, &mut workspace)?;
     let prepared = prepare_paths(&ordered, &mut workspace)?;
-    let mut index = build(
-        &ordered,
-        &prepared,
-        minimum,
-        piece_length,
-        &mut workspace,
-        stats,
-    )?;
-    let mut hierarchy = workspace.vector(node_count(index.len())?, false)?;
+    let mut index = build(&prepared, minimum, &mut workspace, &mut stats)?;
+    let mut hierarchy = workspace.vector(node_count(index.len())?, Storage::Bytes)?;
     if !index.is_empty() {
-        build_tree(&mut index, 0, &mut hierarchy, workspace.budget, stats)?;
+        build_tree(&mut index, 0, &mut hierarchy, workspace.budget, &mut stats)?;
     }
     let mut candidates = Vec::<Candidate>::new();
     let mut capacity = 0;
     for (source, path) in ordered.iter().enumerate() {
-        collect(
-            (source, path.points),
-            (&index, &hierarchy),
-            (radius, piece_length),
-            &mut candidates,
-            &mut capacity,
-            &mut workspace,
-            stats,
-        )?;
+        candidates.clear();
+        let curve = prepared.get(source).ok_or(ResourceError::InvalidIndex)?;
+        if !hierarchy.is_empty() {
+            let mut query = Query {
+                index: &index,
+                nodes: &hierarchy,
+                candidates: &mut candidates,
+                capacity: &mut capacity,
+                stats: &mut stats,
+            };
+            for segment in 0..curve.segment_count() {
+                let endpoints = curve.segment(segment)?;
+                query.visit(
+                    bounds(source, segment, endpoints.start, endpoints.end),
+                    radius,
+                    0,
+                    &mut workspace,
+                )?;
+            }
+        }
+        // One stored entry and one query per positive segment emit each cell once.
         candidates.sort_unstable();
-        workspace
-            .budget
-            .charge(u64::try_from(candidates.len()).map_err(|_| ResourceError::SizeOverflow)?)?;
-        candidates.dedup();
         let mut start = 0;
         while let Some(first) = candidates.get(start) {
             let partner = first.partner;
@@ -317,7 +127,7 @@ fn run<E>(
                 .get(end)
                 .is_some_and(|entry| entry.partner == partner)
             {
-                workspace.budget.charge(1)?;
+                workspace.charge(1)?;
                 end = end.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
             }
             let other = ordered.get(partner).ok_or(ResourceError::InvalidIndex)?;
@@ -340,105 +150,63 @@ fn run<E>(
                 .ok_or(ResourceError::InvalidIndex)?
                 .iter()
                 .map(|entry| entry.cell);
-            let contact = ambiguity_contact::contact_prepared_candidates(
-                prepared.get(source).ok_or(ResourceError::InvalidIndex)?,
+            let located = |cause| Failure {
+                pair: Some((path.id, other.id)),
+                cause,
+            };
+            let contact = ambiguity_contact::contact(
+                curve,
                 prepared.get(partner).ok_or(ResourceError::InvalidIndex)?,
                 radius,
                 minimum,
                 cells,
-                workspace.budget,
+                &mut workspace.nested(),
             )
-            .map_err(|error| Error::Contact {
-                source: path.id,
-                partner: other.id,
-                error,
-            })?;
+            .map_err(located)?;
             if contact {
                 tick(workspace.budget, &mut stats.contacts)?;
-                callback(path.id, other.id, workspace.budget).map_err(|error| Error::Callback {
-                    source: path.id,
-                    partner: other.id,
-                    error,
-                })?;
+                callback(path.id, other.id, workspace.budget).map_err(located)?;
             }
             start = end;
         }
     }
-    Ok(*stats)
+    Ok(stats)
 }
 
-fn build<E>(
-    ordered: &[Path<'_>],
-    prepared: &[ambiguity_contact::PreparedCurve<'_>],
+fn build(
+    prepared: &[PreparedCurve<'_>],
     minimum: f64,
-    piece_length: f64,
     workspace: &mut Workspace<'_>,
     stats: &mut Statistics,
-) -> Result<Vec<Piece>, Error<E>> {
-    let mut eligible = workspace.vector(ordered.len(), false)?;
+) -> Result<Vec<Piece>, ResourceError> {
     let mut count = 0_usize;
-    for (edge, path) in ordered.iter().enumerate() {
-        let first = path.points.first().ok_or(Error::InvalidPath(path.id))?;
-        let length = prepared
-            .get(edge)
-            .ok_or(ResourceError::InvalidIndex)?
-            .total_length();
-        if length == 0.0 {
+    for curve in prepared {
+        workspace.charge(1)?;
+        if curve.segment_count() == 0 {
             stats.constant_paths = stats
                 .constant_paths
                 .checked_add(1)
                 .ok_or(ResourceError::SizeOverflow)?;
             continue;
         }
-        if length < minimum {
+        if curve.total_length() < minimum {
             stats.short_paths = stats
                 .short_paths
                 .checked_add(1)
                 .ok_or(ResourceError::SizeOverflow)?;
         }
-        eligible.push(edge);
-        let mut previous = first.map(f64::from);
-        for point in path.points {
-            workspace.budget.charge(1)?;
-            let current = point.map(f64::from);
-            if (current[0] - previous[0]).hypot(current[1] - previous[1]) <= 0.0 {
-                continue;
-            }
-            count = count
-                .checked_add(count_pieces(
-                    bounds(edge, 0, previous, current),
-                    piece_length,
-                    workspace.budget,
-                    stats,
-                )?)
-                .ok_or(ResourceError::SizeOverflow)?;
-            previous = current;
-        }
+        count = count
+            .checked_add(curve.segment_count())
+            .ok_or(ResourceError::SizeOverflow)?;
     }
-    let mut index = workspace.vector(count, false)?;
-    let mut index_capacity = count;
-    for edge in eligible {
-        let path = ordered.get(edge).ok_or(ResourceError::InvalidIndex)?;
-        let first = path.points.first().ok_or(ResourceError::InvalidCurve)?;
-        let mut previous = first.map(f64::from);
-        let mut segment = 0;
-        for point in path.points {
-            workspace.budget.charge(1)?;
-            let current = point.map(f64::from);
-            if (current[0] - previous[0]).hypot(current[1] - previous[1]) <= 0.0 {
-                continue;
-            }
-            pieces(
-                (edge, segment),
-                (previous, current),
-                piece_length,
-                &mut index,
-                &mut index_capacity,
-                workspace,
-                stats,
-            )?;
-            segment = segment.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
-            previous = current;
+    let mut index = workspace.vector(count, Storage::Bytes)?;
+    for (edge, curve) in prepared.iter().enumerate() {
+        for segment in 0..curve.segment_count() {
+            tick(workspace.budget, &mut stats.pieces_generated)?;
+            let endpoints = curve
+                .segment(segment)
+                .map_err(|_| ResourceError::InvalidIndex)?;
+            index.push(bounds(edge, segment, endpoints.start, endpoints.end));
         }
     }
     Ok(index)
@@ -614,104 +382,23 @@ impl Query<'_> {
                     partner: target.edge,
                     cell: (piece.segment, target.segment),
                 },
-                true,
+                Storage::Records,
             )?;
         }
         Ok(())
     }
-    fn split_query(
-        &mut self,
-        piece: Piece,
-        parameters: (f64, f64),
-        workspace: &mut Workspace<'_>,
-    ) -> Result<(), ResourceError> {
-        tick(workspace.budget, &mut self.stats.entries_visited)?;
-        if let Some((left, right)) = split(piece, parameters.1)? {
-            self.split_query(left, parameters, workspace)?;
-            self.split_query(right, parameters, workspace)
-        } else if self.nodes.is_empty() {
-            Ok(())
-        } else {
-            self.visit(piece, parameters.0, 0, workspace)
-        }
-    }
-}
-fn collect(
-    source: (usize, &[[f32; 2]]),
-    index: (&[Piece], &[Node]),
-    parameters: (f64, f64),
-    candidates: &mut Vec<Candidate>,
-    capacity: &mut usize,
-    workspace: &mut Workspace<'_>,
-    stats: &mut Statistics,
-) -> Result<(), ResourceError> {
-    candidates.clear();
-    let mut query = Query {
-        index: index.0,
-        nodes: index.1,
-        candidates,
-        capacity,
-        stats,
-    };
-    let Some(first) = source.1.first() else {
-        return Err(ResourceError::InvalidCurve);
-    };
-    let mut previous = first.map(f64::from);
-    let mut segment = 0;
-    for point in source.1 {
-        workspace.budget.charge(1)?;
-        let current = point.map(f64::from);
-        if (current[0] - previous[0]).hypot(current[1] - previous[1]) <= 0.0 {
-            continue;
-        }
-        query.split_query(
-            bounds(source.0, segment, previous, current),
-            parameters,
-            workspace,
-        )?;
-        previous = current;
-        segment = segment.checked_add(1).ok_or(ResourceError::SizeOverflow)?;
-    }
-    Ok(())
 }
 
-fn validate_parameters<E>(radius: f64, minimum: f64, piece_length: f64) -> Result<(), Error<E>> {
-    if !radius.is_finite()
-        || radius < 0.0
-        || !(radius * radius).is_finite()
-        || radius > 0.0 && radius * radius == 0.0
-        || !minimum.is_finite()
-        || minimum <= 0.0
-        || !piece_length.is_finite()
-        || piece_length <= 0.0
-    {
-        return Err(Error::InvalidParameters);
-    }
-    Ok(())
-}
-
-fn prepare_paths<'a, E>(
+fn prepare_paths<'a>(
     paths: &[Path<'a>],
     workspace: &mut Workspace<'_>,
-) -> Result<Vec<ambiguity_contact::PreparedCurve<'a>>, Error<E>> {
-    let mut prepared = workspace.vector(paths.len(), false)?;
+) -> Result<Vec<PreparedCurve<'a>>, Failure> {
+    let mut prepared = workspace.vector(paths.len(), Storage::Bytes)?;
     for path in paths {
-        let curve = ambiguity_contact::PreparedCurve::prepare(path.points, workspace.budget)
-            .map_err(|error| match error {
-                ambiguity_contact::Error::Budget(ResourceError::InvalidCurve) => {
-                    Error::InvalidPath(path.id)
-                }
-                ambiguity_contact::Error::Budget(error) => Error::from(error),
-                error => Error::Contact {
-                    source: path.id,
-                    partner: path.id,
-                    error,
-                },
-            })?;
-        workspace.bytes = workspace
-            .bytes
-            .checked_add(curve.workspace_bytes())
-            .ok_or(ResourceError::SizeOverflow)?;
+        let curve = PreparedCurve::prepare(path.points, workspace).map_err(|cause| Failure {
+            pair: Some((path.id, path.id)),
+            cause,
+        })?;
         prepared.push(curve);
     }
     Ok(prepared)
@@ -723,7 +410,7 @@ fn prepare_paths<'a, E>(
 fn participation_possible(
     candidates: &mut [Candidate],
     edges: (usize, usize),
-    prepared: &[ambiguity_contact::PreparedCurve<'_>],
+    prepared: &[PreparedCurve<'_>],
     minimum: f64,
     budget: &mut Budget,
 ) -> Result<bool, ResourceError> {
@@ -742,7 +429,7 @@ fn participation_possible(
 }
 fn participation_bound(
     segments: impl Iterator<Item = usize>,
-    curve: &ambiguity_contact::PreparedCurve<'_>,
+    curve: &PreparedCurve<'_>,
     minimum: f64,
     budget: &mut Budget,
 ) -> Result<bool, ResourceError> {
@@ -773,39 +460,16 @@ fn participation_bound(
     Ok(false)
 }
 
-fn ordered_paths<'a, E>(
-    paths: &[Path<'a>],
+// Snapshot storage order need not be ID order; this charged view restores it.
+fn ordered_paths<'a>(
+    snapshot: &'a Snapshot<'_>,
     workspace: &mut Workspace<'_>,
-) -> Result<Vec<Path<'a>>, Error<E>> {
-    let mut ordered = workspace.vector(paths.len(), false)?;
-    for path in paths {
-        workspace.budget.charge(1)?;
-        ordered.push(*path);
+) -> Result<Vec<Path<'a>>, ResourceError> {
+    let mut ordered = workspace.vector(snapshot.layout().edge_count(), Storage::Bytes)?;
+    for (id, points) in snapshot.edges() {
+        workspace.charge(1)?;
+        ordered.push(Path { id, points });
     }
     ordered.sort_unstable_by_key(|path| path.id);
-    for pair in ordered.windows(2) {
-        workspace.budget.charge(1)?;
-        if let [a, b] = pair
-            && a.id == b.id
-        {
-            return Err(Error::DuplicateId(a.id));
-        }
-    }
     Ok(ordered)
-}
-
-fn count_pieces(
-    piece: Piece,
-    maximum: f64,
-    budget: &mut Budget,
-    stats: &mut Statistics,
-) -> Result<usize, ResourceError> {
-    tick(budget, &mut stats.entries_visited)?;
-    if let Some((left, right)) = split(piece, maximum)? {
-        count_pieces(left, maximum, budget, stats)?
-            .checked_add(count_pieces(right, maximum, budget, stats)?)
-            .ok_or(ResourceError::SizeOverflow)
-    } else {
-        Ok(1)
-    }
 }

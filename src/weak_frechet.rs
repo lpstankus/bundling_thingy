@@ -12,14 +12,10 @@ pub enum Error {
     SizeOverflow,
     Allocation,
     InvalidIndex,
-    InconsistentCohort,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InconsistentCohort => {
-                "canonical original pair is incompatible within its frozen complete-link cohort"
-            }
             Self::InvalidCurve => "weak Frechet requires nonempty finite curves",
             Self::InvalidScale => "evaluation tolerances produce nonfinite normalized distances",
             Self::WorkLimit => "evaluation work limit exceeded",
@@ -43,7 +39,7 @@ pub enum WorkCategory {
     SimplifierPointVisits,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct WorkBreakdown {
     pub other: u64,
     pub weak_cell_visits: u64,
@@ -59,7 +55,7 @@ impl WorkBreakdown {
     };
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct Statistics {
     pub work_consumed: u64,
     pub work_breakdown: WorkBreakdown,
@@ -68,7 +64,8 @@ pub struct Statistics {
     pub records_reserved: usize,
     pub records_peak: usize,
 }
-/// A shared sequential ledger. Retained evidence stays reserved until its owner releases it.
+/// A sequential ledger. Reservations made directly here are persistent; temporary
+/// storage reserves through a `Workspace`, which releases its own counters.
 #[derive(Debug)]
 pub struct Budget {
     work_limit: u64,
@@ -77,13 +74,11 @@ pub struct Budget {
     statistics: Statistics,
 }
 impl Budget {
-    /// Begin a preparation or snapshot phase, returning the previous evidence.
+    /// Begin a preparation or snapshot phase.
     /// Outstanding storage reservations and lifetime peaks remain unchanged.
-    pub const fn begin_phase(&mut self) -> Statistics {
-        let previous = self.statistics;
+    pub const fn begin_phase(&mut self) {
         self.statistics.work_consumed = 0;
         self.statistics.work_breakdown = WorkBreakdown::ZERO;
-        previous
     }
     #[must_use]
     pub const fn new(work: u64, workspace: usize) -> Self {
@@ -187,6 +182,110 @@ impl Budget {
         Ok(())
     }
 }
+/// Ledger counters occupied by a temporary vector's requested capacity.
+#[derive(Clone, Copy)]
+pub(crate) enum Storage {
+    Bytes,
+    /// Bytes plus one stored-pair record per element.
+    Records,
+}
+
+/// Owns only its own temporary reservations on a borrowed ledger.
+///
+/// Each counter increase follows a successful reservation by this owner, so the
+/// ledger always holds at least these amounts and the releases in `drop` cannot
+/// fail. Vectors allocated here must drop before their workspace. `commit`
+/// instead leaves successfully retained storage reserved on the ledger.
+pub(crate) struct Workspace<'a> {
+    pub(crate) budget: &'a mut Budget,
+    bytes: usize,
+    records: usize,
+}
+impl Drop for Workspace<'_> {
+    fn drop(&mut self) {
+        let _ = self.budget.release(self.bytes);
+        let _ = self.budget.release_records(self.records);
+    }
+}
+impl Workspace<'_> {
+    pub(crate) const fn new(budget: &mut Budget) -> Workspace<'_> {
+        Workspace {
+            budget,
+            bytes: 0,
+            records: 0,
+        }
+    }
+    /// A workspace whose reservations end before this one's.
+    pub(crate) const fn nested(&mut self) -> Workspace<'_> {
+        Workspace::new(self.budget)
+    }
+    pub(crate) fn charge(&mut self, units: u64) -> Result<(), Error> {
+        self.budget.charge(units)
+    }
+    /// Transfer this owner's reservations to the ledger's persistent total.
+    pub(crate) fn commit(mut self) {
+        self.bytes = 0;
+        self.records = 0;
+    }
+    pub(crate) fn vector<T>(&mut self, capacity: usize, storage: Storage) -> Result<Vec<T>, Error> {
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(Error::SizeOverflow)?;
+        let total = self.bytes.checked_add(bytes).ok_or(Error::SizeOverflow)?;
+        self.budget.reserve(bytes)?;
+        self.bytes = total;
+        if matches!(storage, Storage::Records) {
+            let total = self
+                .records
+                .checked_add(capacity)
+                .ok_or(Error::SizeOverflow)?;
+            self.budget.reserve_records(capacity)?;
+            self.records = total;
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::Allocation)?;
+        Ok(values)
+    }
+    /// Push into a vector with requested capacity `requested`, growing through a
+    /// separate buffer so old and new capacities are reserved simultaneously.
+    pub(crate) fn push<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        requested: &mut usize,
+        value: T,
+        storage: Storage,
+    ) -> Result<(), Error> {
+        if values.len() == *requested {
+            let capacity = requested.checked_mul(2).ok_or(Error::SizeOverflow)?.max(8);
+            let mut replacement = self.vector(capacity, storage)?;
+            self.charge(u64::try_from(values.len()).map_err(|_| Error::SizeOverflow)?)?;
+            replacement.append(values);
+            *values = replacement;
+            self.free::<T>(*requested, storage)?;
+            *requested = capacity;
+        }
+        values.push(value);
+        Ok(())
+    }
+    fn free<T>(&mut self, capacity: usize, storage: Storage) -> Result<(), Error> {
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(Error::SizeOverflow)?;
+        self.budget.release(bytes)?;
+        self.bytes = self.bytes.checked_sub(bytes).ok_or(Error::InvalidRelease)?;
+        if matches!(storage, Storage::Records) {
+            self.budget.release_records(capacity)?;
+            self.records = self
+                .records
+                .checked_sub(capacity)
+                .ok_or(Error::InvalidRelease)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Orientation {
     Forward,

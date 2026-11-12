@@ -4,12 +4,10 @@ pub mod geometry;
 
 pub mod weak_frechet;
 
-pub mod ambiguity_similarity;
+mod ambiguity_contact;
 
-pub mod ambiguity_contact;
-
-pub mod ambiguity_index;
+mod ambiguity_index;
 
 pub mod ambiguity;
 
-pub mod ambiguity_originals;
+mod ambiguity_originals;

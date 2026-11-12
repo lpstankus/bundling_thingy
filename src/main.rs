@@ -115,11 +115,9 @@ fn headless(opts: &Options) -> Result<()> {
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
     report::invalidate(&opts.out, "ambiguity.json")?;
+    report::invalidate(&opts.out, "ambiguity.json.tmp")?;
     report::invalidate(&opts.out, "distortion.json")?;
     report::invalidate(&opts.out, "noisiness.json")?;
-    if opts.evaluate_ambiguity {
-        opts.ambiguity.validate()?;
-    }
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
     let noisiness = if opts.evaluate_noisiness {
         gpu.render()?;
@@ -146,32 +144,23 @@ fn headless(opts: &Options) -> Result<()> {
             .ok_or_else(|| color_eyre::eyre::eyre!("missing distortion baseline"))?
             .validate_baseline()?;
     }
-    if opts.evaluate_ambiguity {
-        ambiguity_report::run(
-            opts,
-            baseline
-                .as_ref()
-                .ok_or_else(|| color_eyre::eyre::eyre!("missing ambiguity baseline"))?,
-            |evaluator, images| {
-                image_flow(
-                    opts,
-                    &mut gpu,
-                    baseline.as_ref(),
-                    noisiness,
-                    Some(evaluator),
-                    images,
-                )
-            },
-        )?;
+    let mut ambiguity = if opts.evaluate_ambiguity {
+        let (Some(layout), Some(baseline)) = (layout.as_ref(), baseline.as_ref()) else {
+            color_eyre::eyre::bail!("missing ambiguity baseline");
+        };
+        Some(ambiguity_report::Session::new(opts, layout, baseline)?)
     } else {
-        image_flow(
-            opts,
-            &mut gpu,
-            baseline.as_ref(),
-            noisiness,
-            None,
-            &mut Vec::new(),
-        )?;
+        None
+    };
+    image_flow(
+        opts,
+        &mut gpu,
+        baseline.as_ref(),
+        noisiness,
+        ambiguity.as_mut(),
+    )?;
+    if let Some(ambiguity) = ambiguity {
+        ambiguity.finish()?;
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())
@@ -188,8 +177,7 @@ fn image_flow(
     gpu: &mut Gpu,
     baseline: Option<&bundling_wgpu::geometry::Snapshot<'_>>,
     mut noisiness: Option<noisiness::Report>,
-    mut evaluator: Option<&mut bundling_wgpu::ambiguity::Evaluator<'_, '_>>,
-    ambiguity_images: &mut Vec<ambiguity_report::Image>,
+    mut ambiguity: Option<&mut ambiguity_report::Session<'_>>,
 ) -> Result<()> {
     let mut distortion_images = Vec::new();
     let iterations = if opts.neighbor_radius.is_some() {
@@ -232,25 +220,8 @@ fn image_flow(
                 result.0, result.1
             );
         }
-        if let Some(evaluator) = evaluator.as_mut() {
-            let row = if let Some(current) = &current {
-                let mut paths = Vec::new();
-                paths.try_reserve_exact(current.layout().edge_count())?;
-                paths.extend(
-                    current
-                        .edges()
-                        .map(|(id, points)| bundling_wgpu::ambiguity_index::Path { id, points }),
-                );
-                evaluator.evaluate(&paths).wrap_err("evaluate ambiguity snapshot; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit")?
-            } else {
-                evaluator.baseline()
-            };
-            ambiguity_images.push(ambiguity_report::Image::new(
-                name,
-                iteration,
-                &row,
-                &evaluator.baseline(),
-            )?);
+        if let Some(session) = ambiguity.as_mut() {
+            session.record(name, iteration, current.as_ref())?;
         }
     }
     if let Some(noisiness) = noisiness {
