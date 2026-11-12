@@ -4,12 +4,11 @@
 //! every geometric decision is made on the device.
 use super::super::{Error, Geometry, Limit, Protocol, Result};
 use super::{
-    Config, Core, Fault, FrameStatistics, Originals,
+    Config, Core, Fault, FrameStatistics, Key, Labels, Originals, Ranking, Scratch,
     originals::ROUTE_LIMIT,
-    runner::{
-        Bind, Bound, Host, P, add, bits, histogram_words, mul, scan_words, slice_size, spans, word,
-    },
-    status_word, unfinished,
+    ranked_words,
+    runner::{Bind, Bound, Host, P, add, bits, mul, scan_words, slice_size, spans, word},
+    status_word,
 };
 
 /// Work items per dispatch; each examines at most 64 partner entries.
@@ -80,7 +79,7 @@ fn positive(
     let route_count = u64::from(originals.route_count);
     core.runner.reset();
     core.run(
-        "frame_mark",
+        "point_mark",
         &[
             (1, points),
             (2, &geometry.paths),
@@ -448,19 +447,6 @@ fn workspace_words(cells: u64) -> Result<[u64; 7]> {
     ])
 }
 
-/// Word counts shared by capacity planning and sustained-component logging.
-fn logging_words(components: u64) -> Result<[u64; 5]> {
-    let histogram = histogram_words(components)?;
-    let marks = add(components, 1)?;
-    Ok([
-        mul(components, 3)?,
-        mul(components, 3)?,
-        histogram,
-        scan_words(marks.max(histogram))?,
-        marks,
-    ])
-}
-
 struct BatchMemory {
     total: u64,
     largest: u64,
@@ -479,7 +465,7 @@ fn batch_memory(cells: u64) -> Result<BatchMemory> {
     }
     for words in workspace_words(cells)?
         .into_iter()
-        .chain(logging_words(cells)?)
+        .chain(ranked_words(cells)?)
     {
         let bytes = mul(words, 4)?
             .max(16)
@@ -682,8 +668,7 @@ impl Run<'_> {
     ) -> Result<()> {
         let units = add(u64::from(WALK_STEPS), 4)?;
         let slice = slice_size(units);
-        let mut round = 0;
-        loop {
+        let step = |core: &mut Core, round| {
             core.runner.reset();
             for (first, count) in spans(0, self.cells, slice) {
                 core.run_bounded(
@@ -700,15 +685,11 @@ impl Run<'_> {
                     Bound::Each(units),
                 )?;
             }
-            let status = core.runner.status(stage)?;
-            if status_word(&status, S_PENDING) == 0 {
-                return Ok(());
-            }
-            round = add(round, 1)?;
-            if round > WALK_ROUNDS {
-                return Err(unfinished(stage, WALK_ROUNDS));
-            }
-        }
+            Ok(())
+        };
+        let stage = (stage, add(WALK_ROUNDS, 1)?, WALK_ROUNDS);
+        core.settle(stage, step, |status| status_word(status, S_PENDING) == 0)?;
+        Ok(())
     }
 
     /// Chain the cells into their buckets and link joined neighbors. A join
@@ -738,21 +719,18 @@ impl Run<'_> {
     /// Propagate labels until a complete round changes nothing.
     fn components(&self, core: &mut Core, statistics: &mut FrameStatistics) -> Result<()> {
         let binds = [(3, &self.workspace.state), (5, &self.workspace.links)];
-        let mut rounds = 0;
-        loop {
+        // The status counts changes of all rounds between two checks.
+        let step = |core: &mut Core, _| {
             core.runner.reset();
             for _ in 0..ROUNDS_PER_CHECK {
                 core.run("label_round", &binds, self.keys, self.cells)?;
             }
-            rounds = add(rounds, ROUNDS_PER_CHECK)?;
-            let status = core.runner.status("contact components")?;
-            if status_word(&status, S_CHANGED) == 0 {
-                break;
-            }
-            if rounds >= ROUND_LIMIT {
-                return Err(unfinished("contact components", ROUND_LIMIT));
-            }
-        }
+            Ok(())
+        };
+        let checks = ROUND_LIMIT.div_ceil(ROUNDS_PER_CHECK);
+        let stage = ("contact components", checks, ROUND_LIMIT);
+        let checked = core.settle(stage, step, |status| status_word(status, S_CHANGED) == 0)?;
+        let rounds = mul(checked, ROUNDS_PER_CHECK)?;
         statistics.label_rounds = add(statistics.label_rounds, rounds)?;
         statistics.largest_batch_label_rounds = statistics.largest_batch_label_rounds.max(rounds);
         Ok(())
@@ -794,34 +772,26 @@ impl Run<'_> {
         }
         let workspace = self.workspace;
         core.scoped(|core| {
-            let [first, second, histogram, scratch, unique] = logging_words(components)?;
-            let first = core.words("ambiguity f32 component pairs", first)?;
-            let second = core.words("ambiguity f32 component pairs", second)?;
-            let histogram = core.words("ambiguity f32 component pair histogram", histogram)?;
-            let scratch = core.words("ambiguity f32 component pair scan sums", scratch)?;
-            let unique = core.words("ambiguity f32 component pair marks", unique)?;
+            let labels = Labels {
+                records: "ambiguity f32 component pairs",
+                histogram: "ambiguity f32 component pair histogram",
+                marks: "ambiguity f32 component pair marks",
+            };
+            let scratch = Scratch::Owned("ambiguity f32 component pair scan sums");
+            let pairs = Ranking::new(core, components, &labels, scratch)?;
             core.run(
                 "sustained_pairs",
-                &[(1, &workspace.records), (6, &workspace.marks), (7, &first)],
+                &[
+                    (1, &workspace.records),
+                    (6, &workspace.marks),
+                    (7, &pairs.records[0]),
+                ],
                 self.keys,
                 self.cells,
             )?;
             let route_bits = self.keys.d;
-            let (sorted, _) = core.sort(
-                (&first, &second),
-                (&histogram, &scratch),
-                components,
-                (route_bits, route_bits),
-            )?;
-            let count = P {
-                n: word(components)?,
-                a: word(logged)?,
-                ..P::default()
-            };
-            let keyed = [(4, sorted), (5, &unique)];
-            let padded = add(components, 1)?;
-            core.run("key_marks", &keyed, P { a: 0, ..count }, padded)?;
-            let contacts = core.total(&unique, components, &scratch)?;
+            let sorted = pairs.rank(core, components, (route_bits, route_bits), Key::Both)?;
+            let contacts = core.word(&pairs.marks, components)?;
             let total = add(logged, contacts)?;
             if total > log.capacity {
                 return Err(Error::Limit {
@@ -830,7 +800,12 @@ impl Run<'_> {
                     available: log.capacity,
                 });
             }
-            let written = [(4, sorted), (5, &unique), (7, log.buffer)];
+            let count = P {
+                n: word(components)?,
+                a: word(logged)?,
+                ..P::default()
+            };
+            let written = [(4, sorted), (5, &pairs.marks), (7, log.buffer)];
             core.run("pair_out", &written, count, components)?;
             Ok(contacts)
         })

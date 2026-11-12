@@ -29,7 +29,7 @@ mod score;
 
 pub use distance::{SEARCH_CELLS_LIMIT, Statistics as DistanceStatistics};
 use originals::Originals;
-use runner::{Bound, Entry, Module, Runner, Store, mul};
+use runner::{Bound, Entry, Module, P, Runner, Store, add, histogram_words, mul, scan_words};
 pub use runner::{INVOCATION_TARGET, WORK_TARGET};
 
 /// Version of the f32 numerical contract reported with every result.
@@ -345,8 +345,7 @@ impl Core {
     }
     /// Exclusive scan of `count` + 1 words from word 0, then the total.
     fn total(&mut self, values: &wgpu::Buffer, count: u64, scratch: &wgpu::Buffer) -> Result<u64> {
-        self.scan(values, (0, runner::add(count, 1)?), scratch)?;
-        self.word(values, count)
+        self.count("prefix scan", values, count, scratch)
     }
     /// `total` whose overflow is reported as the named u32 count.
     fn count(
@@ -356,9 +355,8 @@ impl Core {
         count: u64,
         scratch: &wgpu::Buffer,
     ) -> Result<u64> {
-        let padded = runner::add(count, 1)?;
         self.runner
-            .scan(&self.kernels, values, (0, padded), scratch)?;
+            .scan(&self.kernels, values, (0, add(count, 1)?), scratch)?;
         self.runner.status(what)?;
         self.word(values, count)
     }
@@ -408,9 +406,124 @@ impl Core {
         let value = result?;
         released.map(|()| value)
     }
+    /// Bounded iteration: run `step` with the attempt index, then read the
+    /// status of `stage`, until `done` accepts it. After `attempts` steps the
+    /// stage fails as unfinished within `limit`, the caller's round count.
+    /// `step` resets the status counters where its algorithm needs. Returns
+    /// the attempts used.
+    fn settle(
+        &mut self,
+        (stage, attempts, limit): (&'static str, u64, u64),
+        mut step: impl FnMut(&mut Self, u64) -> Result<()>,
+        done: impl Fn(&[u32]) -> bool,
+    ) -> Result<u64> {
+        for attempt in 0..attempts {
+            step(self, attempt)?;
+            if done(&self.runner.status(stage)?) {
+                return add(attempt, 1);
+            }
+        }
+        Err(unfinished(stage, limit))
+    }
     /// Write host words to a buffer; nothing may be encoded for it yet.
     fn upload(&self, buffer: &wgpu::Buffer, bytes: &[u8]) {
         self.runner.write(buffer, bytes);
+    }
+}
+
+/// Scratch element of the ranking allocation layout.
+const RANK_SCRATCH_INDEX: usize = 3;
+
+/// Word counts of a ranking workspace over `count` records: both record
+/// buffers, the radix histogram, the scan scratch and the key marks. Contact
+/// capacity planning uses the same counts.
+fn ranked_words(count: u64) -> Result<[u64; 5]> {
+    let histogram = histogram_words(count)?;
+    let marks = add(count, 1)?;
+    Ok([
+        mul(count, 3)?,
+        mul(count, 3)?,
+        histogram,
+        scan_words(marks.max(histogram))?,
+        marks,
+    ])
+}
+
+/// Labels of a ranking workspace's buffers.
+struct Labels {
+    records: &'static str,
+    histogram: &'static str,
+    marks: &'static str,
+}
+/// Where a ranking workspace's scan scratch comes from.
+#[derive(Clone, Copy)]
+enum Scratch<'a> {
+    /// A new buffer with this label.
+    Owned(&'static str),
+    /// A live buffer of at least the workspace's scratch words.
+    Borrowed(&'a wgpu::Buffer),
+}
+/// Which key words decide that two sorted records differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Both,
+    High,
+}
+
+/// Workspace of stable three-word record sorts with key-change ranks, released
+/// with the scope that allocated it. Callers write records into `records[0]`.
+struct Ranking {
+    records: [wgpu::Buffer; 2],
+    histogram: wgpu::Buffer,
+    scratch: wgpu::Buffer,
+    /// Scanned key-change marks of the last rank: dense rank from 1.
+    marks: wgpu::Buffer,
+}
+impl Ranking {
+    /// Allocate a workspace for at most `count` records.
+    fn new(core: &mut Core, count: u64, labels: &Labels, scratch: Scratch<'_>) -> Result<Self> {
+        let [records, _, histogram, scan, marks] = ranked_words(count)?;
+        let first = core.words(labels.records, records)?;
+        let second = core.words(labels.records, records)?;
+        let histogram = core.words(labels.histogram, histogram)?;
+        let scratch = match scratch {
+            Scratch::Owned(label) => core.words(label, scan)?,
+            Scratch::Borrowed(buffer) => buffer.clone(),
+        };
+        Ok(Self {
+            records: [first, second],
+            histogram,
+            scratch,
+            marks: core.words(labels.marks, marks)?,
+        })
+    }
+    /// Sort `count` records by `key_bits`, then mark and scan the key changes.
+    /// Returns the sorted records.
+    fn rank(
+        &self,
+        core: &mut Core,
+        count: u64,
+        key_bits: (u32, u32),
+        key: Key,
+    ) -> Result<&wgpu::Buffer> {
+        let [first, second] = &self.records;
+        let (sorted, _) = core.sort(
+            (first, second),
+            (&self.histogram, &self.scratch),
+            count,
+            key_bits,
+        )?;
+        core.run(
+            "key_marks",
+            &[(4, sorted), (5, &self.marks)],
+            P {
+                a: u32::from(key == Key::High),
+                ..P::count(count)?
+            },
+            add(count, 1)?,
+        )?;
+        core.scan(&self.marks, (0, add(count, 1)?), &self.scratch)?;
+        Ok(sorted)
     }
 }
 
@@ -526,7 +639,6 @@ const UTIL: &[Entry] = &[
 const ORIGINALS: &[Entry] = &[
     ("route_mark", 1),
     ("route_init", 0),
-    ("point_mark", 1),
     ("dedup_write", 1),
     ("route_dedup", 1),
     ("collinear_mark", 192),
@@ -542,8 +654,7 @@ const ORIGINALS: &[Entry] = &[
     ("route_place", 1),
     ("route_rep", 1),
     ("simplify_step", 0),
-    ("endpoint_count", 0),
-    ("endpoint_fill", 0),
+    ("endpoint_visit", 0),
     ("cohort_pairs", 40),
     ("cohort_collect", 1),
     ("first_fit", 0),
@@ -565,7 +676,7 @@ const DISTANCE: &[Entry] = &[
     ("assess_step", 4),
 ];
 const FRAME: &[Entry] = &[
-    ("frame_mark", 1),
+    ("point_mark", 1),
     ("frame_counts", 0),
     ("frame_segments", 1),
     ("frame_routes", 1),

@@ -193,7 +193,7 @@ impl Assessor {
         // One simplified orientation, both, both full curves, then the chosen
         // full orientation.
         let size = TASK_SLICE.min(slice_size(self.task_units));
-        for _ in 0..4 {
+        let step = |core: &mut Core, _| {
             core.runner.reset();
             for (first, slice) in spans(0, tasks, size) {
                 core.run_bounded(
@@ -219,13 +219,11 @@ impl Assessor {
                 self.search(core, originals, tasks, searches)?;
             }
             core.runner.reset();
-            core.run("assess_step", &self.binds(originals), pairs, count)?;
-            let status = core.runner.status("route distance refinement")?;
-            if status_word(&status, S_PENDING) == 0 {
-                return Ok(());
-            }
-        }
-        Err(unfinished("route distance refinement", 4))
+            core.run("assess_step", &self.binds(originals), pairs, count)
+        };
+        let stage = ("route distance refinement", 4, 4);
+        core.settle(stage, step, |status| status_word(status, S_PENDING) == 0)?;
+        Ok(())
     }
 
     /// Bounded frontier searches of the pending tasks, tier by tier, as many
@@ -429,12 +427,11 @@ impl Assessor {
                 let search_count = u64::from(chunk.searches.1.saturating_sub(chunk.searches.0));
                 let tile_count = chunk.tiles.1.saturating_sub(chunk.tiles.0);
                 self.tiles(core, originals, "grid_init", chunk, registers)?;
-                let mut rounds = 0;
-                loop {
-                    // Complete rounds over every tile of the chunk. After each
-                    // round the tiles to sweep next are those marked during it.
-                    // The status is reset before the last round, so a zero count
-                    // means one complete round changed nothing anywhere.
+                // Complete rounds over every tile of the chunk. After each
+                // round the tiles to sweep next are those marked during it.
+                // The status is reset before the last round, so a zero count
+                // means one complete round changed nothing anywhere.
+                let step = |core: &mut Core, _| {
                     for round in 0..ROUNDS_PER_CHECK {
                         if round.checked_add(1) == Some(ROUNDS_PER_CHECK) {
                             core.runner.reset();
@@ -450,15 +447,12 @@ impl Assessor {
                             u64::from(tile_count),
                         )?;
                     }
-                    rounds = add(rounds, ROUNDS_PER_CHECK)?;
-                    let status = core.runner.status("route distance relaxation")?;
-                    if status_word(&status, S_CHANGED) == 0 {
-                        break;
-                    }
-                    if rounds >= ROUND_LIMIT {
-                        return Err(unfinished("route distance relaxation", ROUND_LIMIT));
-                    }
-                }
+                    Ok(())
+                };
+                let checks = ROUND_LIMIT.div_ceil(ROUNDS_PER_CHECK);
+                let stage = ("route distance relaxation", checks, ROUND_LIMIT);
+                let changed = |status: &[u32]| status_word(status, S_CHANGED) == 0;
+                let rounds = mul(core.settle(stage, step, changed)?, ROUNDS_PER_CHECK)?;
                 self.statistics.relaxation_rounds = add(self.statistics.relaxation_rounds, rounds)?;
                 core.run(
                     "grid_finish",

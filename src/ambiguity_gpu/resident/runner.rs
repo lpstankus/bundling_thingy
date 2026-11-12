@@ -11,7 +11,6 @@ use super::super::{
     resources::{Owned, Pool, Spec, Usage},
 };
 use super::Fault;
-use crate::weak_frechet::Budget;
 use std::{num::NonZeroU64, sync::mpsc, time::Instant};
 
 pub(super) const WORKGROUP: u64 = 256;
@@ -187,7 +186,6 @@ enum Keep {
 
 pub(super) struct Store {
     pool: Pool,
-    budget: Budget,
     /// Each buffer with how long it lives.
     owned: Vec<(Owned, Keep)>,
 }
@@ -195,9 +193,6 @@ impl Store {
     pub(super) const fn new(device: wgpu::Device, limit: u64) -> Self {
         Self {
             pool: Pool::new(device, limit),
-            // The pool reserves no stored records here; this ledger only
-            // satisfies its interface.
-            budget: Budget::with_record_limit(0, 0, 0),
             owned: Vec::new(),
         }
     }
@@ -205,7 +200,7 @@ impl Store {
         self.owned
             .try_reserve(1)
             .map_err(|_| Error::Fault(Fault::HostAllocation))?;
-        let owned = self.pool.allocate(&mut self.budget, spec)?;
+        let owned = self.pool.allocate(spec)?;
         let buffer = owned.buffer().clone();
         self.owned.push((owned, Keep::Scope));
         Ok(buffer)
@@ -216,7 +211,6 @@ impl Store {
             label,
             bytes: mul(count, 4)?,
             usage: Usage::Storage,
-            records: 0,
         })
     }
     pub(super) const fn mark(&self) -> usize {
@@ -246,7 +240,7 @@ impl Store {
                 Some((owned, Keep::Promoted)) => kept.push((owned, Keep::Scope)),
                 Some((owned, Keep::Session)) => kept.push((owned, Keep::Session)),
                 Some((owned, Keep::Scope)) => {
-                    let freed = self.pool.free(&mut self.budget, owned);
+                    let freed = self.pool.free(owned);
                     result = result.and(freed);
                 }
                 None => {}
@@ -264,7 +258,7 @@ impl Store {
     }
     /// Bytes still available under the limit.
     pub(super) const fn available(&self) -> u64 {
-        self.pool.available(0)
+        self.pool.available()
     }
 }
 
@@ -384,14 +378,12 @@ impl Runner {
             label: "ambiguity f32 registers",
             bytes: RING_BYTES,
             usage: Usage::Uniform,
-            records: 0,
         })?;
         let status = store.words("ambiguity f32 status", STATUS_BYTES / 4)?;
         let staging = store.allocate(&Spec {
             label: "ambiguity f32 staging",
             bytes: STAGING_BYTES,
             usage: Usage::Read,
-            records: 0,
         })?;
         let mut dummies = Vec::new();
         for _ in 0..STORAGE_BINDINGS {

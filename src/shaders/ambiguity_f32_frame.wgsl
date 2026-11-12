@@ -15,11 +15,13 @@
 @group(0) @binding(6) var<storage, read_write> fc: array<u32>;
 @group(0) @binding(7) var<storage, read_write> fd: array<u32>;
 
-// fa: positive mark per point (plus zero at p.n). fd: ordinal + 1 by ID.
-// p.a: reservations. Every point must lie inside its eligible reservation and
-// be finite and admitted.
+// fa: mark per raw point (plus zero at p.n). fd: ordinal + 1 by ID. p.a:
+// reservations. Every point must lie inside its eligible reservation and be
+// finite and admitted. A point is marked when its normalized bits differ from
+// its predecessor's. p.b = 1 also marks each route's first point: the keep
+// marks of the originals. p.b = 0 gives the positive segment ends of a frame.
 @compute @workgroup_size(WG)
-fn frame_mark(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn point_mark(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let i = index_of(id, groups);
     if i > p.n {
         return;
@@ -46,12 +48,12 @@ fn frame_mark(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgro
         fail(E_RANGE);
         return;
     }
+    var mark = p.b == 1u && i == path.point_offset;
     if i > path.point_offset {
         let previous = points[i - 1u];
-        if normal_zero(point.x) != normal_zero(previous.x) || normal_zero(point.y) != normal_zero(previous.y) {
-            fa[i] = 1u;
-        }
+        mark = normal_zero(point.x) != normal_zero(previous.x) || normal_zero(point.y) != normal_zero(previous.y);
     }
+    fa[i] = select(0u, 1u, mark);
 }
 
 // fa: scanned marks. fb: positive segments per route (plus zero at p.n). The
