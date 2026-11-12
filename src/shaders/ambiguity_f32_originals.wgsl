@@ -33,7 +33,8 @@ fn route_mark(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgro
 // wa: scanned marks (route ordinals by increasing ID). wd: ordinal + 1 by ID.
 // p.b: active points; p.c: largest admitted point count of one route. Every
 // point of a route must carry its ID; with the per-point range check of
-// `point_mark` this proves that the routes tile the active points.
+// `point_mark` (frame kernels) this proves that the routes tile the active
+// points.
 @compute @workgroup_size(WG)
 fn route_init(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let edge = index_of(id, groups);
@@ -62,45 +63,6 @@ fn route_init(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgro
     routes[o].count = path.count;
     routes[o].scratch = 0u;
     wd[edge] = o + 1u;
-}
-
-// wa: keep mark per raw point (plus a zero at index n). wd: ordinal table.
-// A point is kept when it starts its route or differs from its predecessor.
-@compute @workgroup_size(WG)
-fn point_mark(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = index_of(id, groups);
-    if i > p.n {
-        return;
-    }
-    if i == p.n {
-        wa[i] = 0u;
-        return;
-    }
-    let point = points[i];
-    wa[i] = 0u;
-    if point.edge_id >= p.a {
-        fail(E_LAYOUT);
-        return;
-    }
-    let path = paths[point.edge_id];
-    if i < path.point_offset || i - path.point_offset >= path.count || wd[point.edge_id] == 0u {
-        fail(E_LAYOUT);
-        return;
-    }
-    if !(is_finite_bits(point.x) && is_finite_bits(point.y)) {
-        fail(E_NONFINITE);
-        return;
-    }
-    if !(admitted_bits(point.x) && admitted_bits(point.y)) {
-        fail(E_RANGE);
-        return;
-    }
-    var keep = i == path.point_offset;
-    if !keep {
-        let previous = points[i - 1u];
-        keep = normal_zero(point.x) != normal_zero(previous.x) || normal_zero(point.y) != normal_zero(previous.y);
-    }
-    wa[i] = select(0u, 1u, keep);
 }
 
 // wa: scanned keep marks. wb: deduplicated points (x, y, ordinal). wd: ordinal table.
@@ -512,43 +474,35 @@ fn endpoints_compatible(a: Route, b: Route) -> bool {
         || sqrt(max(sq(first_a, last_b), sq(last_a, first_b))) <= p.x;
 }
 
-// Counts, for unique route i, the earlier unique routes in [p.a, p.b) whose
-// endpoints are compatible. wa: canonical points. wb: counts (accumulated).
-// wc: persistent words (representatives at p.c).
+// Visits, for unique route i, the earlier unique routes in [p.a, p.b) whose
+// endpoints are compatible, in increasing order. wa: canonical points. wc:
+// persistent words (representatives at p.c). p.e = 0 counts them into wb
+// (accumulated over the slices). p.e = 1 fills them: wb holds the scanned
+// counts, wd receives the earlier unique routes by later unique route, and the
+// route's scratch word keeps its cursor between slices.
 @compute @workgroup_size(WG)
-fn endpoint_count(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = index_of(id, groups);
-    if i >= p.n {
-        return;
-    }
-    let route = routes[wc[p.c + i]];
-    var count = 0u;
-    for (var j = p.a; j < min(p.b, i); j += 1u) {
-        if endpoints_compatible(route, routes[wc[p.c + j]]) {
-            count += 1u;
-        }
-    }
-    wb[i] += count;
-}
-
-// Fills the routes counted above in increasing order. wb: scanned counts.
-// wd: earlier unique routes with compatible endpoints, by later unique route.
-@compute @workgroup_size(WG)
-fn endpoint_fill(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn endpoint_visit(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let i = index_of(id, groups);
     if i >= p.n {
         return;
     }
     let o = wc[p.c + i];
     let route = routes[o];
-    var cursor = route.scratch;
+    let fill = p.e == 1u;
+    var cursor = select(0u, route.scratch, fill);
     for (var j = p.a; j < min(p.b, i); j += 1u) {
         if endpoints_compatible(route, routes[wc[p.c + j]]) {
-            wd[wb[i] + cursor] = j;
+            if fill {
+                wd[wb[i] + cursor] = j;
+            }
             cursor += 1u;
         }
     }
-    routes[o].scratch = cursor;
+    if fill {
+        routes[o].scratch = cursor;
+    } else {
+        wb[i] += cursor;
+    }
 }
 
 // Assessment pairs of list entries [p.a, p.a + p.n): the later unique route

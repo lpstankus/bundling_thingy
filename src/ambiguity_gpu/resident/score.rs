@@ -3,9 +3,11 @@
 //! the final counts and scalars only.
 use super::super::{Error, Protocol, Result};
 use super::{
-    CohortScores, Config, Core, Fault, Interval, Originals, View,
+    CohortScores, Config, Core, Fault, Interval, Key, Labels, Originals, RANK_SCRATCH_INDEX,
+    Ranking, Scratch, View,
     distance::{Assessor, PAIRS},
-    runner::{Bound, P, add, bits, histogram_words, mul, scan_words, spans, word},
+    ranked_words,
+    runner::{Bound, P, add, bits, mul, spans, word},
     status_word,
 };
 
@@ -175,40 +177,33 @@ impl Records<'_> {
                 contacting: 0,
             });
         }
-        let first = core.words("ambiguity f32 cohort pair records", mul(crossing, 3)?)?;
-        let second = core.words("ambiguity f32 cohort pair records", mul(crossing, 3)?)?;
-        let histogram = core.words(
-            "ambiguity f32 cohort pair histogram",
-            histogram_words(crossing)?,
-        )?;
-        let unique = core.words("ambiguity f32 cohort pair marks", add(crossing, 1)?)?;
+        let labels = Labels {
+            records: "ambiguity f32 cohort pair records",
+            histogram: "ambiguity f32 cohort pair histogram",
+            marks: "ambiguity f32 cohort pair marks",
+        };
+        // The record scratch is sized for every contact, at least `crossing`.
+        let pairs = Ranking::new(core, crossing, &labels, Scratch::Borrowed(&self.scratch))?;
+        let unique = &pairs.marks;
         core.run(
             "cross_keys",
-            &[(4, &self.scores), (5, &self.marks), (6, &first)],
+            &[(4, &self.scores), (5, &self.marks), (6, &pairs.records[0])],
             self.count,
             self.contacts,
         )?;
         let cohort_bits = bits(add(originals.preparation.cohorts, 1)?);
-        let (sorted, _) = core.sort(
-            (&first, &second),
-            (&histogram, &self.scratch),
-            crossing,
-            (cohort_bits, cohort_bits),
-        )?;
+        let sorted = pairs.rank(core, crossing, (cohort_bits, cohort_bits), Key::Both)?;
         let crossing_n = P::count(crossing)?;
-        let padded = add(crossing, 1)?;
-        let keyed = [(4, sorted), (5, &unique)];
-        core.run("key_marks", &keyed, crossing_n, padded)?;
-        let contacting = core.total(&unique, crossing, &self.scratch)?;
+        let contacting = core.word(unique, crossing)?;
         let flags = core.words("ambiguity f32 witness marks", add(contacting, 1)?)?;
-        let marked = [(4, sorted), (5, &unique), (7, &flags)];
+        let marked = [(4, sorted), (5, unique), (7, &flags)];
         core.run("witness_marks", &marked, crossing_n, crossing)?;
         let witnessed = core.total(&flags, contacting, &self.scratch)?;
         let list = if witnessed > 0 {
             let list = core.words("ambiguity f32 witnessed cohort pairs", mul(witnessed, 2)?)?;
             core.run(
                 "witness_list",
-                &[(4, sorted), (5, &unique), (6, &list), (7, &flags)],
+                &[(4, sorted), (5, unique), (6, &list), (7, &flags)],
                 crossing_n,
                 crossing,
             )?;
@@ -347,7 +342,7 @@ pub(super) fn score(
             marks: core.words("ambiguity f32 score marks", add(contacts, 1)?)?,
             scratch: core.words(
                 "ambiguity f32 score scan sums",
-                scan_words(add(contacts, 1)?.max(histogram_words(contacts)?))?,
+                ranked_words(contacts)?[RANK_SCRATCH_INDEX],
             )?,
             contacts,
             count: P {

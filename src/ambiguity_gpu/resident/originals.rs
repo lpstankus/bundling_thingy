@@ -4,10 +4,10 @@
 //! and the final membership table.
 use super::super::{Error, Geometry, Result};
 use super::{
-    Config, Core, Preparation,
+    Config, Core, Key, Labels, Preparation, Ranking, Scratch,
     distance::{Assessor, PAIRS},
-    runner::{Bound, P, add, bits, histogram_words, mul, scan_words, spans, step_budget, word},
-    status_word, unfinished,
+    runner::{Bound, P, add, bits, mul, scan_words, spans, step_budget, word},
+    status_word,
 };
 
 /// Largest stored point count of one route; bounds every per-route loop.
@@ -110,6 +110,7 @@ fn layout(
         P {
             n: geometry.samples,
             a: geometry.reservations,
+            b: 1,
             ..P::default()
         },
         add(samples, 1)?,
@@ -194,45 +195,12 @@ fn canonicalize(
     })
 }
 
-/// Sort workspace of the naming passes.
-struct Naming {
-    records: [wgpu::Buffer; 2],
-    sorter: [wgpu::Buffer; 2],
-    marks: wgpu::Buffer,
-}
-impl Naming {
-    /// Sort `count` records, then mark and scan the key changes. Returns the
-    /// sorted records.
-    fn rank(
-        &self,
-        core: &mut Core,
-        n: u64,
-        key_bits: (u32, u32),
-        high_only: bool,
-    ) -> Result<&wgpu::Buffer> {
-        let [first, second] = &self.records;
-        let [histogram, scratch] = &self.sorter;
-        let (sorted, _) = core.sort((first, second), (histogram, scratch), n, key_bits)?;
-        core.run(
-            "key_marks",
-            &[(4, sorted), (5, &self.marks)],
-            P {
-                a: u32::from(high_only),
-                ..P::count(n)?
-            },
-            add(n, 1)?,
-        )?;
-        core.scan(&self.marks, (0, add(n, 1)?), scratch)?;
-        Ok(sorted)
-    }
-}
-
 /// Block names of every canonical point's block, level by level; returns the
 /// buffer whose word at each route's first point names the whole route.
 fn names(
     core: &mut Core,
     canonical: &Canonical,
-    naming: &Naming,
+    naming: &Ranking,
     name_bits: u32,
 ) -> Result<wgpu::Buffer> {
     let points = canonical.points;
@@ -245,7 +213,7 @@ fn names(
     let mut key_bits = (32, 32);
     let mut level = 0_u32;
     loop {
-        let sorted = naming.rank(core, points, key_bits, false)?;
+        let sorted = naming.rank(core, points, key_bits, Key::Both)?;
         tracing::debug!(level, "gpu-f32 block naming level");
         core.run(
             "name_write",
@@ -278,18 +246,13 @@ fn names(
 fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(wgpu::Buffer, u64)> {
     let (points, route_count) = (canonical.points, canonical.route_count);
     core.scoped(|core| {
-        let records = |core: &mut Core| core.words("ambiguity f32 sort records", mul(points, 3)?);
-        let naming = Naming {
-            records: [records(core)?, records(core)?],
-            sorter: [
-                core.words("ambiguity f32 sort histogram", histogram_words(points)?)?,
-                core.words(
-                    "ambiguity f32 scan sums",
-                    scan_words(add(points, 1)?.max(histogram_words(points)?))?,
-                )?,
-            ],
-            marks: core.words("ambiguity f32 key marks", add(points, 1)?)?,
+        let labels = Labels {
+            records: "ambiguity f32 sort records",
+            histogram: "ambiguity f32 sort histogram",
+            marks: "ambiguity f32 key marks",
         };
+        let scratch = Scratch::Owned("ambiguity f32 scan sums");
+        let naming = Ranking::new(core, points, &labels, scratch)?;
         let name_bits = bits(add(points, 2)?);
         let named = names(core, canonical, &naming, name_bits)?;
         let routes_n = P::count(route_count)?;
@@ -300,7 +263,8 @@ fn order(core: &mut Core, canonical: &Canonical, reservations: u64) -> Result<(w
             routes_n,
             route_count,
         )?;
-        let sorted = naming.rank(core, route_count, (bits(reservations), name_bits), true)?;
+        let route_keys = (bits(reservations), name_bits);
+        let sorted = naming.rank(core, route_count, route_keys, Key::High)?;
         let unique = core.word(&naming.marks, route_count)?;
         let words = core.words(
             "ambiguity f32 order, representatives and knots",
@@ -337,7 +301,8 @@ fn simplify(core: &mut Core, originals: &Originals, unique: u64, sigma: f32) -> 
         // A resource limit, not a proven bound: 16 examinations per stored
         // point cover every route measured so far; exceeding it is an error.
         let limit = add(mul(u64::from(ROUTE_LIMIT), 16)?.div_ceil(steps), 8)?;
-        for round in 0..limit {
+        let rounds = ("original simplification", limit, limit);
+        let step = |core: &mut Core, round| {
             core.runner.reset();
             core.run_bounded(
                 "simplify_step",
@@ -358,13 +323,10 @@ fn simplify(core: &mut Core, originals: &Originals, unique: u64, sigma: f32) -> 
                 },
                 unique,
                 Bound::Each(add(steps, 1)?),
-            )?;
-            let status = core.runner.status("original simplification")?;
-            if status_word(&status, S_PENDING) == 0 {
-                return Ok(());
-            }
-        }
-        Err(unfinished("original simplification", limit))
+            )
+        };
+        core.settle(rounds, step, |status| status_word(status, S_PENDING) == 0)?;
+        Ok(())
     })
 }
 
@@ -377,10 +339,11 @@ struct Candidates {
     total: u64,
 }
 
+/// Count the endpoint-compatible earlier unique routes into `offsets`, or with
+/// a `list`, fill them in at the scanned `offsets`.
 fn endpoint_pass(
     core: &mut Core,
     originals: &Originals,
-    entry: &str,
     (offsets, list): (&wgpu::Buffer, Option<&wgpu::Buffer>),
     (unique, tolerance): (u64, f32),
 ) -> Result<()> {
@@ -395,13 +358,14 @@ fn endpoint_pass(
         ];
         binds.extend(list.map(|list| (7, list)));
         core.run_bounded(
-            entry,
+            "endpoint_visit",
             &binds,
             P {
                 n: word(unique)?,
                 a: word(first)?,
                 b: word(add(first, count)?)?,
                 c: originals.route_count,
+                e: u32::from(list.is_some()),
                 x: tolerance,
                 ..P::default()
             },
@@ -426,17 +390,11 @@ fn candidates(
     }
     let offsets = core.words("ambiguity f32 endpoint candidate offsets", add(unique, 1)?)?;
     let scale = (unique, config.endpoint_tolerance);
-    endpoint_pass(core, originals, "endpoint_count", (&offsets, None), scale)?;
+    endpoint_pass(core, originals, (&offsets, None), scale)?;
     let total = core.count("endpoint candidate count", &offsets, unique, scratch)?;
     tracing::info!(candidates = total, "gpu-f32 endpoint candidates counted");
     let list = core.words("ambiguity f32 endpoint candidates", total.max(1))?;
-    endpoint_pass(
-        core,
-        originals,
-        "endpoint_fill",
-        (&offsets, Some(&list)),
-        scale,
-    )?;
+    endpoint_pass(core, originals, (&offsets, Some(&list)), scale)?;
     for (first, chunk) in spans(0, total, PAIRS) {
         let registers = P {
             n: word(chunk)?,
@@ -486,8 +444,8 @@ fn first_fit(
         visits.checked_div(u64::from(FIT_STEPS)).unwrap_or(visits),
         2,
     )?;
-    let mut round = 0;
-    loop {
+    let rounds = ("cohort assignment", add(limit, 1)?, limit);
+    let step = |core: &mut Core, round| {
         core.runner.reset();
         core.run_once(
             "first_fit",
@@ -501,16 +459,10 @@ fn first_fit(
             // Each visit or transition is one step; transitions are at most
             // three per charged visit.
             Bound::Each(mul(u64::from(FIT_STEPS), 4)?),
-        )?;
-        let status = core.runner.status("cohort assignment")?;
-        if status_word(&status, S_A) == unique {
-            return Ok(());
-        }
-        round = add(round, 1)?;
-        if round > limit {
-            return Err(unfinished("cohort assignment", limit));
-        }
-    }
+        )
+    };
+    core.settle(rounds, step, |status| status_word(status, S_A) == unique)?;
+    Ok(())
 }
 
 /// First-fit complete-link cohorts over the unique routes, then memberships.

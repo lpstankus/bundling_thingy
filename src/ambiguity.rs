@@ -12,8 +12,7 @@
 //! Index and kernel temporary storage remain on that ledger during callbacks.
 use crate::{
     ambiguity_cohorts::{self, Cohorts, Route},
-    ambiguity_gpu,
-    ambiguity_index::{self, BroadPhase, Path},
+    ambiguity_index::{self, Path},
     ambiguity_similarity::{self, Config as Similarity},
     weak_frechet::{Budget, Error as Resource, Statistics},
 };
@@ -257,16 +256,6 @@ impl Evaluator<'_, '_> {
     /// # Errors
     /// Any failure invalidates this evaluator. No partial row is returned.
     pub fn evaluate(&mut self, paths: &[Path<'_>]) -> Result<Row, Error> {
-        self.evaluate_with(paths, BroadPhase::Cpu)
-    }
-    /// `evaluate` with the selected candidate broad phase.
-    /// # Errors
-    /// Any failure invalidates this evaluator. No partial row is returned.
-    pub fn evaluate_with(
-        &mut self,
-        paths: &[Path<'_>],
-        broad_phase: BroadPhase<'_>,
-    ) -> Result<Row, Error> {
         if !self.valid {
             return Err(Error::InvalidState);
         }
@@ -283,22 +272,17 @@ impl Evaluator<'_, '_> {
             )?;
             self.route(path.id).map_err(|_| Error::InvalidIds)?;
         }
-        let row = self.frame(paths, false, broad_phase)?;
+        let row = self.frame(paths, false)?;
         self.valid = true;
         Ok(row)
     }
-    fn frame(
-        &mut self,
-        paths: &[Path<'_>],
-        baseline: bool,
-        broad_phase: BroadPhase<'_>,
-    ) -> Result<Row, Error> {
+    fn frame(&mut self, paths: &[Path<'_>], baseline: bool) -> Result<Row, Error> {
         let phase = if baseline {
             Phase::Baseline
         } else {
             Phase::Snapshot
         };
-        self.frame_inner(paths, baseline, phase, broad_phase)
+        self.frame_inner(paths, baseline, phase)
             .map_err(|error| match error {
                 Error::Resource(resource) => Error::PhaseResource(phase, resource),
                 other => other,
@@ -309,7 +293,6 @@ impl Evaluator<'_, '_> {
         paths: &[Path<'_>],
         baseline: bool,
         phase: Phase,
-        broad_phase: BroadPhase<'_>,
     ) -> Result<Row, Error> {
         self.h.clear(self.budget)?;
         self.cross.clear(self.budget)?;
@@ -330,8 +313,7 @@ impl Evaluator<'_, '_> {
             row: &mut row,
             is_baseline: baseline,
         };
-        let stats = ambiguity_index::enumerate_with(
-            broad_phase,
+        let stats = ambiguity_index::enumerate(
             paths,
             self.config.radius,
             self.config.minimum_contact,
@@ -641,25 +623,6 @@ pub fn with_evaluator<R>(
     budget: &mut Budget,
     operation: impl FnOnce(&mut Evaluator<'_, '_>) -> Result<R, Error>,
 ) -> Result<R, Error> {
-    with_evaluator_using::<R>(original, config, None, budget, |evaluator, _| {
-        operation(evaluator)
-    })
-}
-
-/// `with_evaluator` whose baseline frame uses `baseline` instead of the CPU
-/// index when present. The source is handed back to `operation` afterwards.
-/// # Errors
-/// As `with_evaluator`, plus GPU contact resource, device and protocol failures.
-pub fn with_evaluator_using<R>(
-    original: &[Route<'_>],
-    config: &Config,
-    mut baseline: Option<&mut ambiguity_gpu::Frame>,
-    budget: &mut Budget,
-    operation: impl FnOnce(
-        &mut Evaluator<'_, '_>,
-        Option<&mut ambiguity_gpu::Frame>,
-    ) -> Result<R, Error>,
-) -> Result<R, Error> {
     budget.begin_phase();
     for route in original {
         budget.charge(u64::try_from(route.points.len()).map_err(|_| Resource::SizeOverflow)?)?;
@@ -731,12 +694,9 @@ pub fn with_evaluator_using<R>(
                     valid: false,
                 };
                 evaluator.budget.begin_phase();
-                let broad_phase = baseline
-                    .as_deref_mut()
-                    .map_or(BroadPhase::Cpu, BroadPhase::Gpu);
-                evaluator.baseline_row = evaluator.frame(&paths, true, broad_phase)?;
+                evaluator.baseline_row = evaluator.frame(&paths, true)?;
                 evaluator.valid = true;
-                operation(&mut evaluator, baseline)
+                operation(&mut evaluator)
             })();
             budget.release_records(records)?;
             budget.release(bytes)?;

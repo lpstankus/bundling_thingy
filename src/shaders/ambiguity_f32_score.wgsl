@@ -78,6 +78,14 @@ fn score_init(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgro
     sb[k] = select(0u, 1u, first != second && known == NONE);
 }
 
+// Assessment pair at word `slot` of sc: the representatives of both routes,
+// the later canonical route first.
+fn write_pair(slot: u32, a: Route, b: Route) {
+    let later = a.position > b.position;
+    sc[slot] = select(b.rep, a.rep, later);
+    sc[slot + 1u] = select(a.rep, b.rep, later);
+}
+
 // Assessment pairs of needed pairs [p.a, p.a + p.b). sb: scanned marks.
 // sc: pairs (16 words).
 @compute @workgroup_size(WG)
@@ -86,12 +94,7 @@ fn score_pairs(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgr
     if k >= p.n || sb[k + 1u] == sb[k] || sb[k] < p.a || sb[k] - p.a >= p.b {
         return;
     }
-    let a = routes[sa[8u * k]];
-    let b = routes[sa[8u * k + 1u]];
-    let slot = 16u * (sb[k] - p.a);
-    let later = a.position > b.position;
-    sc[slot] = select(b.rep, a.rep, later);
-    sc[slot + 1u] = select(a.rep, b.rep, later);
+    write_pair(16u * (sb[k] - p.a), routes[sa[8u * k]], routes[sa[8u * k + 1u]]);
 }
 
 // Diagnostic: assessment pairs of the p.n logged pairs themselves, whatever
@@ -102,11 +105,7 @@ fn probe_pairs(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgr
     if k >= p.n {
         return;
     }
-    let a = routes[pairs[2u * k]];
-    let b = routes[pairs[2u * k + 1u]];
-    let later = a.position > b.position;
-    sc[16u * k] = select(b.rep, a.rep, later);
-    sc[16u * k + 1u] = select(a.rep, b.rep, later);
+    write_pair(16u * k, routes[pairs[2u * k]], routes[pairs[2u * k + 1u]]);
 }
 
 fn excess(value: f32, tolerance: f32) -> f32 {

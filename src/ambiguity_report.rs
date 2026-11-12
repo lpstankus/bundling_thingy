@@ -2,7 +2,7 @@ use crate::{Options, gpu::SIZE};
 use bundling_wgpu::{
     ambiguity::{self, Bounds, CohortView, Evaluator, Row, View},
     ambiguity_cohorts::{Membership, Route},
-    ambiguity_gpu::{self, resident},
+    ambiguity_gpu::resident,
     ambiguity_index, ambiguity_similarity,
     geometry::Snapshot,
     weak_frechet::{Budget, Statistics, WorkBreakdown},
@@ -26,34 +26,31 @@ pub struct Parameters {
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-minimum-contact-pixels", default_value_t = 24.0, value_parser = positive_pixels)]
     minimum_contact_pixels: f64,
     /// Correspondence simplification error in export pixels. Zero uses full
-    /// curves. Certified for cpu and gpu; an f32 estimate for gpu-f32.
+    /// curves. Certified for cpu; an f32 estimate for gpu-f32.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-simplification-pixels", default_value_t = 0.1, value_parser = nonnegative_pixels)]
     simplification_pixels: f64,
     /// Work units per preparation or snapshot, shared across all pair
-    /// evaluations (cpu and gpu backends; rejected with gpu-f32, which bounds
-    /// work per GPU dispatch instead).
+    /// evaluations (cpu backend; rejected with gpu-f32, which bounds work per
+    /// GPU dispatch instead).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-work-limit", default_value_t = 2_000_000_000, value_parser = clap::value_parser!(u64).range(1..))]
     work_limit: u64,
     /// Requested evaluation workspace bytes, excluding shared snapshots and
-    /// allocator overhead (cpu and gpu backends; rejected with gpu-f32).
+    /// allocator overhead (cpu backend; rejected with gpu-f32).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-workspace-bytes", default_value_t = 1_073_741_824, value_parser = positive_capacity)]
     workspace_bytes: usize,
     /// Global stored-pair capacity, including fixed tables and temporary
-    /// candidate records (cpu and gpu backends; rejected with gpu-f32).
+    /// candidate records (cpu backend; rejected with gpu-f32).
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-stored-pair-limit", default_value_t = 5_000_000, value_parser = positive_capacity)]
     stored_pair_limit: usize,
-    /// Ambiguity backend. cpu and gpu produce the same CPU-f64 decisions and
-    /// scores; gpu-f32 evaluates everything on the GPU in f32.
+    /// Ambiguity backend. cpu is the CPU-f64 reference; gpu-f32 evaluates
+    /// everything on the GPU in f32.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-backend", value_enum, default_value_t = Backend::Cpu)]
     pub backend: Backend,
-    /// Combined byte limit for all GPU ambiguity buffers (gpu: per frame;
-    /// gpu-f32: everything it owns, including the frozen baseline), in MiB.
+    /// gpu-f32 only: combined byte limit for every GPU ambiguity buffer it
+    /// owns, including the frozen baseline, in MiB.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-memory-mib", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..=1 << 40))]
+    #[serde(skip)]
     gpu_memory_mib: u64,
-    /// Cap on GPU candidate records per batch; defaults to the stored-pair
-    /// limit (gpu backend; rejected with gpu-f32).
-    #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-batch-records", value_parser = clap::value_parser!(u32).range(1..))]
-    gpu_batch_records: Option<u32>,
     /// gpu-f32 only: largest free-space cell count of one whole-route distance
     /// search, enforced exactly.
     #[arg(requires = "evaluate_ambiguity", long = "ambiguity-gpu-search-cells", default_value_t = resident::SEARCH_CELLS_LIMIT, value_parser = clap::value_parser!(u64).range(1..=resident::SEARCH_CELLS_LIMIT))]
@@ -70,15 +67,15 @@ pub struct Parameters {
     gpu_host_mib: u64,
 }
 
-/// Resource flags of the cpu and gpu backends that gpu-f32 does not implement.
-const REFERENCE_ONLY: [(&str, &str); 4] = [
+/// Resource flags of the cpu backend that gpu-f32 does not implement.
+const REFERENCE_ONLY: [(&str, &str); 3] = [
     ("work_limit", "--ambiguity-work-limit"),
     ("workspace_bytes", "--ambiguity-workspace-bytes"),
     ("stored_pair_limit", "--ambiguity-stored-pair-limit"),
-    ("gpu_batch_records", "--ambiguity-gpu-batch-records"),
 ];
 /// Resource flags only gpu-f32 implements.
-const RESIDENT_ONLY: [(&str, &str); 3] = [
+const RESIDENT_ONLY: [(&str, &str); 4] = [
+    ("gpu_memory_mib", "--ambiguity-gpu-memory-mib"),
     ("gpu_search_cells", "--ambiguity-gpu-search-cells"),
     ("gpu_contact_pairs", "--ambiguity-gpu-contact-pairs"),
     ("gpu_host_mib", "--ambiguity-gpu-host-mib"),
@@ -89,7 +86,7 @@ pub fn check_backend_flags(matches: &clap::ArgMatches, backend: Backend) -> Resu
     let (flags, name) = if backend == Backend::GpuF32 {
         (REFERENCE_ONLY.as_slice(), "gpu-f32")
     } else {
-        (RESIDENT_ONLY.as_slice(), "the cpu and gpu backends")
+        (RESIDENT_ONLY.as_slice(), "the cpu backend")
     };
     for (id, flag) in flags {
         ensure!(
@@ -105,9 +102,6 @@ pub fn check_backend_flags(matches: &clap::ArgMatches, backend: Backend) -> Resu
 pub enum Backend {
     /// CPU AABB hierarchy and CPU contact kernel (reference).
     Cpu,
-    /// GPU candidates and certified GPU contact decisions on resident geometry,
-    /// with the complete CPU pair route for every uncertain pair.
-    Gpu,
     /// Every numerical stage on the GPU in f32, with no CPU fallback. Results
     /// are f32 estimates and can differ from the reference near thresholds.
     #[value(name = "gpu-f32")]
@@ -115,18 +109,10 @@ pub enum Backend {
     GpuF32,
 }
 
-/// Contact backend identity and GPU accounting for one frame.
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct CandidateStage {
+/// Contact backend identity of a cpu frame.
+#[derive(Serialize)]
+struct CandidateStage {
     backend: Backend,
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    gpu: Option<ambiguity_gpu::Statistics>,
-}
-impl CandidateStage {
-    const CPU: Self = Self {
-        backend: Backend::Cpu,
-        gpu: None,
-    };
 }
 
 fn positive_capacity(text: &str) -> std::result::Result<usize, String> {
@@ -175,20 +161,6 @@ impl Parameters {
             "ambiguity resource limits must be positive"
         );
         Ok(())
-    }
-    /// GPU candidate limits. The radius comes from each enumeration.
-    pub fn gpu_settings(&self) -> Result<ambiguity_gpu::Settings> {
-        Ok(ambiguity_gpu::Settings {
-            memory_bytes: self
-                .gpu_memory_mib
-                .checked_mul(1 << 20)
-                .ok_or_else(|| eyre!("GPU candidate memory overflow"))?,
-            // The CPU cannot retain more candidate records than the stored-pair limit.
-            batch_records: Some(
-                self.gpu_batch_records
-                    .unwrap_or_else(|| u32::try_from(self.stored_pair_limit).unwrap_or(u32::MAX)),
-            ),
-        })
     }
     /// Thresholds and limits of the gpu-f32 backend. The combined GPU byte limit
     /// covers every buffer it owns; the contact-pair limit caps logged contacts.
@@ -401,12 +373,7 @@ pub struct Image {
     candidates: CandidateStage,
 }
 impl Image {
-    pub fn new(
-        file: String,
-        iteration: u32,
-        (row, baseline): (&Row, &Row),
-        candidates: &CandidateStage,
-    ) -> Result<Self> {
+    pub fn new(file: String, iteration: u32, row: &Row, baseline: &Row) -> Result<Self> {
         Ok(Self {
             file,
             iteration,
@@ -418,7 +385,9 @@ impl Image {
             cohorts: row.cohorts,
             resources: row.resources,
             index: row.index,
-            candidates: *candidates,
+            candidates: CandidateStage {
+                backend: Backend::Cpu,
+            },
         })
     }
 }
@@ -432,45 +401,6 @@ struct Report<'a> {
     #[serde(with = "ResourceStatistics")]
     preparation_resources: Statistics,
     images: &'a [Image],
-}
-
-/// Evaluate one frame with the selected contact backend.
-/// # Errors
-/// Evaluation failures. GPU resource, device and protocol failures abort and
-/// never switch to the CPU index; per-pair numerical fallback is expected.
-pub fn evaluate(
-    evaluator: &mut Evaluator<'_, '_>,
-    paths: &[ambiguity_index::Path<'_>],
-    candidates: Option<(&ambiguity_gpu::Candidates, ambiguity_gpu::Geometry)>,
-) -> Result<(Row, CandidateStage)> {
-    let Some((candidates, geometry)) = candidates else {
-        return Ok((
-            evaluator.evaluate(paths).map_err(|error| eyre!(error))?,
-            CandidateStage::CPU,
-        ));
-    };
-    let mut frame = candidates.frame(geometry);
-    let row = evaluator
-        .evaluate_with(paths, ambiguity_index::BroadPhase::Gpu(&mut frame))
-        .map_err(|error| eyre!(error))?;
-    Ok((row, gpu_stage(&frame)))
-}
-
-fn gpu_stage(frame: &ambiguity_gpu::Frame) -> CandidateStage {
-    let timings = frame.timings();
-    tracing::info!(
-        validation_wait_seconds = timings.validation.as_secs_f64(),
-        setup_wait_seconds = timings.setup.as_secs_f64(),
-        count_wait_seconds = timings.count.as_secs_f64(),
-        fill_wait_seconds = timings.fill.as_secs_f64(),
-        contact_seconds = timings.contact.as_secs_f64(),
-        statistics = ?frame.statistics(),
-        "GPU ambiguity contact"
-    );
-    CandidateStage {
-        backend: Backend::Gpu,
-        gpu: Some(frame.statistics()),
-    }
 }
 
 /// Route views and typed report rows reserved by this integration.
@@ -498,8 +428,7 @@ fn integration_bytes(count: usize, rows: usize) -> Result<(usize, usize, usize)>
 pub fn run(
     opts: &Options,
     baseline: &Snapshot<'_>,
-    candidates: Option<(&ambiguity_gpu::Candidates, ambiguity_gpu::Geometry)>,
-    operation: impl FnOnce(&mut Evaluator<'_, '_>, CandidateStage, &mut Vec<Image>) -> Result<()>,
+    operation: impl FnOnce(&mut Evaluator<'_, '_>, &mut Vec<Image>) -> Result<()>,
 ) -> Result<()> {
     let params = &opts.ambiguity;
     let count = baseline.layout().edge_count();
@@ -530,27 +459,19 @@ pub fn run(
         );
         let mut images = Vec::new();
         images.try_reserve_exact(rows)?;
-        let mut frame = candidates.map(|(candidates, geometry)| candidates.frame(geometry));
-        // The inner Result preserves GPU/I/O failures; the outer Result owns evaluator cleanup.
-        ambiguity::with_evaluator_using(&originals, &config, frame.as_mut(), &mut budget, |evaluator, frame| {
+        // The inner Result preserves I/O failures; the outer Result owns evaluator cleanup.
+        ambiguity::with_evaluator(&originals, &config, &mut budget, |evaluator| {
             Ok((|| -> Result<()> {
-                let stage = frame.map_or(CandidateStage::CPU, |frame| gpu_stage(frame));
-                operation(evaluator, stage, &mut images)?;
+                operation(evaluator, &mut images)?;
                 let cohorts = evaluator.memberships();
                 let report = Report {
                     metadata: serde_json::json!({
-                        "schema_version": 2, "metric_version": 1, "metric": "ambiguity",
+                        "schema_version": 3, "metric_version": 1, "metric": "ambiguity",
                         "baseline": {"source": "gpu_resampled_iteration_0", "preprocessing_distortion_included": false},
                         "input": opts.input.display().to_string(),
-                        "geometry": {"geometry_contract_version": 1, "coordinate_space": "clip", "distance_output_units": "export_pixels", "squared_distance_output_units": "export_pixels_squared", "width": SIZE, "height": SIZE, "pixels_per_clip_unit": pixels_per_clip(), "normalization": "initial graph bounds, centered uniform 95% fit, fixed across snapshots", "active_samples": baseline.layout().sample_count()},
+                        "geometry": geometry(baseline.layout().sample_count()),
                         "counts": {"eligible_routes": count, "skipped_reservations": baseline.layout().skipped_count(), "total_reservations": count.saturating_add(baseline.layout().skipped_count()), "original_constants": evaluator.original_constant_count(), "closed_stored_start_routes": cohorts.closed_route_count, "unique_canonical_routes": cohorts.unique_route_count, "cohorts": cohorts.cohort_count},
-                        "definitions": {
-                            "general": "For sustained current contacts, sqrt(mean(max(d-T,0)^2))/T, with original whole-route continuous endpoint-constrained weak Frechet distance d in the joint selected orientation. Introduced/resolved incompatible edge counts and squared-excess sums are co-primary alongside RMS.",
-                            "endpoints": "Separate sqrt(mean(max(e-U,0)^2))/U over the same contacts, where e is the larger matched endpoint distance in that same orientation. Introduced/resolved counts and sums are co-primary.",
-                            "cohorts": "Deduplicated unordered cohort pairs witnessed by an incompatible contacting edge pair. Introduced cohort associations are primary; denominator counts all distinct cross-cohort pairs contacting in this snapshot.",
-                            "interpretation": "Lower excess means less original-route mismatch among current sustained contacts. Ratios are dimensionless and can exceed 1. Compatible contacts can dilute RMS. No combined score or overall quality claim.",
-                            "empty_contacts": "count 0, sums 0, RMS 0, ratios 0; empty cohort denominator gives fraction 0"
-                        },
+                        "definitions": definitions(),
                         "policies": {
                             "defaults": "Operational defaults, not calibrated perceptual constants. All pixel thresholds convert in f64 using SIZE/2; GPU f32 geometry is unchanged.",
                             "orientation": "Minimize max(d/T,e/U) jointly over forward/reversed matching, then smaller d, smaller e, then forward. Endpoint tolerance gives stronger endpoint influence. Inclusive thresholds, no epsilon halo.",
@@ -559,13 +480,13 @@ pub fn run(
                             "canonicalization": "Normalize signed zero; remove consecutive duplicates and exact redundant forward-collinear vertices while retaining retracing. Lexicographically smaller forward/reverse sequence, geometry order with stable edge ID ties. Closed routes retain stored starts.",
                             "cohorts": "First-fit complete-link over all unique canonical originals, with full membership mapping and duplicate multiplicity retained. Partition depends on thresholds and canonical order; crossing a partition alone is not incompatibility.",
                             "approximation": "Endpoint-preserving strong index-correspondence certificate per shortcut; bound original weak distance by simplified distance plus/minus the sum of certificate errors. Refine undecidable orientations/classifications on full curves. Bounds describe frozen original geometry and can tighten without geometric change. General output has explicit lower/upper bounds; endpoint values are exact under ordinary f64 arithmetic, not exact-real arithmetic.",
-                            "limitations": "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.",
-                            "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
-                            "edge_ids": "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels.",
+                            "limitations": LIMITATIONS,
+                            "rendering": RENDERING,
+                            "edge_ids": EDGE_IDS,
                             "contact": "One connected continuous radius-proximity component must have projected arc-interval union length at least the minimum on both curves. Point/tangent patches connect cells. Exact closed current paths use periodic adjacency.",
-                            "candidates": "ambiguity_backend selects the contact backend. Both produce the same contact decisions in the same source/partner order and feed the unchanged similarity, orientation, baseline evidence, cohorts and aggregation. cpu: f64 AABB hierarchy over bounded pieces, then the CPU contact kernel for every candidate pair the participation bound admits. gpu: before any work, the resident GPU points and reservations are read back and compared bit for bit with this frame's CPU paths; the enumeration's own radius, minimum, ordered IDs, positive-segment offsets and CPU-f64 segment lengths are used; mismatches fail. S1 enumerates a conservative superset of candidate cells with widened f32 boxes on a clamped uniform grid; candidate work items examine at most images[].candidates.partner_entries_per_item entries and are dispatched at most items_per_dispatch per submission. S2 sorts each whole-source batch by an exact key and certifies every cell and complete source/partner pair with outward f32 intervals that enclose the ordinary CPU-f64 values; certified contacts and certified negatives are decided on the GPU. Uncertain certificates, unsupported scalars or lengths, pairs above 4096 cells and component labels that do not settle within 128 rounds take the complete CPU pair route (participation bound, then contact kernel): this per-pair numerical fallback is expected. Resource, device and protocol failures abort with no report; there is no silent switch to the CPU index. index.narrow_pairs counts actual CPU contact-kernel pairs after the participation bound and index.contacts every emitted contact. images[].candidates keeps the S1 counters; images[].candidates.contact reports GPU decisions, CPU fallback pairs and cells by reason, schedule buckets, rounds, work estimates against the grouping target, submissions and maximum host submit-through-completion waits (not per-pair GPU durations). GPU work is not charged CPU work units. images[].candidates.memory reports the combined GPU byte limit, the simultaneous allocated peak of all owned buffers, device stored-record slots and owner-local host peaks; renderer-owned geometry is reported as borrowed and excluded, as are driver, pipeline and allocator overhead, so this is a buffer-byte limit, not a VRAM guarantee. Each frame's GPU buffers are destroyed when its enumeration ends.",
+                            "candidates": "images[].candidates.backend names the contact backend, always cpu in this report: an f64 AABB hierarchy over bounded pieces, then the CPU contact kernel for every candidate pair the participation bound admits. index.narrow_pairs counts actual CPU contact-kernel pairs after the participation bound and index.contacts every emitted contact.",
                             "short_path_count": "index.short_paths counts positive paths whose ordinary f64 total is below the minimum. This is diagnostic only; they remain indexed and use the conservative candidate participation test.",
-                            "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. With the gpu backend, resident candidate cells, sorted cells, pair results, readback staging that holds those records, and host pair decisions and fallback runs each count as stored records while they exist; certificates, keys, permutations, offsets, schedules and scratch count only as GPU bytes. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
+                            "capacities": "Explicit fail limits, never truncation. Baseline min(possible pairs,floor(global/5)); each of three cohort tables min(possible pairs,floor(global/10)); cache min(possible pairs,floor(global/100),65536). Remaining global records support index/candidate batches. Increase --ambiguity-stored-pair-limit for exhausted baseline/cohort tables or candidates. Only recomputable cache entries may evict.",
                             "work": "One work limit per preparation/baseline/current snapshot; no per-pair reset. Total work is charged before operations. The disjoint work_breakdown fields sum to work_consumed in charged work units: weak_cell_visits counts settled nonstale free-space cell visits, heap_operations counts individual pushes/pops, simplifier_point_visits counts interior point examinations for shortcut correspondence certificates, and other contains all remaining charges, including label initialization and geometry validation. Counts record successful pre-operation charges; failed charges change no counters. Detailed index counters accompany each row and overlap total work; do not add them to this full breakdown. Sort comparisons are not work units.",
                             "workspace": "Requested capacities include canonical/cohort data, evaluator metadata/tables, index/kernel temporaries, original/current route views and typed report rows with 32 filename bytes each. Shared GPU/CPU snapshots, allocator overhead, small report metadata and streaming serializer/I/O buffers are separate from requested evaluation workspace; this is not process RSS."
                         },
@@ -580,7 +501,7 @@ pub fn run(
                 };
                 crate::report::publish(&opts.out, "ambiguity.json", &report)
             })())
-        }).wrap_err("ambiguity preparation/evaluation failed; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit (baseline/cohort capacities derive from the stored-pair limit); GPU contact errors name their own limit or device/protocol cause")??;
+        }).wrap_err("ambiguity preparation/evaluation failed; check --ambiguity-work-limit, --ambiguity-workspace-bytes and --ambiguity-stored-pair-limit; baseline/cohort capacities derive from the stored-pair limit")??;
         Ok(())
     })();
     budget.release(caller_bytes)?;
@@ -590,6 +511,28 @@ pub fn run(
         config.baseline_capacity, config.cohort_capacity, config.cache_capacity, budget.statistics()
     ))
 }
+
+/// Output geometry block of both reports.
+fn geometry(active_samples: impl Serialize) -> serde_json::Value {
+    serde_json::json!({"geometry_contract_version": 1, "coordinate_space": "clip", "distance_output_units": "export_pixels", "squared_distance_output_units": "export_pixels_squared", "width": SIZE, "height": SIZE, "pixels_per_clip_unit": pixels_per_clip(), "normalization": "initial graph bounds, centered uniform 95% fit, fixed across snapshots", "active_samples": active_samples})
+}
+
+/// Metric definitions of both reports.
+fn definitions() -> serde_json::Value {
+    serde_json::json!({
+        "general": "For sustained current contacts, sqrt(mean(max(d-T,0)^2))/T, with original whole-route continuous endpoint-constrained weak Frechet distance d in the joint selected orientation. Introduced/resolved incompatible edge counts and squared-excess sums are co-primary alongside RMS.",
+        "endpoints": "Separate sqrt(mean(max(e-U,0)^2))/U over the same contacts, where e is the larger matched endpoint distance in that same orientation. Introduced/resolved counts and sums are co-primary.",
+        "cohorts": "Deduplicated unordered cohort pairs witnessed by an incompatible contacting edge pair. Introduced cohort associations are primary; denominator counts all distinct cross-cohort pairs contacting in this snapshot.",
+        "interpretation": "Lower excess means less original-route mismatch among current sustained contacts. Ratios are dimensionless and can exceed 1. Compatible contacts can dilute RMS. No combined score or overall quality claim.",
+        "empty_contacts": "count 0, sums 0, RMS 0, ratios 0; empty cohort denominator gives fraction 0"
+    })
+}
+
+/// Policies shared by both reports.
+const LIMITATIONS: &str = "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.";
+const RENDERING: &str =
+    "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.";
+const EDGE_IDS: &str = "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels.";
 
 #[derive(Serialize)]
 #[serde(remote = "ambiguity_index::Statistics")]
@@ -712,19 +655,13 @@ pub fn publish_resident(
         "numerical_contract": {
             "backend": "gpu-f32", "precision": "f32", "contract_version": resident::CONTRACT_VERSION,
             "cpu_fallback": false, "certified_bounds": false, "cpu_f64_parity": false,
-            "summary": "Every numerical stage runs in WGSL f32 on the GPU. Values are ordinary f32 point estimates; the device may flush subnormal intermediates to zero. Results are not bit-compatible with the cpu and gpu backends and classifications at a threshold can differ from them. Range, resource, convergence and protocol failures abort without a report."
+            "summary": "Every numerical stage runs in WGSL f32 on the GPU. Values are ordinary f32 point estimates; the device may flush subnormal intermediates to zero. Results are not bit-compatible with the cpu backend and classifications at a threshold can differ from it. Range, resource, convergence and protocol failures abort without a report."
         },
         "baseline": {"source": "gpu_resampled_iteration_0", "storage": "device copy frozen before bundling", "preprocessing_distortion_included": false},
         "input": opts.input.display().to_string(),
-        "geometry": {"geometry_contract_version": 1, "coordinate_space": "clip", "distance_output_units": "export_pixels", "squared_distance_output_units": "export_pixels_squared", "width": SIZE, "height": SIZE, "pixels_per_clip_unit": pixels_per_clip(), "normalization": "initial graph bounds, centered uniform 95% fit, fixed across snapshots", "active_samples": samples},
+        "geometry": geometry(samples),
         "counts": {"eligible_routes": preparation.eligible_routes, "skipped_reservations": preparation.skipped_reservations, "total_reservations": preparation.eligible_routes.saturating_add(preparation.skipped_reservations), "original_constants": preparation.original_constants, "closed_stored_start_routes": preparation.closed_stored_start_routes, "unique_canonical_routes": preparation.unique_canonical_routes, "cohorts": preparation.cohorts},
-        "definitions": {
-            "general": "For sustained current contacts, sqrt(mean(max(d-T,0)^2))/T, with original whole-route continuous endpoint-constrained weak Frechet distance d in the joint selected orientation. Introduced/resolved incompatible edge counts and squared-excess sums are co-primary alongside RMS.",
-            "endpoints": "Separate sqrt(mean(max(e-U,0)^2))/U over the same contacts, where e is the larger matched endpoint distance in that same orientation. Introduced/resolved counts and sums are co-primary.",
-            "cohorts": "Deduplicated unordered cohort pairs witnessed by an incompatible contacting edge pair. Introduced cohort associations are primary; denominator counts all distinct cross-cohort pairs contacting in this snapshot.",
-            "interpretation": "Lower excess means less original-route mismatch among current sustained contacts. Ratios are dimensionless and can exceed 1. Compatible contacts can dilute RMS. No combined score or overall quality claim.",
-            "empty_contacts": "count 0, sums 0, RMS 0, ratios 0; empty cohort denominator gives fraction 0"
-        },
+        "definitions": definitions(),
         "policies": {
             "residency": "The host parses the input, uploads thresholds as f32, sizes and schedules bounded dispatches, enforces limits, and reads counts used for sizing and batching, the membership table and the finished counts and scalars. Baseline points are copied on the device before bundling. Layout validation, positive segments, canonical originals and their order, simplification, cohort inference, contact, whole-route distances, orientation, baseline evidence, cohort associations, counts and reductions all run on the device. Pixel conversion of the finished f32 scalars for this report is done in f64 on the host.",
             "ranges": "Coordinates must be finite and below 2^20 clip units in magnitude; thresholds must lie within [2^-20, 2^20] clip units (radius and simplification may be zero); a route may store at most 32768 points. Violations abort before use.",
@@ -737,11 +674,11 @@ pub fn publish_resident(
             "contact_lengths": "A component's length on a route is the sum of its cells' uncovered interval lengths. Each contribution is an f32 value in units of the minimum, capped at one and truncated to a multiple of 2^-32, and the truncated values are added as 64-bit integers, so the sum does not depend on evaluation order. It is exact for the truncated contributions, not an exact arc length: K contributions lose less than K * 2^-32 of the minimum, below 1/64 of it at the largest batch. A decision exactly at the minimum can differ from an unquantized evaluation.",
             "reductions": "Counts are exact integers. Sums are f32, added in pair order within blocks of 256 and then across blocks level by level; RMS and ratios are f32.",
             "baseline_evidence": "The baseline frame's incompatible contact records and witnessed cohort pairs stay on the device. A later contact of the same edge pair reuses its stored flags and excesses; same-cohort contacts score zero; every other cross-cohort contact is assessed again with the same kernels.",
-            "limits": "Explicit fail limits, never truncation. --ambiguity-gpu-memory-mib bounds all owned GPU buffers including the frozen baseline copy (renderer geometry is borrowed; driver, pipeline and allocator overhead are outside it). --ambiguity-gpu-contact-pairs bounds the contact pairs one frame logs. --ambiguity-gpu-search-cells bounds one distance search, compared exactly with its cell count. --ambiguity-gpu-host-mib bounds the host metadata this backend allocates from input or device counts (readback vectors, membership and ID tables, batch and chunk plans, pair listings); report rows, the JSON serializer and the renderer are outside it. A single route whose cells exceed a batch fails; batches are whole lower-route ranges, so no component is split. The flags listed under parameters.not_applicable belong to the cpu and gpu backends and are rejected when given with gpu-f32.",
+            "limits": "Explicit fail limits, never truncation. --ambiguity-gpu-memory-mib bounds all owned GPU buffers including the frozen baseline copy (renderer geometry is borrowed; driver, pipeline and allocator overhead are outside it). --ambiguity-gpu-contact-pairs bounds the contact pairs one frame logs. --ambiguity-gpu-search-cells bounds one distance search, compared exactly with its cell count. --ambiguity-gpu-host-mib bounds the host metadata this backend allocates from input or device counts (readback vectors, membership and ID tables, batch and chunk plans, pair listings); report rows, the JSON serializer and the renderer are outside it. A single route whose cells exceed a batch fails; batches are whole lower-route ranges, so no component is split. The flags listed under parameters.not_applicable belong to the cpu backend and are rejected when given with gpu-f32.",
             "work": "Every dispatch declares a worst-case unit count; a dispatch above parameters.effective.work_units_per_dispatch_and_submission is refused rather than run, and pending work is submitted before a submission would exceed it. A work unit is one innermost-loop iteration or straight-line block touching at most 32 buffer elements. Long work is resumable on the device (simplification, first-fit, frontier searches, chain walks). Uniform-bound dispatches are sliced into whole workgroups. A dispatch with a caller-proven Total bound is encoded whole or refused before execution. Work is never truncated. Round limits for simplification, relaxation, label propagation and chain walks are resource limits, not convergence proofs: an input that exceeds one fails with no report. These are operation-count bounds, not wall-time guarantees; device.work.maximum_wait_seconds is the longest observed submission on this machine. There is no global work budget in this backend.",
-            "limitations": "Stored starts constrain closed-route matching. Weak Frechet permits retracing. Connected contact participation can include shallow crossings/backtracking and is not monotone one-to-one traversal. No tangent filter or endpoint exemption. Constants are eligible but have no positive-length contact.",
-            "rendering": "Geometry only: line color, opacity, MSAA and endpoint dots do not enter these scores.",
-            "edge_ids": "Membership IDs are stable drawable GPU path IDs from the uploaded layout, not semantic cohort labels."
+            "limitations": LIMITATIONS,
+            "rendering": RENDERING,
+            "edge_ids": EDGE_IDS
         },
         "bundling": {"neighbor_radius": opts.neighbor_radius, "iterations": images.len().saturating_sub(1)},
         "parameters": opts.ambiguity.resident_parameters()?,

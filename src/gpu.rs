@@ -481,18 +481,6 @@ impl Gpu {
         decoder.finish()
     }
 
-    /// Shared device handles for GPU ambiguity contact acceleration.
-    pub fn ambiguity_candidates(
-        &self,
-        settings: bundling_wgpu::ambiguity_gpu::Settings,
-    ) -> Result<bundling_wgpu::ambiguity_gpu::Candidates> {
-        Ok(bundling_wgpu::ambiguity_gpu::Candidates::new(
-            self.device.clone(),
-            self.queue.clone(),
-            settings,
-        )?)
-    }
-
     /// Freeze the current resident points as the gpu-f32 ambiguity baseline and
     /// prepare its originals, cohorts and baseline scores on this device.
     pub fn ambiguity_resident(

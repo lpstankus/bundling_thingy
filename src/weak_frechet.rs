@@ -135,18 +135,6 @@ impl Budget {
     pub const fn statistics(&self) -> Statistics {
         self.statistics
     }
-    /// Stored-pair record capacity not currently reserved by any owner.
-    #[must_use]
-    pub const fn available_records(&self) -> usize {
-        self.record_limit
-            .saturating_sub(self.statistics.records_reserved)
-    }
-    /// Requested workspace bytes not currently reserved by any owner.
-    #[must_use]
-    pub const fn available_workspace(&self) -> usize {
-        self.workspace_limit
-            .saturating_sub(self.statistics.workspace_reserved)
-    }
     /// # Errors
     /// Returns `WorkLimit` without changing the ledger if the limit would be exceeded.
     pub fn charge(&mut self, units: u64) -> Result<(), Error> {
