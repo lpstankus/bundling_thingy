@@ -1,3 +1,4 @@
+mod ambiguity_report;
 mod density;
 mod distortion_report;
 mod gpu;
@@ -43,6 +44,13 @@ pub struct Options {
     /// Measure GPU geometry displacement and write distortion.json.
     #[arg(long, requires = "headless")]
     evaluate_distortion: bool,
+
+    /// Measure general geometric ambiguity and write ambiguity.json.
+    #[arg(long, requires = "headless")]
+    evaluate_ambiguity: bool,
+
+    #[command(flatten)]
+    ambiguity: ambiguity_report::Parameters,
 
     /// Accepted for compatibility; headless exports always resample.
     #[arg(long = "resample", requires = "headless", hide = true)]
@@ -106,13 +114,12 @@ fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
+    report::invalidate(&opts.out, "ambiguity.json")?;
+    report::invalidate(&opts.out, "ambiguity.json.tmp")?;
     report::invalidate(&opts.out, "distortion.json")?;
     report::invalidate(&opts.out, "noisiness.json")?;
-    let mut distortion_images = Vec::new();
-
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
-
-    let mut report = if opts.evaluate_noisiness {
+    let noisiness = if opts.evaluate_noisiness {
         gpu.render()?;
         let blank = gpu.readback()?;
         Some(noisiness::Report::new(
@@ -121,14 +128,12 @@ fn headless(opts: &Options) -> Result<()> {
     } else {
         None
     };
-
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
-    let layout = if opts.evaluate_distortion {
-        Some(gpu.distortion_layout()?)
-    } else {
-        None
-    };
+    let layout = opts
+        .evaluate_distortion
+        .then(|| gpu.distortion_layout())
+        .transpose()?;
     let baseline = layout
         .as_ref()
         .map(|layout| gpu.distortion_snapshot(layout))
@@ -136,58 +141,101 @@ fn headless(opts: &Options) -> Result<()> {
     if let Some(baseline) = &baseline {
         baseline.validate_baseline()?;
     }
-    write_image(&gpu, &opts.out, "original.png", 0, report.as_mut())?;
-    if baseline.is_some() {
-        println!("original.png distortion=0 rms_displacement_pixels=0");
-        distortion_images.push(serde_json::json!({
-            "file": "original.png",
-            "iteration": 0,
-            "distortion": 0.0,
-            "rms_displacement_pixels": 0.0
-        }));
-    }
-    if opts.neighbor_radius.is_some() {
-        for iteration in 1..=opts.iterations {
-            let _timing = tracing::info_span!("iteration", iteration).entered();
-            gpu.iterate()?;
-            let name = if opts.iterations == 1 {
-                "neighbor-mean.png".to_owned()
-            } else {
-                format!("iteration-{iteration:02}.png")
-            };
-            write_image(&gpu, &opts.out, &name, iteration, report.as_mut())?;
-            if let Some(baseline) = &baseline {
-                let _capture =
-                    tracing::info_span!("distortion.capture", file = %name, iteration).entered();
-                let current = gpu.distortion_snapshot(baseline.layout())?;
-                let _measure =
-                    tracing::info_span!("distortion.measure", file = %name, iteration).entered();
-                let mut aggregate = Aggregate::default();
-                for ((_, original), (_, changed)) in baseline.edges().zip(current.edges()) {
-                    aggregate.add(&Curve::new(original)?, &Curve::new(changed)?)?;
-                }
-                let result = aggregate.finish(SIZE)?;
-                distortion_images.push(serde_json::json!({
-                    "file": name,
-                    "iteration": iteration,
-                    "distortion": result.distortion,
-                    "rms_displacement_pixels": result.rms_displacement_pixels
-                }));
-                println!(
-                    "{name} distortion={} rms_displacement_pixels={}",
-                    result.distortion, result.rms_displacement_pixels
-                );
-            }
-        }
-    }
-    if let Some(report) = report {
-        report.write(opts)?;
-    }
-    if let Some(layout) = &layout {
-        distortion_report::write(opts, layout, &distortion_images)?;
+    let mut ambiguity = opts
+        .evaluate_ambiguity
+        .then(|| ambiguity_report::Session::new(opts, &gpu))
+        .transpose()?;
+    image_flow(
+        opts,
+        &mut gpu,
+        baseline.as_ref(),
+        noisiness,
+        ambiguity.as_mut(),
+    )?;
+    if let Some(ambiguity) = ambiguity {
+        ambiguity.finish()?;
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())
+}
+
+fn image_flow(
+    opts: &Options,
+    gpu: &mut Gpu,
+    baseline: Option<&bundling_wgpu::geometry::Snapshot<'_>>,
+    mut noisiness: Option<noisiness::Report>,
+    mut ambiguity: Option<&mut ambiguity_report::Session<'_>>,
+) -> Result<()> {
+    let mut distortion_images = Vec::new();
+    let iterations = if opts.neighbor_radius.is_some() {
+        opts.iterations
+    } else {
+        0
+    };
+    for iteration in 0..=iterations {
+        let _timing = tracing::info_span!("image", iteration).entered();
+        if iteration > 0 {
+            gpu.iterate()?;
+        }
+        let name = image_name(iteration, iterations)?;
+        write_image(gpu, &opts.out, &name, iteration, noisiness.as_mut())?;
+        if let Some(original) = baseline {
+            let current = (iteration > 0)
+                .then(|| gpu.distortion_snapshot(original.layout()))
+                .transpose()?;
+            let mut aggregate = Aggregate::default();
+            let result = if let Some(changed) = &current {
+                let _measure = tracing::info_span!("distortion.measure", iteration).entered();
+                for ((_, a), (_, b)) in original.edges().zip(changed.edges()) {
+                    aggregate.add(&Curve::new(a)?, &Curve::new(b)?)?;
+                }
+                let result = aggregate.finish(SIZE)?;
+                (result.distortion, result.rms_displacement_pixels)
+            } else {
+                (0.0, 0.0)
+            };
+            distortion_images.push(serde_json::json!({
+                "file": name, "iteration": iteration,
+                "distortion": result.0, "rms_displacement_pixels": result.1
+            }));
+            println!(
+                "{name} distortion={} rms_displacement_pixels={}",
+                result.0, result.1
+            );
+        }
+        if let Some(session) = ambiguity.as_mut() {
+            // Bundling alternates point buffers: take the current one each frame.
+            let current = (iteration > 0)
+                .then(|| gpu.ambiguity_geometry())
+                .transpose()?;
+            session.record(name, iteration, current.as_ref())?;
+        }
+    }
+    if let Some(noisiness) = noisiness {
+        noisiness.write(opts)?;
+    }
+    if opts.evaluate_distortion {
+        distortion_report::write(
+            opts,
+            baseline
+                .ok_or_else(|| color_eyre::eyre::eyre!("missing distortion layout"))?
+                .layout(),
+            &distortion_images,
+        )?;
+    }
+    Ok(())
+}
+
+fn image_name(iteration: u32, iterations: u32) -> Result<String> {
+    use std::fmt::Write;
+    let mut name = String::new();
+    name.try_reserve_exact(32)?;
+    match iteration {
+        0 => name.push_str("original.png"),
+        _ if iterations == 1 => name.push_str("neighbor-mean.png"),
+        _ => write!(&mut name, "iteration-{iteration:02}.png")?,
+    }
+    Ok(name)
 }
 
 fn write_image(

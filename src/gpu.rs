@@ -481,6 +481,33 @@ impl Gpu {
         decoder.finish()
     }
 
+    /// Handles to the current point buffer and the fixed reservation buffer;
+    /// nothing is copied. Bundling alternates point buffers, so call this again
+    /// after every `iterate`.
+    pub fn ambiguity_geometry(&self) -> Result<bundling_wgpu::ambiguity::Geometry> {
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        Ok(bundling_wgpu::ambiguity::Geometry {
+            points: graph.geometry.points.clone(),
+            paths: graph.geometry.paths.clone(),
+            samples: graph.samples,
+            reservations: u32::try_from(graph.geometry.paths.size() / 12)?,
+        })
+    }
+
+    /// Freeze the current points as the ambiguity baseline on this device and
+    /// score its baseline frame. Call before the first `iterate`.
+    pub fn ambiguity_session(
+        &self,
+        settings: &bundling_wgpu::ambiguity::Settings,
+    ) -> Result<bundling_wgpu::ambiguity::Session> {
+        Ok(bundling_wgpu::ambiguity::Session::new(
+            &self.device,
+            &self.queue,
+            &self.ambiguity_geometry()?,
+            settings,
+        )?)
+    }
+
     fn wait(&self) -> Result<()> {
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
