@@ -40,7 +40,7 @@ pub struct Gpu {
     resampler: Resampler,
     neighbor_mean: Option<NeighborMean>,
     graph: Option<UploadedGraph>,
-    geometry_staging: Option<wgpu::Buffer>,
+    distortion_staging: Option<wgpu::Buffer>,
 
     target: wgpu::Texture,
     msaa: wgpu::TextureView,
@@ -141,7 +141,7 @@ impl Gpu {
         });
 
         Ok(Self {
-            geometry_staging: Self::create_geometry_staging(&device, opts),
+            distortion_staging: Self::create_distortion_staging(&device, opts),
             device,
             queue,
             map,
@@ -167,11 +167,11 @@ impl Gpu {
         })
     }
 
-    fn create_geometry_staging(device: &wgpu::Device, opts: &Options) -> Option<wgpu::Buffer> {
-        opts.geometry_evaluation().then(|| {
+    fn create_distortion_staging(device: &wgpu::Device, opts: &Options) -> Option<wgpu::Buffer> {
+        opts.evaluate_distortion.then(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("geometry staging"),
-                size: resampling::GEOMETRY_STAGING_BYTES,
+                label: Some("distortion staging"),
+                size: resampling::DISTORTION_STAGING_BYTES,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -397,14 +397,14 @@ impl Gpu {
         mut consume: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         let staging = self
-            .geometry_staging
+            .distortion_staging
             .as_ref()
-            .ok_or_eyre("geometry staging disabled")?;
+            .ok_or_eyre("distortion staging disabled")?;
         let mut offset = 0;
         while offset < bytes {
             let count = bytes
                 .saturating_sub(offset)
-                .min(resampling::GEOMETRY_STAGING_BYTES);
+                .min(resampling::DISTORTION_STAGING_BYTES);
             let mut encoder = self
                 .device
                 .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -435,8 +435,8 @@ impl Gpu {
         Ok(())
     }
 
-    #[tracing::instrument(name = "geometry.layout_readback", skip_all, err)]
-    pub fn geometry_layout(&self) -> Result<bundling_wgpu::geometry::Layout> {
+    #[tracing::instrument(name = "distortion.layout_readback", skip_all, err)]
+    pub fn distortion_layout(&self) -> Result<bundling_wgpu::geometry::Layout> {
         let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
         let mut paths = Vec::new();
         paths.try_reserve_exact(usize::try_from(graph.geometry.paths.size() / 12)?)?;
@@ -458,16 +458,16 @@ impl Gpu {
             },
         )?;
         tracing::info!(
-            staging_bytes = resampling::GEOMETRY_STAGING_BYTES,
+            staging_bytes = resampling::DISTORTION_STAGING_BYTES,
             snapshot_bytes = u64::from(graph.samples) * 8,
             metadata_bytes = std::mem::size_of_val(paths.as_slice()),
-            "geometry CPU storage per snapshot"
+            "distortion CPU storage per snapshot"
         );
         bundling_wgpu::geometry::Layout::new(&paths, usize::try_from(graph.samples)?)
     }
 
-    #[tracing::instrument(name = "geometry.points_readback", skip_all, err)]
-    pub fn geometry_snapshot<'a>(
+    #[tracing::instrument(name = "distortion.points_readback", skip_all, err)]
+    pub fn distortion_snapshot<'a>(
         &self,
         layout: &'a bundling_wgpu::geometry::Layout,
     ) -> Result<bundling_wgpu::geometry::Snapshot<'a>> {
@@ -479,6 +479,33 @@ impl Gpu {
             |bytes| decoder.push(bytes),
         )?;
         decoder.finish()
+    }
+
+    /// Handles to the current point buffer and the fixed reservation buffer;
+    /// nothing is copied. Bundling alternates point buffers, so call this again
+    /// after every `iterate`.
+    pub fn ambiguity_geometry(&self) -> Result<bundling_wgpu::ambiguity::Geometry> {
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        Ok(bundling_wgpu::ambiguity::Geometry {
+            points: graph.geometry.points.clone(),
+            paths: graph.geometry.paths.clone(),
+            samples: graph.samples,
+            reservations: u32::try_from(graph.geometry.paths.size() / 12)?,
+        })
+    }
+
+    /// Freeze the current points as the ambiguity baseline on this device and
+    /// score its baseline frame. Call before the first `iterate`.
+    pub fn ambiguity_session(
+        &self,
+        settings: &bundling_wgpu::ambiguity::Settings,
+    ) -> Result<bundling_wgpu::ambiguity::Session> {
+        Ok(bundling_wgpu::ambiguity::Session::new(
+            &self.device,
+            &self.queue,
+            &self.ambiguity_geometry()?,
+            settings,
+        )?)
     }
 
     fn wait(&self) -> Result<()> {

@@ -131,27 +131,20 @@ fn headless(opts: &Options) -> Result<()> {
     let graph = Graph::load(&opts.input)?;
     let samples = gpu.upload(&graph)?;
     let layout = opts
-        .geometry_evaluation()
-        .then(|| gpu.geometry_layout())
+        .evaluate_distortion
+        .then(|| gpu.distortion_layout())
         .transpose()?;
     let baseline = layout
         .as_ref()
-        .map(|layout| gpu.geometry_snapshot(layout))
+        .map(|layout| gpu.distortion_snapshot(layout))
         .transpose()?;
-    if opts.evaluate_distortion {
-        baseline
-            .as_ref()
-            .ok_or_else(|| color_eyre::eyre::eyre!("missing distortion baseline"))?
-            .validate_baseline()?;
+    if let Some(baseline) = &baseline {
+        baseline.validate_baseline()?;
     }
-    let mut ambiguity = if opts.evaluate_ambiguity {
-        let (Some(layout), Some(baseline)) = (layout.as_ref(), baseline.as_ref()) else {
-            color_eyre::eyre::bail!("missing ambiguity baseline");
-        };
-        Some(ambiguity_report::Session::new(opts, layout, baseline)?)
-    } else {
-        None
-    };
+    let mut ambiguity = opts
+        .evaluate_ambiguity
+        .then(|| ambiguity_report::Session::new(opts, &gpu))
+        .transpose()?;
     image_flow(
         opts,
         &mut gpu,
@@ -164,12 +157,6 @@ fn headless(opts: &Options) -> Result<()> {
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())
-}
-
-impl Options {
-    const fn geometry_evaluation(&self) -> bool {
-        self.evaluate_distortion || self.evaluate_ambiguity
-    }
 }
 
 fn image_flow(
@@ -192,16 +179,12 @@ fn image_flow(
         }
         let name = image_name(iteration, iterations)?;
         write_image(gpu, &opts.out, &name, iteration, noisiness.as_mut())?;
-        let current = if iteration > 0 {
-            baseline
-                .map(|original| gpu.geometry_snapshot(original.layout()))
-                .transpose()?
-        } else {
-            None
-        };
-        if opts.evaluate_distortion {
+        if let Some(original) = baseline {
+            let current = (iteration > 0)
+                .then(|| gpu.distortion_snapshot(original.layout()))
+                .transpose()?;
             let mut aggregate = Aggregate::default();
-            let result = if let (Some(original), Some(changed)) = (baseline, current.as_ref()) {
+            let result = if let Some(changed) = &current {
                 let _measure = tracing::info_span!("distortion.measure", iteration).entered();
                 for ((_, a), (_, b)) in original.edges().zip(changed.edges()) {
                     aggregate.add(&Curve::new(a)?, &Curve::new(b)?)?;
@@ -221,6 +204,10 @@ fn image_flow(
             );
         }
         if let Some(session) = ambiguity.as_mut() {
+            // Bundling alternates point buffers: take the current one each frame.
+            let current = (iteration > 0)
+                .then(|| gpu.ambiguity_geometry())
+                .transpose()?;
             session.record(name, iteration, current.as_ref())?;
         }
     }
