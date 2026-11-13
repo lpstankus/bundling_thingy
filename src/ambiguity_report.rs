@@ -108,7 +108,11 @@ struct Threshold {
 }
 impl Threshold {
     fn new(clip: f64) -> Self {
-        let uploaded = ambiguity::nearest_f32(clip);
+        let uploaded = if clip == 0.0 {
+            0.0
+        } else {
+            ambiguity::nearest_f32(clip)
+        };
         Self {
             clip: uploaded,
             pixels: f64::from(uploaded) * pixels_per_clip(),
