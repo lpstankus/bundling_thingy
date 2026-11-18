@@ -229,7 +229,12 @@ impl Ambiguity {
         );
         let sample_groups = samples.div_ceil(WORKGROUP_SIZE);
         let row_bytes = u64::from(path_count.max(1)).saturating_mul(8);
-        let rows = SCRATCH_BYTES.div_ceil(row_bytes).clamp(1, MAX_ROWS);
+        // Rows only add concurrency, so they shrink to fit the device before one row is too many.
+        let rows = SCRATCH_BYTES
+            .min(binding_limit(device))
+            .checked_div(row_bytes)
+            .unwrap_or(1)
+            .clamp(1, MAX_ROWS);
         let scratch_bytes = rows.saturating_mul(row_bytes);
         ensure!(
             scratch_bytes <= binding_limit(device),
