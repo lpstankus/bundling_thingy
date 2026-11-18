@@ -146,7 +146,7 @@ fn count_anchors(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_work
     }
 }
 
-// Each entry stores its anchor number in x and its segment start in index.
+// Each entry stores its segment start in index.
 @compute @workgroup_size(block_size)
 fn scatter_anchors(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let segment = invocation(id, groups);
@@ -157,7 +157,7 @@ fn scatter_anchors(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_wo
     for (var anchor = 0u; anchor < count; anchor += 1u) {
         let slot = atomicAdd(&spatial.cells[anchor_cell(segment, anchor, count)].end, 1u);
         if slot < arrayLength(&positions) {
-            positions[slot] = IndexedPoint(f32(anchor), 0.0, segment);
+            positions[slot] = IndexedPoint(0.0, 0.0, segment);
         }
     }
 }

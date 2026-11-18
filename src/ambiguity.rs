@@ -12,7 +12,9 @@ const WORKGROUP_SIZE: u32 = 128;
 const STATS_BYTES: u64 = 32;
 /// Pair set slot: one directed route pair key.
 const SLOT_BYTES: u64 = 4;
+/// Half the export size, checked below.
 const PIXELS_PER_CLIP: f32 = 800.0;
+const _: () = assert!(SIZE == 1600);
 /// Near length rows, one per concurrent contact workgroup, each 8 bytes per route.
 const SCRATCH_BYTES: u64 = 128 << 20;
 const MAX_ROWS: u64 = 1024;
@@ -109,15 +111,15 @@ impl Ambiguity {
             "ambiguity evaluation needs 9 storage buffers per shader stage"
         );
         let radius = opts.ambiguity_contact_radius;
-        // Queries step by the radius and grid cells hold at most 64 pixels.
+        // Smaller radii multiply the query pieces and larger ones the anchors each piece scans.
         ensure!(
-            (0.25..=64.0).contains(&radius),
-            "--ambiguity-contact-radius must be between 0.25 and 64 pixels"
+            (0.25..=16.0).contains(&radius),
+            "--ambiguity-contact-radius must be between 0.25 and 16 pixels"
         );
         // Cells also set the anchor spacing, so queries reach the radius plus half a cell.
-        let cell_size = (1u32..64)
+        let cell_size = (1u32..16)
             .find(|size| f64::from(*size) >= f64::from(radius))
-            .unwrap_or(64)
+            .unwrap_or(16)
             .saturating_add(1);
         let size = SIZE.div_ceil(cell_size);
         let cell_count = size.saturating_mul(size);
@@ -387,7 +389,9 @@ impl Ambiguity {
         total: u32,
         limit: u32,
     ) -> Result<()> {
-        let (mut base, mut chunk, mut submissions) = (0, 1, 0u32);
+        // One workgroup's time does not fall with the chunk, so smaller chunks only idle the GPU.
+        let floor = limit.min(64);
+        let (mut base, mut chunk, mut submissions) = (0, floor, 0u32);
         let mut slowest = Duration::ZERO;
         while base < total {
             let count = chunk.min(total.saturating_sub(base));
@@ -407,7 +411,7 @@ impl Ambiguity {
             if elapsed < FAST_SUBMISSION {
                 chunk = chunk.saturating_mul(2).min(limit);
             } else if elapsed > SLOW_SUBMISSION {
-                chunk = (chunk / 2).max(1);
+                chunk = (chunk / 2).max(floor);
             }
             base = base.saturating_add(count);
             submissions = submissions.saturating_add(1);
