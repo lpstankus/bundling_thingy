@@ -117,7 +117,7 @@ fn reserve_cells(
         let task_count = (count + block_size - 1u) / block_size;
         if task_count > 0u {
             let task_start = atomicAdd(&spatial.task_count, task_count);
-            for (var task = 0u; task < task_count; task += 1u) {
+            for (var task = 0u; task < task_count && task_start + task < arrayLength(&tasks); task += 1u) {
                 tasks[task_start + task] = Task(index, start + task * block_size);
             }
         }

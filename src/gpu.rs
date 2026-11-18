@@ -1,5 +1,6 @@
 use crate::{
     Options,
+    ambiguity::{self, Ambiguity},
     density::{self, Density},
     graph::Graph,
     neighbor_mean::NeighborMean,
@@ -39,6 +40,7 @@ pub struct Gpu {
     resampling_timings: GpuTimings,
     resampler: Resampler,
     neighbor_mean: Option<NeighborMean>,
+    ambiguity: Option<Ambiguity>,
     graph: Option<UploadedGraph>,
     distortion_staging: Option<wgpu::Buffer>,
 
@@ -87,7 +89,6 @@ impl Gpu {
             "software GPU is not permitted"
         );
 
-        let limits = adapter.limits();
         let (device, queue) = Self::request_device(&adapter, opts.msaa).await?;
 
         let config = if let (Some(surface), Some(window)) = (&surface, &window) {
@@ -128,7 +129,7 @@ impl Gpu {
                 )
             })
             .transpose()?;
-        tracing::info!(adapter = %info.name, max_buffer_bytes = limits.max_buffer_size, max_storage_binding_bytes = limits.max_storage_buffer_binding_size, "GPU graph processing");
+        tracing::info!(adapter = %info.name, max_buffer_bytes = adapter.limits().max_buffer_size, max_storage_binding_bytes = adapter.limits().max_storage_buffer_binding_size, "GPU graph processing");
 
         let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
         let msaa = Self::texture(&device, width, height, format, opts.msaa)
@@ -141,6 +142,7 @@ impl Gpu {
         });
 
         Ok(Self {
+            ambiguity: Ambiguity::new(&device, &queue, opts, &map)?,
             distortion_staging: Self::create_distortion_staging(&device, opts),
             device,
             queue,
@@ -515,6 +517,14 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         self.wait()?;
         let (geometry, samples) = pending.finish()?;
+        if let Some(ambiguity) = &mut self.ambiguity {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            ambiguity.prepare(&self.device, &mut encoder, &geometry, samples)?;
+            self.queue.submit([encoder.finish()]);
+            self.wait()?;
+        }
         let bindings = Self::graph_bindings(&self.device, &self.pipeline, &geometry);
         self.graph = Some(UploadedGraph {
             bindings,
@@ -550,6 +560,18 @@ impl Gpu {
         graph.bindings = Self::graph_bindings(&self.device, &self.pipeline, &graph.geometry);
         self.queue.submit([encoder.finish()]);
         self.wait()
+    }
+
+    #[tracing::instrument(name = "ambiguity.gpu", skip_all, err)]
+    pub fn ambiguity(&self) -> Result<ambiguity::Measurement> {
+        let ambiguity = self
+            .ambiguity
+            .as_ref()
+            .ok_or_eyre("ambiguity evaluation is disabled")?;
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        let totals = ambiguity.submit(&self.device, &self.queue, &graph.geometry, graph.samples)?;
+        self.wait()?;
+        ambiguity.finish(totals.recv()??)
     }
 
     fn graph_bindings(

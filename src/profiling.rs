@@ -86,6 +86,24 @@ impl GpuTimings {
         })
     }
 
+    /// Time one stage split across passes, from the first pass start to the last pass end.
+    pub fn compute_part(
+        &self,
+        stage: u32,
+        first: bool,
+        last: bool,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        self.compute_pass(stage)
+            .filter(|_| first || last)
+            .map(|writes| wgpu::ComputePassTimestampWrites {
+                beginning_of_pass_write_index: writes
+                    .beginning_of_pass_write_index
+                    .filter(|_| first),
+                end_of_pass_write_index: writes.end_of_pass_write_index.filter(|_| last),
+                ..writes
+            })
+    }
+
     pub const fn render_pass(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         let Some(timestamps) = &self.timestamps else {
             return None;
