@@ -289,9 +289,9 @@ impl NeighborMean {
     }
 }
 
-fn workgroups(device: &wgpu::Device, groups: u32) -> Result<[u32; 2]> {
+pub fn workgroups(device: &wgpu::Device, groups: u32) -> Result<[u32; 2]> {
     let limit = device.limits().max_compute_workgroups_per_dimension;
     let y = groups.div_ceil(limit);
-    ensure!(y <= limit, "neighbor grid exceeds GPU dispatch limits");
+    ensure!(y <= limit, "work exceeds GPU dispatch limits");
     Ok([groups.div_ceil(y), y])
 }

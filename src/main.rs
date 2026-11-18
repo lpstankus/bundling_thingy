@@ -1,3 +1,4 @@
+mod ambiguity;
 mod density;
 mod distortion_report;
 mod gpu;
@@ -44,6 +45,27 @@ pub struct Options {
     #[arg(long, requires = "headless")]
     evaluate_distortion: bool,
 
+    /// Measure false bundling contacts on the GPU and write ambiguity.json.
+    #[arg(long, requires = "headless")]
+    evaluate_ambiguity: bool,
+
+    /// Original-route weak Frechet distance in export pixels above which a contact is false.
+    #[arg(long, default_value_t = 16.0, value_parser = positive)]
+    ambiguity_route_tolerance: f32,
+
+    /// Distance in export pixels within which current routes are near each other.
+    #[arg(long, default_value_t = 2.0, value_parser = positive)]
+    ambiguity_contact_radius: f32,
+
+    /// Near length in export pixels each route of a contact pair needs.
+    #[arg(long, default_value_t = 24.0, value_parser = positive)]
+    ambiguity_contact_length: f32,
+
+    /// GPU hash set slots for route pairs where one route reaches the contact length, 4 bytes
+    /// each (256 MiB by default). A contact uses two slots.
+    #[arg(long, default_value_t = 1 << 26, value_parser = clap::value_parser!(u32).range(1..))]
+    ambiguity_pair_capacity: u32,
+
     /// Accepted for compatibility; headless exports always resample.
     #[arg(long = "resample", requires = "headless", hide = true)]
     _resample: bool,
@@ -89,6 +111,13 @@ pub struct Options {
     max_graph_memory_mib: u64,
 }
 
+fn positive(value: &str) -> Result<f32, String> {
+    match value.parse::<f32>() {
+        Ok(value) if value.is_finite() && value > 0.0 => Ok(value),
+        _ => Err("expected a positive finite number".to_owned()),
+    }
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     profiling::init()?;
@@ -108,7 +137,9 @@ fn headless(opts: &Options) -> Result<()> {
 
     report::invalidate(&opts.out, "distortion.json")?;
     report::invalidate(&opts.out, "noisiness.json")?;
+    report::invalidate(&opts.out, "ambiguity.json")?;
     let mut distortion_images = Vec::new();
+    let mut ambiguity_images = Vec::new();
 
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
 
@@ -137,6 +168,9 @@ fn headless(opts: &Options) -> Result<()> {
         baseline.validate_baseline()?;
     }
     write_image(&gpu, &opts.out, "original.png", 0, report.as_mut())?;
+    if opts.evaluate_ambiguity {
+        ambiguity_images.push(measure_ambiguity(&gpu, "original.png", 0)?);
+    }
     if baseline.is_some() {
         println!("original.png distortion=0 rms_displacement_pixels=0");
         distortion_images.push(serde_json::json!({
@@ -156,6 +190,9 @@ fn headless(opts: &Options) -> Result<()> {
                 format!("iteration-{iteration:02}.png")
             };
             write_image(&gpu, &opts.out, &name, iteration, report.as_mut())?;
+            if opts.evaluate_ambiguity {
+                ambiguity_images.push(measure_ambiguity(&gpu, &name, iteration)?);
+            }
             if let Some(baseline) = &baseline {
                 let _capture =
                     tracing::info_span!("distortion.capture", file = %name, iteration).entered();
@@ -186,8 +223,26 @@ fn headless(opts: &Options) -> Result<()> {
     if let Some(layout) = &layout {
         distortion_report::write(opts, layout, &distortion_images)?;
     }
+    if opts.evaluate_ambiguity {
+        ambiguity::write(opts, &ambiguity_images)?;
+    }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())
+}
+
+fn measure_ambiguity(gpu: &Gpu, file: &str, iteration: u32) -> Result<serde_json::Value> {
+    let result = gpu.ambiguity()?;
+    println!(
+        "{file} ambiguity={} contact_pairs={} incompatible_pairs={}",
+        result.score, result.contact_pairs, result.incompatible_pairs
+    );
+    Ok(serde_json::json!({
+        "file": file,
+        "iteration": iteration,
+        "contact_pairs": result.contact_pairs,
+        "incompatible_pairs": result.incompatible_pairs,
+        "score": result.score
+    }))
 }
 
 fn write_image(
