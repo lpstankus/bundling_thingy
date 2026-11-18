@@ -1,4 +1,4 @@
-// Rust prepends `const K: u32`, the original points kept per route.
+// Rust prepends `const K: u32`, the original points kept per route, and `SCORE_ROUNDS`.
 const CELLS: u32 = K - 1u;
 // Fixed-point contact length units per export pixel.
 const UNITS: f32 = 256.0;
@@ -15,17 +15,14 @@ struct Parameters {
     tolerance: f32,
     pixels_per_clip: f32,
     capacity: u32,
-    // First route or contact of the current submission.
+    // First workgroup of the current submission.
     base: u32,
 }
 
-// Key packs the lower route ID above the higher one. Zero marks an empty slot.
-// Stamps hold each side's last query piece so a piece credits a pair at most once.
-// After the contact pass, select_contacts reuses stamps[0] as the compacted contact list.
-struct Slot {
-    key: atomic<u32>,
-    lengths: array<atomic<u32>, 2>,
-    stamps: array<atomic<u32>, 2>,
+// Near length a route has to one other route, and the last query piece that credited it.
+struct Near {
+    length: atomic<u32>,
+    stamp: atomic<u32>,
 }
 
 struct Stats {
@@ -37,7 +34,6 @@ struct Stats {
     sum_squares: f32,
     // Finished work, so Rust can reject a frame with a dropped submission.
     routes: atomic<u32>,
-    selected: atomic<u32>,
     scored: atomic<u32>,
     // One squared-excess sum per scoring workgroup.
     partials: array<f32>,
@@ -47,13 +43,20 @@ override block_size: u32;
 
 @group(0) @binding(0) var<storage, read> input_points: array<Point>;
 @group(0) @binding(1) var<storage, read_write> originals: array<vec2<f32>>;
-@group(0) @binding(3) var<storage, read_write> table: array<Slot>;
+// Hash set of directed pairs (route << 16 | other) where route reaches the contact length.
+// Zero marks an empty slot.
+@group(0) @binding(3) var<storage, read_write> table: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read> paths: array<Path>;
 @group(0) @binding(10) var<storage, read_write> stats: Stats;
+// One row of near lengths to every route per workgroup of a contact submission.
+@group(0) @binding(11) var<storage, read_write> scratch: array<Near>;
 @group(0) @binding(12) var<uniform> parameters: Parameters;
 
 var<workgroup> partial_sums: array<f32, block_size>;
 var<workgroup> stop: u32;
+var<workgroup> pending: array<u32, block_size * 2u>;
+var<workgroup> pending_count: atomic<u32>;
+var<workgroup> batch: u32;
 
 fn invocation(id: vec3<u32>, groups: vec3<u32>) -> u32 {
     return id.y * groups.x * block_size + id.x;
@@ -167,40 +170,47 @@ fn hash(key: u32) -> u32 {
     return h ^ (h >> 16u);
 }
 
-// Credits one query piece to the pair once. Only route's workgroup writes its side, and it
-// queries one piece at a time, so the first lane to swap in the piece's stamp adds its length.
-fn add_contact(route: u32, other: u32, units: u32, stamp: u32) {
-    let low = min(route, other);
-    let key = (low << 16u) | max(route, other);
-    let side = select(1u, 0u, route == low);
+// Inserts a directed pair. Each route inserts its pairs once per frame, so keys never repeat.
+fn insert_pair(key: u32) {
     var slot = hash(key) % parameters.capacity;
     for (var probe = 0u; probe < MAX_PROBES; probe += 1u) {
-        var found = atomicLoad(&table[slot].key);
-        if found == 0u {
-            let exchange = atomicCompareExchangeWeak(&table[slot].key, 0u, key);
-            found = exchange.old_value;
-            if exchange.exchanged {
-                found = key;
-                atomicAdd(&stats.occupied, 1u);
-            } else if found == 0u {
-                // Spurious weak failure: retry this slot.
-                continue;
-            }
-        }
-        if found == key {
-            if atomicExchange(&table[slot].stamps[side], stamp) != stamp {
-                atomicAdd(&table[slot].lengths[side], units);
-            }
+        let exchange = atomicCompareExchangeWeak(&table[slot], 0u, key);
+        if exchange.exchanged {
+            atomicAdd(&stats.occupied, 1u);
             return;
         }
-        slot = (slot + 1u) % parameters.capacity;
+        // A zero old value is a spurious weak failure, so retry this slot.
+        if exchange.old_value != 0u {
+            slot = (slot + 1u) % parameters.capacity;
+        }
     }
     atomicOr(&stats.status, TABLE_FULL);
 }
 
+fn contains_pair(key: u32) -> bool {
+    var slot = hash(key) % parameters.capacity;
+    for (var probe = 0u; probe < MAX_PROBES; probe += 1u) {
+        let found = atomicLoad(&table[slot]);
+        if found == key || found == 0u {
+            return found == key;
+        }
+        slot = (slot + 1u) % parameters.capacity;
+    }
+    return false;
+}
+
+// Credits one query piece to the other route once. The workgroup queries one piece at a
+// time, so the first lane to swap in the piece's stamp adds its length.
+fn add_contact(row: u32, other: u32, units: u32, stamp: u32) {
+    let near = row * arrayLength(&paths) + other;
+    if atomicExchange(&scratch[near].stamp, stamp) != stamp {
+        atomicAdd(&scratch[near].length, units);
+    }
+}
+
 // The workgroup's lanes share the anchors near a query piece's midpoint and credit every
 // other route with a segment within the radius.
-fn query_contacts(route: u32, position: vec2<f32>, units: u32, stamp: u32, lane: u32) {
+fn query_contacts(route: u32, row: u32, position: vec2<f32>, units: u32, stamp: u32, lane: u32) {
     let point = position * parameters.pixels_per_clip;
     // A segment point within the radius lies within half an anchor spacing of an anchor.
     let reach = parameters.radius + f32(grid.radius) * 0.5;
@@ -216,7 +226,7 @@ fn query_contacts(route: u32, position: vec2<f32>, units: u32, stamp: u32, lane:
                 let segment = positions[slot].index;
                 let other = input_points[segment].edge_id;
                 if other != route && route_distance(point, segment) <= parameters.radius {
-                    add_contact(route, other, units, stamp);
+                    add_contact(row, other, units, stamp);
                 }
             }
         }
@@ -232,6 +242,7 @@ fn fixed(length: f32) -> u32 {
 @compute @workgroup_size(block_size)
 fn accumulate_contacts(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     let route = parameters.base + group.x;
+    let row = group.x;
     if route >= arrayLength(&paths) {
         return;
     }
@@ -264,9 +275,22 @@ fn accumulate_contacts(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_i
                 return;
             }
             stamp += 1u;
-            query_contacts(route, mix(start, end, (f32(piece) + 0.5) / f32(pieces)), units, stamp, lane);
+            query_contacts(route, row, mix(start, end, (f32(piece) + 0.5) / f32(pieces)), units, stamp, lane);
         }
         walked += length;
+    }
+    storageBarrier();
+    // Keep the routes this route reaches and zero the row for the next submission.
+    let count = arrayLength(&paths);
+    for (var other = lane; other < count; other += block_size) {
+        let near = row * count + other;
+        if atomicLoad(&scratch[near].stamp) != 0u {
+            if f32(atomicLoad(&scratch[near].length)) / UNITS >= parameters.length {
+                insert_pair((route << 16u) | other);
+            }
+            atomicStore(&scratch[near].length, 0u);
+            atomicStore(&scratch[near].stamp, 0u);
+        }
     }
     if lane == 0u {
         atomicAdd(&stats.routes, 1u);
@@ -345,54 +369,73 @@ fn workgroup_sum(lane: u32, value: f32) -> f32 {
     return partial_sums[0];
 }
 
-// Compacts contact pairs so scoring lanes stay busy.
-@compute @workgroup_size(block_size)
-fn select_contacts(
-    @builtin(global_invocation_id) id: vec3<u32>,
-    @builtin(num_workgroups) groups: vec3<u32>,
-    @builtin(local_invocation_index) lane: u32,
-) {
-    let slot = invocation(id, groups);
-    if lane == 0u && slot < parameters.capacity {
-        atomicAdd(&stats.selected, min(block_size, parameters.capacity - slot));
+// Synchronous walk over the resampled points, an upper bound on the weak Frechet distance.
+fn synchronous_bound(first: u32, second: u32, reversed: bool) -> f32 {
+    var bound = 0.0;
+    for (var k = 0u; k < K; k += 1u) {
+        bound = max(bound, distance(original(first, k, false), original(second, k, reversed)));
     }
-    if slot == 0u {
-        stats.anchors = atomicLoad(&spatial.cursor);
-        if stats.anchors > arrayLength(&positions) {
-            atomicOr(&stats.status, ANCHOR_OVERFLOW);
-        }
-    }
-    if slot >= parameters.capacity {
-        return;
-    }
-    let lengths = vec2<f32>(f32(atomicLoad(&table[slot].lengths[0])), f32(atomicLoad(&table[slot].lengths[1]))) / UNITS;
-    if all(lengths >= vec2<f32>(parameters.length)) {
-        // Selection never reads stamps, so overwriting them here cannot race.
-        atomicStore(&table[atomicAdd(&stats.contacts, 1u)].stamps[0], atomicLoad(&table[slot].key));
-    }
+    return bound;
 }
 
+// Squared excess of a contact. Pairs within the tolerance under a synchronous walk have none.
+fn score_pair(key: u32) -> f32 {
+    let first = key >> 16u;
+    let second = key & 0xffffu;
+    var separation = min(synchronous_bound(first, second, false), synchronous_bound(first, second, true));
+    if separation <= parameters.tolerance {
+        return 0.0;
+    }
+    // The orientation with the smaller endpoint bound usually decides the minimum.
+    let reversed = endpoint_bound(first, second, true) < endpoint_bound(first, second, false);
+    let likely = weak_frechet(first, second, reversed, separation);
+    separation = weak_frechet(first, second, !reversed, likely);
+    if separation > parameters.tolerance {
+        atomicAdd(&stats.incompatible, 1u);
+    }
+    let excess = max(separation - parameters.tolerance, 0.0);
+    return excess * excess;
+}
+
+// Each workgroup scans SCORE_ROUNDS slots per lane and queues contacts, pairs present in both
+// directions, so every lane scores one when a batch runs even in a sparse set.
 @compute @workgroup_size(block_size)
-fn score_contacts(
-    @builtin(global_invocation_id) id: vec3<u32>,
-    @builtin(workgroup_id) group: vec3<u32>,
-    @builtin(local_invocation_index) lane: u32,
-) {
+fn score_contacts(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    let first_slot = (parameters.base + group.x) * block_size * SCORE_ROUNDS;
+    if lane == 0u && first_slot < parameters.capacity {
+        atomicAdd(&stats.scored, min(block_size * SCORE_ROUNDS, parameters.capacity - first_slot));
+    }
     var sum = 0.0;
-    let index = parameters.base + id.x;
-    if index < atomicLoad(&stats.contacts) {
-        let key = atomicLoad(&table[index].stamps[0]);
-        let first = key >> 16u;
-        let second = key & 0xffffu;
-        // The orientation with the smaller endpoint bound usually decides the minimum.
-        let reversed = endpoint_bound(first, second, true) < endpoint_bound(first, second, false);
-        let likely = weak_frechet(first, second, reversed, 3.0e38);
-        let separation = weak_frechet(first, second, !reversed, likely);
-        atomicAdd(&stats.scored, 1u);
-        let excess = max(separation - parameters.tolerance, 0.0);
-        sum = excess * excess;
-        if separation > parameters.tolerance {
-            atomicAdd(&stats.incompatible, 1u);
+    for (var round = 0u; round <= SCORE_ROUNDS; round += 1u) {
+        let slot = first_slot + round * block_size + lane;
+        if round < SCORE_ROUNDS && slot < parameters.capacity {
+            let key = atomicLoad(&table[slot]);
+            let first = key >> 16u;
+            let second = key & 0xffffu;
+            if first < second && contains_pair((second << 16u) | first) {
+                atomicAdd(&stats.contacts, 1u);
+                pending[atomicAdd(&pending_count, 1u)] = key;
+            }
+        }
+        // Score full batches, then the rest after the last round. Fewer than a batch remain
+        // before each round adds at most one key per lane.
+        loop {
+            workgroupBarrier();
+            if lane == 0u {
+                batch = atomicLoad(&pending_count);
+            }
+            let count = workgroupUniformLoad(&batch);
+            if count < select(block_size, 1u, round == SCORE_ROUNDS) {
+                break;
+            }
+            let taken = min(count, block_size);
+            if lane < taken {
+                sum += score_pair(pending[count - 1u - lane]);
+            }
+            workgroupBarrier();
+            if lane == 0u {
+                atomicStore(&pending_count, count - taken);
+            }
         }
     }
     sum = workgroup_sum(lane, sum);
@@ -409,6 +452,10 @@ fn reduce_partials(@builtin(local_invocation_index) lane: u32) {
     }
     sum = workgroup_sum(lane, sum);
     if lane == 0u {
+        stats.anchors = atomicLoad(&spatial.cursor);
+        if stats.anchors > arrayLength(&positions) {
+            atomicOr(&stats.status, ANCHOR_OVERFLOW);
+        }
         stats.sum_squares = sum;
         atomicOr(&stats.status, COMPLETE);
     }

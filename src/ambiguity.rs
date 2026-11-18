@@ -4,38 +4,44 @@ use crate::{
 };
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 /// Arc-length resampled points per original route for weak Frechet distances.
 const ORIGINAL_POINTS: u32 = 32;
 const WORKGROUP_SIZE: u32 = 128;
-const STATS_BYTES: u64 = 36;
-/// Pair table slot: key, two near lengths, and two query stamps (later the contact list).
-const SLOT_BYTES: u64 = 20;
+const STATS_BYTES: u64 = 32;
+/// Pair set slot: one directed route pair key.
+const SLOT_BYTES: u64 = 4;
 const PIXELS_PER_CLIP: f32 = 800.0;
-/// Routes (one workgroup each) per contact submission and contacts per score submission.
-const CONTACT_CHUNK: u32 = 1 << 10;
-const SCORE_CHUNK: u32 = SCORE_GROUPS * WORKGROUP_SIZE;
-/// Scoring workgroups, each accumulating its partial sum over all score submissions.
-const SCORE_GROUPS: u32 = 1024;
-/// Byte offset of the chunk base (first route or contact) in the parameters uniform.
+/// Near length rows, one per concurrent contact workgroup, each 8 bytes per route.
+const SCRATCH_BYTES: u64 = 128 << 20;
+const MAX_ROWS: u64 = 1024;
+/// Scoring workgroups per submission, each accumulating its partial sum over all submissions.
+const SCORE_GROUPS: u32 = 1 << 14;
+/// Pair set slots each scoring lane scans.
+const SCORE_ROUNDS: u32 = 32;
+/// Submissions grow while faster and shrink while slower than these, far below driver watchdogs.
+const FAST_SUBMISSION: Duration = Duration::from_millis(100);
+const SLOW_SUBMISSION: Duration = Duration::from_millis(400);
+/// Byte offset of the submission's first workgroup in the parameters uniform.
 const BASE_OFFSET: u64 = 20;
 /// Grid entries reserved per sample for segment anchors.
 const ANCHORS_PER_SAMPLE: u64 = 2;
-const ENTRIES: [&str; 7] = [
+const CONTACTS: u32 = 3;
+const SCORE: u32 = 4;
+const ENTRIES: [&str; 6] = [
     "count_anchors",
     "reserve_cells",
     "scatter_anchors",
     "accumulate_contacts",
-    "select_contacts",
     "score_contacts",
     "reduce_partials",
 ];
-const TIMING_STAGES: [&str; 7] = [
+const TIMING_STAGES: [&str; 6] = [
     "ambiguity.grid_count",
     "ambiguity.grid_reserve",
     "ambiguity.grid_scatter",
     "ambiguity.contacts",
-    "ambiguity.select",
     "ambiguity.score",
     "ambiguity.reduce",
 ];
@@ -62,12 +68,14 @@ struct GraphBuffers {
     originals: wgpu::Buffer,
     positions: wgpu::Buffer,
     tasks: wgpu::Buffer,
+    scratch: wgpu::Buffer,
+    rows: u32,
     path_count: u32,
 }
 
 pub struct Ambiguity {
     originals: wgpu::ComputePipeline,
-    pipelines: [wgpu::ComputePipeline; 7],
+    pipelines: [wgpu::ComputePipeline; 6],
     settings: Parameters,
     parameters: wgpu::Buffer,
     grid: wgpu::Buffer,
@@ -75,7 +83,6 @@ pub struct Ambiguity {
     cell_count: u32,
     table: wgpu::Buffer,
     stats: wgpu::Buffer,
-    score_groups: [u32; 2],
     map: wgpu::Buffer,
     timings: GpuTimings,
     graph: Option<GraphBuffers>,
@@ -96,6 +103,11 @@ impl Ambiguity {
             u64::from(capacity).saturating_mul(SLOT_BYTES) <= binding_limit(device),
             "--ambiguity-pair-capacity exceeds GPU buffer limits"
         );
+        // Near length rows add a ninth storage buffer to the default eight.
+        ensure!(
+            device.limits().max_storage_buffers_per_shader_stage >= 9,
+            "ambiguity evaluation needs 9 storage buffers per shader stage"
+        );
         let radius = opts.ambiguity_contact_radius;
         // Queries step by the radius and grid cells hold at most 64 pixels.
         ensure!(
@@ -109,7 +121,6 @@ impl Ambiguity {
             .saturating_add(1);
         let size = SIZE.div_ceil(cell_size);
         let cell_count = size.saturating_mul(size);
-        let score_groups = workgroups(device, capacity.div_ceil(WORKGROUP_SIZE))?;
         let (originals, pipelines) = Self::pipelines(device);
         let settings = Parameters {
             radius,
@@ -153,16 +164,15 @@ impl Ambiguity {
                     .saturating_mul(4)
                     .saturating_add(STATS_BYTES),
             ),
-            score_groups,
             map: map.clone(),
             timings: GpuTimings::new(device, queue, &TIMING_STAGES)?,
             graph: None,
         }))
     }
 
-    fn pipelines(device: &wgpu::Device) -> (wgpu::ComputePipeline, [wgpu::ComputePipeline; 7]) {
+    fn pipelines(device: &wgpu::Device) -> (wgpu::ComputePipeline, [wgpu::ComputePipeline; 6]) {
         let entries =
-            [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 12].map(|binding| wgpu::BindGroupLayoutEntry {
+            [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12].map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
@@ -191,7 +201,7 @@ impl Ambiguity {
             device,
             "ambiguity",
             &format!(
-                "const K: u32 = {ORIGINAL_POINTS}u;\n{}\n{}",
+                "const K: u32 = {ORIGINAL_POINTS}u;\nconst SCORE_ROUNDS: u32 = {SCORE_ROUNDS}u;\n{}\n{}",
                 include_str!("shaders/spatial_grid.wgsl"),
                 include_str!("shaders/ambiguity.wgsl"),
             ),
@@ -216,6 +226,13 @@ impl Ambiguity {
             "ambiguity evaluation supports at most 65536 routes"
         );
         let sample_groups = samples.div_ceil(WORKGROUP_SIZE);
+        let row_bytes = u64::from(path_count.max(1)).saturating_mul(8);
+        let rows = SCRATCH_BYTES.div_ceil(row_bytes).clamp(1, MAX_ROWS);
+        let scratch_bytes = rows.saturating_mul(row_bytes);
+        ensure!(
+            scratch_bytes <= binding_limit(device),
+            "ambiguity near length rows for {path_count} routes exceed GPU buffer limits"
+        );
         let anchors = u64::from(samples).saturating_mul(ANCHORS_PER_SAMPLE);
         ensure!(
             anchors.saturating_mul(12) <= binding_limit(device),
@@ -241,6 +258,8 @@ impl Ambiguity {
                     .saturating_add(u64::from(self.cell_count))
                     .saturating_mul(8),
             ),
+            scratch: shader::storage(device, "ambiguity near lengths", scratch_bytes),
+            rows: u32::try_from(rows)?,
             path_count,
         });
         let bindings = self.bindings(device, geometry, samples)?;
@@ -261,10 +280,7 @@ impl Ambiguity {
         geometry: &Geometry,
         samples: u32,
     ) -> Result<wgpu::BindGroup> {
-        let graph = self
-            .graph
-            .as_ref()
-            .ok_or_eyre("ambiguity originals are not prepared")?;
+        let graph = self.graph()?;
         // The live points buffer can be larger than the active samples.
         let points = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
             buffer: &geometry.points,
@@ -285,6 +301,7 @@ impl Ambiguity {
                 (7, graph.tasks.as_entire_binding()),
                 (9, self.map.as_entire_binding()),
                 (10, self.stats.as_entire_binding()),
+                (11, graph.scratch.as_entire_binding()),
                 (12, self.parameters.as_entire_binding()),
             ],
         ))
@@ -297,9 +314,9 @@ impl Ambiguity {
         queue: &wgpu::Queue,
         geometry: &Geometry,
         samples: u32,
-    ) -> Result<shader::Readback<[u32; 9]>> {
+    ) -> Result<shader::Readback<[u32; 8]>> {
         let bindings = self.bindings(device, geometry, samples)?;
-        let path_count = self.path_count()?;
+        let graph = self.graph()?;
         let sample_groups = workgroups(device, samples.div_ceil(WORKGROUP_SIZE))?;
         let cell_groups = workgroups(device, self.cell_count.div_ceil(WORKGROUP_SIZE))?;
         let new_encoder =
@@ -308,45 +325,21 @@ impl Ambiguity {
         encoder.clear_buffer(&self.cells, 0, None);
         encoder.clear_buffer(&self.table, 0, None);
         encoder.clear_buffer(&self.stats, 0, None);
-        for ((pipeline, label), stage) in self.pipelines.iter().zip(TIMING_STAGES).zip(0..) {
-            // Contact and score work is split into short submissions so the GPU never resets them.
-            let (total, chunk) = match stage {
-                3 => (path_count, CONTACT_CHUNK),
-                5 => (self.settings.capacity, SCORE_CHUNK),
-                _ => (1, 1),
-            };
-            let parts = total.div_ceil(chunk);
-            for part in 0..parts {
-                queue.write_buffer(
-                    &self.parameters,
-                    BASE_OFFSET,
-                    bytemuck::bytes_of(&part.saturating_mul(chunk)),
-                );
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(label),
-                    timestamp_writes: self.timings.compute_part(
-                        stage,
-                        part == 0,
-                        part.saturating_add(1) == parts,
-                    ),
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &bindings, &[]);
-                let [x, y] = match stage {
-                    1 => cell_groups,
-                    3 => [chunk, 1],
-                    5 => [chunk / WORKGROUP_SIZE, 1],
-                    4 => self.score_groups,
-                    6 => [1, 1],
-                    _ => sample_groups,
-                };
-                pass.dispatch_workgroups(x, y, 1);
-                drop(pass);
-                if chunk > 1 {
-                    queue.submit([std::mem::replace(&mut encoder, new_encoder()).finish()]);
-                }
-            }
+        // A failed frame can leave rows unzeroed.
+        encoder.clear_buffer(&graph.scratch, 0, None);
+        for (stage, groups) in (0..).zip([sample_groups, cell_groups, sample_groups]) {
+            self.dispatch(&mut encoder, &bindings, stage, [true, true], groups)?;
         }
+        queue.submit([encoder.finish()]);
+        let (routes, rows) = (graph.path_count, graph.rows);
+        self.run_timed(device, queue, &bindings, CONTACTS, routes, rows)?;
+        let slots = self
+            .settings
+            .capacity
+            .div_ceil(WORKGROUP_SIZE * SCORE_ROUNDS);
+        self.run_timed(device, queue, &bindings, SCORE, slots, SCORE_GROUPS)?;
+        let mut encoder = new_encoder();
+        self.dispatch(&mut encoder, &bindings, SCORE + 1, [true, true], [1, 1])?;
         self.timings.resolve(&mut encoder);
         // A fresh zeroed buffer cannot report a previous frame if the GPU drops a submission.
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -357,21 +350,84 @@ impl Ambiguity {
         });
         encoder.copy_buffer_to_buffer(&self.stats, 0, &readback, 0, STATS_BYTES);
         let totals = shader::readback(&encoder, &readback, |result| {
-            result.map(bytemuck::pod_read_unaligned::<[u32; 9]>)
+            result.map(bytemuck::pod_read_unaligned::<[u32; 8]>)
         });
         queue.submit([encoder.finish()]);
         Ok(totals)
     }
 
-    fn path_count(&self) -> Result<u32> {
-        Ok(self
-            .graph
-            .as_ref()
-            .ok_or_eyre("ambiguity originals are not prepared")?
-            .path_count)
+    fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bindings: &wgpu::BindGroup,
+        stage: u32,
+        [first, last]: [bool; 2],
+        [x, y]: [u32; 2],
+    ) -> Result<()> {
+        let (pipeline, label) = (self.pipelines.iter().zip(TIMING_STAGES))
+            .nth(usize::try_from(stage)?)
+            .ok_or_eyre("unknown ambiguity stage")?;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: self.timings.compute_part(stage, first, last),
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bindings, &[]);
+        pass.dispatch_workgroups(x, y, 1);
+        Ok(())
     }
 
-    pub fn finish(&self, totals: [u32; 9]) -> Result<Measurement> {
+    /// Runs `total` workgroups of a stage in submissions sized by the previous submission's time.
+    fn run_timed(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bindings: &wgpu::BindGroup,
+        stage: u32,
+        total: u32,
+        limit: u32,
+    ) -> Result<()> {
+        let (mut base, mut chunk, mut submissions) = (0, 1, 0u32);
+        let mut slowest = Duration::ZERO;
+        while base < total {
+            let count = chunk.min(total.saturating_sub(base));
+            queue.write_buffer(&self.parameters, BASE_OFFSET, bytemuck::bytes_of(&base));
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let parts = [base == 0, base.saturating_add(count) == total];
+            self.dispatch(&mut encoder, bindings, stage, parts, [count, 1])?;
+            let start = Instant::now();
+            queue.submit([encoder.finish()]);
+            device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(60)),
+            })?;
+            let elapsed = start.elapsed();
+            slowest = slowest.max(elapsed);
+            if elapsed < FAST_SUBMISSION {
+                chunk = chunk.saturating_mul(2).min(limit);
+            } else if elapsed > SLOW_SUBMISSION {
+                chunk = (chunk / 2).max(1);
+            }
+            base = base.saturating_add(count);
+            submissions = submissions.saturating_add(1);
+        }
+        tracing::info!(
+            stage = TIMING_STAGES.get(usize::try_from(stage)?),
+            submissions,
+            slowest_ms = slowest.as_secs_f64() * 1e3,
+            "ambiguity submissions"
+        );
+        Ok(())
+    }
+
+    fn graph(&self) -> Result<&GraphBuffers> {
+        self.graph
+            .as_ref()
+            .ok_or_eyre("ambiguity originals are not prepared")
+    }
+
+    pub fn finish(&self, totals: [u32; 8]) -> Result<Measurement> {
         let [
             anchors,
             occupied,
@@ -380,7 +436,6 @@ impl Ambiguity {
             status,
             sum_squares,
             routes,
-            selected,
             scored,
         ] = totals;
         ensure!(
@@ -389,7 +444,7 @@ impl Ambiguity {
         );
         ensure!(
             status & 1 == 0,
-            "ambiguity pair table is full ({occupied} of {} slots); raise --ambiguity-pair-capacity",
+            "ambiguity pair set is full ({occupied} of {} slots); raise --ambiguity-pair-capacity",
             self.settings.capacity
         );
         ensure!(
@@ -403,16 +458,14 @@ impl Ambiguity {
         );
         // Status bits alone cannot show that every submission ran.
         ensure!(
-            routes == self.path_count()?
-                && selected == self.settings.capacity
-                && scored == contact_pairs,
-            "ambiguity evaluation is partial ({routes} routes, {selected} slots, {scored} of {contact_pairs} contacts); the GPU may have dropped a submission"
+            routes == self.graph()?.path_count && scored == self.settings.capacity,
+            "ambiguity evaluation is partial ({routes} routes, {scored} slots); the GPU may have dropped a submission"
         );
         tracing::info!(
             anchors,
             occupied,
             capacity = self.settings.capacity,
-            "ambiguity pair table"
+            "ambiguity pair set"
         );
         let sum_squares = f64::from(f32::from_bits(sum_squares));
         let score = if contact_pairs == 0 {

@@ -61,8 +61,9 @@ pub struct Options {
     #[arg(long, default_value_t = 24.0, value_parser = positive)]
     ambiguity_contact_length: f32,
 
-    /// GPU hash table slots for near route pairs, 20 bytes each (80 MiB by default).
-    #[arg(long, default_value_t = 1 << 22, value_parser = clap::value_parser!(u32).range(1..))]
+    /// GPU hash set slots for route pairs where one route reaches the contact length, 4 bytes
+    /// each (256 MiB by default). A contact uses two slots.
+    #[arg(long, default_value_t = 1 << 26, value_parser = clap::value_parser!(u32).range(1..))]
     ambiguity_pair_capacity: u32,
 
     /// Accepted for compatibility; headless exports always resample.
