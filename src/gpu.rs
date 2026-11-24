@@ -1,6 +1,7 @@
 use crate::{
     Options,
     density::{self, Density},
+    geometry_io::GeometryData,
     graph::Graph,
     neighbor_mean::NeighborMean,
     palette::{ColorBy, Palette},
@@ -116,16 +117,7 @@ impl Gpu {
         let resampling_timings = GpuTimings::new(&device, &queue, resampler.timing_stages())?;
         let neighbor_mean = opts
             .neighbor_radius
-            .map(|radius| {
-                NeighborMean::new(
-                    &device,
-                    &queue,
-                    radius,
-                    [width, height],
-                    opts.color_by,
-                    &map,
-                )
-            })
+            .map(|radius| NeighborMean::new(&device, &queue, radius, [width, height], opts, &map))
             .transpose()?;
         tracing::info!(adapter = %info.name, max_buffer_bytes = limits.max_buffer_size, max_storage_binding_bytes = limits.max_storage_buffer_binding_size, "GPU graph processing");
 
@@ -427,6 +419,7 @@ impl Gpu {
             .as_mut()
             .ok_or_eyre("neighbor radius is not configured")?;
         let graph = self.graph.as_mut().ok_or_eyre("no uploaded graph")?;
+        neighbor_mean.prepare_iteration(&self.queue)?;
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -435,6 +428,7 @@ impl Gpu {
         }
         neighbor_mean.encode(
             &self.device,
+            &self.queue,
             &mut encoder,
             &mut graph.geometry,
             graph.samples,
@@ -463,6 +457,151 @@ impl Gpu {
                 (3, geometry.edges.as_entire_binding()),
             ],
         )
+    }
+
+    pub fn export_geometry(&self, folder: &std::path::Path) -> Result<()> {
+        let graph = self.graph.as_ref().ok_or_eyre("no graph to export")?;
+        std::fs::create_dir_all(folder)?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        let mut downloads = Vec::new();
+        for (name, source, bytes) in [
+            (
+                "points.bin",
+                &graph.geometry.points,
+                u64::from(graph.samples).saturating_mul(12),
+            ),
+            (
+                "paths.bin",
+                &graph.geometry.paths,
+                graph.geometry.paths.size(),
+            ),
+            (
+                "edges.bin",
+                &graph.geometry.edges,
+                graph.geometry.edges.size(),
+            ),
+        ] {
+            let target = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("geometry export"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_buffer_to_buffer(source, 0, &target, 0, bytes);
+            let readback = shader::readback(&encoder, &target, |result| result.map(<[u8]>::to_vec));
+            downloads.push((name, readback));
+        }
+        self.queue.submit([encoder.finish()]);
+        self.wait()?;
+        for (name, readback) in downloads {
+            std::fs::write(folder.join(name), readback.recv()??)?;
+        }
+        let metadata = format!(
+            concat!(
+                "{{\n  \"version\": 1,\n  \"width\": {},\n  \"height\": {},\n",
+                "  \"samples\": {},\n  \"paths\": {},\n",
+                "  \"coordinate_space\": \"clip\",\n  \"byte_order\": \"little\",\n",
+                "  \"points.bin\": \"f32 x, f32 y, u32 edge_id\",\n",
+                "  \"paths.bin\": \"u32 point_offset, u32 segment_offset, u32 count\",\n",
+                "  \"edges.bin\": \"f32 source_x, f32 source_y, f32 destination_x, f32 destination_y\"\n}}\n"
+            ),
+            SIZE,
+            SIZE,
+            graph.samples,
+            graph.geometry.paths.size() / 12,
+        );
+        std::fs::write(folder.join("format.json"), metadata)?;
+        Ok(())
+    }
+
+    pub fn import_geometry(&mut self, folder: &std::path::Path) -> Result<u32> {
+        use wgpu::util::DeviceExt;
+        ensure!(
+            self.color_by == ColorBy::EdgeId,
+            "geometry imports currently require --color-by edge-id"
+        );
+        let grid_bytes = self.neighbor_mean.as_ref().map_or(0, |mean| {
+            NeighborMean::grid_bytes([SIZE, SIZE], mean.cell_size())
+        });
+        let budget = self
+            .resampler
+            .memory_budget()
+            .checked_sub(grid_bytes)
+            .ok_or_eyre("neighbor grid exceeds graph memory budget")?;
+        let limits = self.device.limits();
+        let binding_limit = limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size));
+        let data = GeometryData::load(
+            folder,
+            budget,
+            binding_limit,
+            if self.neighbor_mean.is_some() {
+                crate::neighbor_mean::EXTRA_SAMPLE_BYTES
+            } else {
+                0
+            },
+        )?;
+        self.graph = None;
+        if let Some(mean) = &mut self.neighbor_mean {
+            mean.reset();
+        }
+        let segment_count = u32::try_from(data.segments.len())?;
+        let endpoint_count = u32::try_from(data.endpoints.len())?;
+        let commands = [
+            data.samples,
+            segment_count,
+            endpoint_count,
+            0,
+            4,
+            segment_count,
+            0,
+            0,
+            4,
+            endpoint_count,
+            0,
+            0,
+        ];
+        let upload = |label, bytes: &[u8], usage| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytes,
+                    usage,
+                })
+        };
+        let storage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        let geometry = resampling::Geometry {
+            points: upload("imported points", &data.points, storage),
+            paths: upload("imported paths", &data.paths, storage),
+            edges: upload("imported edges", &data.edges, storage),
+            segments: upload(
+                "imported segments",
+                bytemuck::cast_slice(&data.segments),
+                storage,
+            ),
+            endpoints: upload(
+                "imported endpoints",
+                bytemuck::cast_slice(&data.endpoints),
+                storage,
+            ),
+            commands: upload(
+                "imported draw commands",
+                bytemuck::cast_slice(&commands),
+                storage | wgpu::BufferUsages::INDIRECT,
+            ),
+        };
+        let bindings = Self::graph_bindings(&self.device, &self.pipeline, &geometry);
+        self.graph = Some(UploadedGraph {
+            bindings,
+            geometry,
+            samples: data.samples,
+        });
+        Ok(data.samples)
     }
 
     fn encode_draw(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
@@ -558,7 +697,7 @@ impl Gpu {
             let _timing = tracing::info_span!("gpu.resize", width, height).entered();
             if let Some(neighbor_mean) = &mut self.neighbor_mean {
                 self.resampler
-                    .resize_grid([width, height], neighbor_mean.radius())?;
+                    .resize_grid([width, height], neighbor_mean.cell_size())?;
                 neighbor_mean.resize(&self.device, [width, height])?;
             }
             let density = self

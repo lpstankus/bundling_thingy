@@ -1,5 +1,16 @@
-use crate::{palette::ColorBy, profiling::GpuTimings, resampling::Geometry, shader};
-use color_eyre::eyre::{Result, ensure};
+use crate::{Options, palette::ColorBy, profiling::GpuTimings, resampling::Geometry, shader};
+use clap::ValueEnum;
+use color_eyre::eyre::{OptionExt, Result, ensure};
+use std::{num::NonZeroU32, time::Duration};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum NeighborWeighting {
+    /// Give every nearby sample on another edge the same weight.
+    Uniform,
+    /// Use inverse closest-endpoint distance, normalized by total weight.
+    #[default]
+    Endpoint,
+}
 
 const WORKGROUP_SIZE: u32 = 128;
 const TIMING_STAGES: [&str; 7] = [
@@ -18,16 +29,20 @@ pub const EXTRA_SAMPLE_BYTES: u64 = 32;
 #[repr(C)]
 struct GridParameters {
     size: [u32; 2],
-    radius: u32,
+    cell_size: u32,
     dispatch_limit: u32,
+    radius: u32,
+    padding: [u32; 3],
 }
 
 impl GridParameters {
     fn new(size: [u32; 2], radius: u32) -> Self {
         Self {
             size: size.map(|dimension| dimension.div_ceil(radius)),
-            radius,
+            cell_size: radius,
             dispatch_limit: 0,
+            radius,
+            padding: [0; 3],
         }
     }
 
@@ -41,7 +56,7 @@ impl GridParameters {
     }
 
     fn summary_bytes(&self) -> u64 {
-        self.cells().saturating_mul(24)
+        self.cells().saturating_mul(32)
     }
 }
 
@@ -56,7 +71,7 @@ struct GridBuffers {
     cells: wgpu::Buffer,
     summaries: wgpu::Buffer,
     cell_count: u32,
-    radius: u32,
+    cell_size: u32,
 }
 
 impl GridBuffers {
@@ -80,7 +95,7 @@ impl GridBuffers {
             cells: shader::storage(device, "neighbor grid cells", bytes),
             summaries: shader::storage(device, "neighbor cell summaries", summary_bytes),
             cell_count: u32::try_from(parameters.cells())?,
-            radius,
+            cell_size: radius,
         })
     }
 }
@@ -91,7 +106,13 @@ pub struct NeighborMean {
     grid: GridBuffers,
     map: wgpu::Buffer,
     timings: GpuTimings,
+    query_timings: [GpuTimings; 2],
+    query_offset: wgpu::Buffer,
+    batch_size: Option<NonZeroU32>,
     scratch: Option<Scratch>,
+    final_radius: u32,
+    iterations: u32,
+    iteration: u32,
 }
 
 impl NeighborMean {
@@ -100,26 +121,27 @@ impl NeighborMean {
         queue: &wgpu::Queue,
         radius: u32,
         size: [u32; 2],
-        color_by: ColorBy,
+        opts: &Options,
         map: &wgpu::Buffer,
     ) -> Result<Self> {
         let grid = GridBuffers::new(device, size, radius)?;
-        let entries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: if binding == 2 || binding == 9 {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage {
-                        read_only: binding == 0 || binding == 4,
-                    }
+        let entries =
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: if binding == 2 || binding == 9 || binding == 10 {
+                        wgpu::BufferBindingType::Uniform
+                    } else {
+                        wgpu::BufferBindingType::Storage {
+                            read_only: binding == 0 || binding == 4,
+                        }
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        });
+                count: None,
+            });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("neighbor grid and mean"),
             entries: &entries,
@@ -141,8 +163,18 @@ impl NeighborMean {
         let constants = [
             ("block_size", f64::from(WORKGROUP_SIZE)),
             (
+                "force_tiled",
+                f64::from(u8::from(opts.neighbor_batch_size.is_some())),
+            ),
+            (
+                "weight_by_endpoints",
+                f64::from(u8::from(
+                    opts.neighbor_weighting == NeighborWeighting::Endpoint,
+                )),
+            ),
+            (
                 "accumulate_density",
-                f64::from(u8::from(color_by == ColorBy::Density)),
+                f64::from(u8::from(opts.color_by == ColorBy::Density)),
             ),
         ];
         Ok(Self {
@@ -168,8 +200,21 @@ impl NeighborMean {
             }),
             grid,
             map: map.clone(),
-            timings: GpuTimings::new(device, queue, &TIMING_STAGES)?,
+            timings: GpuTimings::new(device, queue, TIMING_STAGES.split_at(5).0)?,
+            query_timings: [
+                GpuTimings::new(device, queue, &["graph.neighbor_mean"])?,
+                GpuTimings::new(device, queue, &["graph.neighbor_mean_sparse"])?,
+            ],
+            query_offset: shader::uniform(
+                device,
+                "neighbor query offset",
+                bytemuck::cast_slice(&[0u32; 4]),
+            ),
+            batch_size: opts.neighbor_batch_size,
             scratch: None,
+            final_radius: opts.neighbor_radius_end.unwrap_or(radius),
+            iterations: opts.iterations,
+            iteration: 0,
         })
     }
 
@@ -179,15 +224,15 @@ impl NeighborMean {
         parameters
             .buffer_bytes()
             .saturating_add(parameters.summary_bytes())
-            .saturating_add(52)
+            .saturating_add(84)
     }
 
-    pub const fn radius(&self) -> u32 {
-        self.grid.radius
+    pub const fn cell_size(&self) -> u32 {
+        self.grid.cell_size
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, size: [u32; 2]) -> Result<()> {
-        self.grid = GridBuffers::new(device, size, self.grid.radius)?;
+        self.grid = GridBuffers::new(device, size, self.grid.cell_size)?;
         self.reset();
         Ok(())
     }
@@ -195,11 +240,31 @@ impl NeighborMean {
     pub fn reset(&mut self) {
         // The resampler can reuse the first input allocation for a different graph.
         self.scratch = None;
+        self.iteration = 0;
+    }
+
+    pub fn prepare_iteration(&mut self, queue: &wgpu::Queue) -> Result<()> {
+        // Integer interpolation reaches both endpoints without float rounding.
+        // A single iteration uses the initial radius; later calls stay at the final radius.
+        let steps = self.iterations.saturating_sub(1).max(1);
+        let progress = self.iteration.min(steps);
+        let decrease = u64::from(self.grid.cell_size.saturating_sub(self.final_radius))
+            .saturating_mul(u64::from(progress))
+            .checked_div(u64::from(steps))
+            .ok_or_eyre("radius schedule must have at least one step")?;
+        let radius = u64::from(self.grid.cell_size).saturating_sub(decrease);
+        let radius = u32::try_from(radius)?;
+        // Keep the grid allocation fixed. Only the query radius shrinks.
+        queue.write_buffer(&self.grid.parameters, 16, bytemuck::bytes_of(&radius));
+        self.iteration = self.iteration.saturating_add(1);
+        tracing::info!(iteration = self.iteration, radius, "neighbor attraction");
+        Ok(())
     }
 
     pub fn encode(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         geometry: &mut Geometry,
         samples: u32,
@@ -239,6 +304,7 @@ impl NeighborMean {
                 (7, scratch.tasks.as_entire_binding()),
                 (8, self.grid.summaries.as_entire_binding()),
                 (9, self.map.as_entire_binding()),
+                (10, self.query_offset.as_entire_binding()),
             ],
         );
         let dispatch_grid = shader::bindings(
@@ -255,7 +321,8 @@ impl NeighborMean {
             [(0, self.dispatch.as_entire_binding())],
         );
         encoder.clear_buffer(&self.grid.cells, 0, None);
-        for ((pipeline, label), stage) in self.pipelines.iter().zip(TIMING_STAGES).zip(0..) {
+        for ((pipeline, label), stage) in self.pipelines.iter().take(5).zip(TIMING_STAGES).zip(0..)
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes: self.timings.compute_pass(stage),
@@ -277,16 +344,85 @@ impl NeighborMean {
                     pass.set_bind_group(1, &dispatch_binding, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
                 }
-                4 => pass.dispatch_workgroups_indirect(&self.dispatch, 0),
-                5 => pass.dispatch_workgroups_indirect(&self.dispatch, 12),
-                _ => pass.dispatch_workgroups_indirect(&self.dispatch, 24),
+                _ => pass.dispatch_workgroups_indirect(&self.dispatch, 0),
             }
         }
         self.timings.resolve(encoder);
+        self.encode_queries(device, queue, encoder, &bindings, tasks)?;
         std::mem::swap(&mut geometry.points, &mut scratch.points);
         self.scratch = Some(scratch);
         Ok(())
     }
+
+    fn encode_queries(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        bindings: &wgpu::BindGroup,
+        tasks: u32,
+    ) -> Result<()> {
+        let Some(batch_size) = self.batch_size else {
+            for ((pipeline, timings), offset) in self
+                .pipelines
+                .iter()
+                .skip(5)
+                .zip(&self.query_timings)
+                .zip([12, 24])
+            {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("neighbor queries"),
+                        timestamp_writes: timings.compute_pass(0),
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bindings, &[]);
+                    pass.dispatch_workgroups_indirect(&self.dispatch, offset);
+                }
+                timings.resolve(encoder);
+            }
+            return Ok(());
+        };
+
+        // Finish the index first. All query batches read the same input and write disjoint slots.
+        submit_and_wait(device, queue, encoder)?;
+        let batch_size = batch_size
+            .get()
+            .min(device.limits().max_compute_workgroups_per_dimension);
+        let timings = &self.query_timings[0];
+        for offset in (0..tasks).step_by(usize::try_from(batch_size)?) {
+            queue.write_buffer(&self.query_offset, 0, bytemuck::bytes_of(&offset));
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("batched neighbor queries"),
+                    timestamp_writes: timings.compute_pass(0),
+                });
+                pass.set_pipeline(&self.pipelines[5]);
+                pass.set_bind_group(0, bindings, &[]);
+                pass.dispatch_workgroups(tasks.saturating_sub(offset).min(batch_size), 1, 1);
+            }
+            timings.resolve(encoder);
+            submit_and_wait(device, queue, encoder)?;
+        }
+        Ok(())
+    }
+}
+
+fn submit_and_wait(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+) -> Result<()> {
+    let commands = std::mem::replace(
+        encoder,
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default()),
+    );
+    let submission = queue.submit([commands.finish()]);
+    device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        timeout: Some(Duration::from_secs(60)),
+    })?;
+    Ok(())
 }
 
 fn workgroups(device: &wgpu::Device, groups: u32) -> Result<[u32; 2]> {

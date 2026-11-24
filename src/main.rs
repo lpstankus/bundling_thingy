@@ -1,4 +1,5 @@
 mod density;
+mod geometry_io;
 mod gpu;
 mod graph;
 mod neighbor_mean;
@@ -9,12 +10,14 @@ mod shader;
 mod window;
 
 use clap::{Parser, builder::TypedValueParser};
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{Result, WrapErr, ensure};
 use gpu::{Gpu, SIZE};
 use graph::Graph;
+use neighbor_mean::NeighborWeighting;
 use palette::{ColorBy, Palette};
 use std::{
     fs::{self, File},
+    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 
@@ -56,9 +59,29 @@ pub struct Options {
     #[arg(long)]
     endpoint_dots: bool,
 
-    /// Mean-update radius in texels. Endpoints remain fixed.
+    /// Initial search radius in texels. Endpoints remain fixed.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     neighbor_radius: Option<u32>,
+
+    /// Final radius in texels. Decreases linearly; one iteration uses the initial radius.
+    #[arg(long, requires = "neighbor_radius", value_parser = clap::value_parser!(u32).range(1..))]
+    neighbor_radius_end: Option<u32>,
+
+    /// Weight nearby samples uniformly or by closest-endpoint distance.
+    #[arg(long, value_enum, default_value_t = NeighborWeighting::default(), requires = "neighbor_radius")]
+    neighbor_weighting: NeighborWeighting,
+
+    /// Limit query workgroups per submission to avoid long GPU jobs.
+    #[arg(long, requires = "neighbor_radius")]
+    neighbor_batch_size: Option<NonZeroU32>,
+
+    /// Export final path coordinates and edge IDs for headless analysis.
+    #[arg(long, requires = "headless")]
+    export_geometry: bool,
+
+    /// Render or continue exported geometry. Use --color-by edge-id.
+    #[arg(long, requires = "headless", conflicts_with = "input")]
+    geometry_input: Option<PathBuf>,
 
     /// Mean updates per graph. Headless exports every iteration.
     #[arg(long, default_value_t = 1, requires = "neighbor_radius", value_parser = clap::value_parser!(u32).range(1..))]
@@ -81,6 +104,12 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     profiling::init()?;
     let opts = Options::parse();
+    if let Some(end) = opts.neighbor_radius_end {
+        ensure!(
+            opts.neighbor_radius.is_some_and(|start| end <= start),
+            "--neighbor-radius-end must not exceed --neighbor-radius"
+        );
+    }
 
     if opts.headless {
         headless(&opts)
@@ -89,15 +118,19 @@ fn main() -> Result<()> {
     }
 }
 
-#[tracing::instrument(name = "headless", skip_all, fields(input = %opts.input.display()), err)]
+#[tracing::instrument(name = "headless", skip_all, fields(input = %opts.geometry_input.as_ref().unwrap_or(&opts.input).display()), err)]
 fn headless(opts: &Options) -> Result<()> {
     fs::create_dir_all(&opts.out)
         .wrap_err_with(|| format!("create output directory {}", opts.out.display()))?;
 
     let mut gpu = pollster::block_on(Gpu::new(None, opts))?;
 
-    let graph = Graph::load(&opts.input)?;
-    let samples = gpu.upload(&graph)?;
+    let samples = if let Some(folder) = &opts.geometry_input {
+        gpu.import_geometry(folder)?
+    } else {
+        let graph = Graph::load(&opts.input)?;
+        gpu.upload(&graph)?
+    };
     write_image(&gpu, &opts.out.join("original.png"))?;
     if opts.neighbor_radius.is_some() {
         for iteration in 1..=opts.iterations {
@@ -110,6 +143,9 @@ fn headless(opts: &Options) -> Result<()> {
             };
             write_image(&gpu, &opts.out.join(name))?;
         }
+    }
+    if opts.export_geometry {
+        gpu.export_geometry(&opts.out.join("geometry"))?;
     }
     println!("rendered {} samples to {}", samples, opts.out.display());
     Ok(())

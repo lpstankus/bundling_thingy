@@ -66,6 +66,10 @@ pub struct PendingGraph {
 }
 
 impl Resampler {
+    pub const fn memory_budget(&self) -> u64 {
+        self.budget
+    }
+
     pub fn new(device: &wgpu::Device, opts: &Options, size: [u32; 2]) -> Result<Self> {
         let budget = opts
             .max_graph_memory_mib

@@ -6,3 +6,5 @@ benchmarks/loading/**/target/
 benchmarks/loading/**/__pycache__/
 
 /target/
+
+/tools/__pycache__/

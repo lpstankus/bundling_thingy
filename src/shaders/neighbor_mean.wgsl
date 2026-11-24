@@ -1,10 +1,12 @@
 override block_size: u32;
 override accumulate_density: bool;
+override weight_by_endpoints: bool;
 
 @group(0) @binding(0) var<storage, read> input_points: array<Point>;
 @group(0) @binding(1) var<storage, read_write> output_points: array<Point>;
 @group(0) @binding(3) var<storage, read_write> density: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read> paths: array<Path>;
+@group(0) @binding(10) var<uniform> query_offset: vec4<u32>;
 
 struct Summary {
     start: u32,
@@ -12,12 +14,56 @@ struct Summary {
     relative_sum: vec2<f32>,
     minimum: vec2<f32>,
     maximum: vec2<f32>,
+    edge_id: u32,
+}
+
+struct Neighbor {
+    point: Point,
+    endpoints: Edge,
 }
 
 var<workgroup> cell_summary: Summary;
 var<workgroup> scan_needed: atomic<u32>;
 var<workgroup> scan_flag: u32;
-var<workgroup> tile: array<vec2<f32>, block_size>;
+var<workgroup> tile: array<Neighbor, block_size>;
+
+fn edge_endpoints(edge_id: u32) -> Edge {
+    if !weight_by_endpoints {
+        return Edge(vec2<f32>(0.0), vec2<f32>(0.0));
+    }
+    // Endpoints are pinned, including after swapping the point buffers.
+    let path = paths[edge_id];
+    return Edge(
+        point_position(input_points[path.point_offset]),
+        point_position(input_points[path.point_offset + path.count - 1u]),
+    );
+}
+
+fn read_neighbor(slot: u32) -> Neighbor {
+    let point = input_points[positions[slot].index];
+    return Neighbor(point, edge_endpoints(point.edge_id));
+}
+
+fn endpoint_similarity(a: Edge, b: Edge, texel_scale: vec2<f32>) -> f32 {
+    if !weight_by_endpoints {
+        return 1.0;
+    }
+    let ss = (a.source - b.source) * texel_scale;
+    let sd = (a.source - b.destination) * texel_scale;
+    let ds = (a.destination - b.source) * texel_scale;
+    let dd = (a.destination - b.destination) * texel_scale;
+    let closest_squared = min(min(dot(ss, ss), dot(sd, sd)), min(dot(ds, ds), dot(dd, dd)));
+    // Inverse distance, with a one-texel offset to keep shared endpoints finite.
+    return 1.0 / (1.0 + sqrt(closest_squared));
+}
+
+fn moved_position(position: vec2<f32>, displacement: vec2<f32>, total_weight: f32) -> vec2<f32> {
+    if total_weight == 0.0 {
+        return position;
+    }
+    // Relative displacements give the weighted mean without summing absolute coordinates.
+    return position + displacement / total_weight;
+}
 
 fn read_summary(cell: u32) -> Summary {
     return Summary(
@@ -26,6 +72,7 @@ fn read_summary(cell: u32) -> Summary {
         summaries[cell].relative_sum,
         summaries[cell].minimum,
         summaries[cell].maximum,
+        summaries[cell].edge_id,
     );
 }
 
@@ -78,7 +125,7 @@ fn neighbor_mean(
     @builtin(local_invocation_index) lane: u32,
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    let task = load_task(group.y * groups.x + group.x, lane);
+    let task = load_task(query_offset.x + group.y * groups.x + group.x, lane);
     if task.cell >= arrayLength(&spatial.cells) {
         return;
     }
@@ -87,10 +134,12 @@ fn neighbor_mean(
     let valid = slot < query_cell.end;
     var index = 0u;
     var current = Point(0.0, 0.0, 0u);
+    var endpoints = Edge(vec2<f32>(0.0), vec2<f32>(0.0));
     var movable = false;
     if valid {
         index = positions[slot].index;
         current = input_points[index];
+        endpoints = edge_endpoints(current.edge_id);
         movable = movable_point(index, current);
     }
     let position = point_position(current);
@@ -102,7 +151,7 @@ fn neighbor_mean(
     let first = grid_cell(texel_position(query_cell.minimum) - reach);
     let last = grid_cell(texel_position(query_cell.maximum) + reach);
     var displacement = vec2<f32>(0.0);
-    var neighbors = 0u;
+    var total_weight = 0.0;
     for (var y = first.y; y <= last.y; y += 1u) {
         for (var x = first.x; x <= last.x; x += 1u) {
             let source = load_summary(y * grid.size.x + x, lane);
@@ -110,11 +159,14 @@ fn neighbor_mean(
                 continue;
             }
             let classification = classify_cell(source, position, texel_scale);
-            let scan = movable && classification == 2u;
-            if movable && classification == 1u {
+            let foreign_edge = source.edge_id != current.edge_id;
+            let summarize = classification == 1u && source.edge_id != MIXED_EDGES;
+            let scan = movable && foreign_edge && classification != 0u && !summarize;
+            if movable && foreign_edge && summarize {
                 let count = source.end - source.start;
-                displacement += cell_displacement(source, position);
-                neighbors += count;
+                let weight = endpoint_similarity(endpoints, edge_endpoints(source.edge_id), texel_scale);
+                displacement += weight * cell_displacement(source, position);
+                total_weight += weight * f32(count);
             }
 
             if lane == 0u {
@@ -132,16 +184,21 @@ fn neighbor_mean(
                 for (var start = source.start; start < source.end; start += block_size) {
                     let count = min(block_size, source.end - start);
                     if lane < count {
-                        tile[lane] = indexed_position(start + lane);
+                        tile[lane] = read_neighbor(start + lane);
                     }
                     workgroupBarrier();
                     if scan {
                         for (var neighbor = 0u; neighbor < count; neighbor += 1u) {
-                            let delta = tile[neighbor] - position;
+                            let candidate = tile[neighbor];
+                            if candidate.point.edge_id == current.edge_id {
+                                continue;
+                            }
+                            let delta = point_position(candidate.point) - position;
                             let texel_delta = delta * texel_scale;
                             if dot(texel_delta, texel_delta) <= radius_squared {
-                                displacement += delta;
-                                neighbors += 1u;
+                                let weight = endpoint_similarity(endpoints, candidate.endpoints, texel_scale);
+                                displacement += weight * delta;
+                                total_weight += weight;
                             }
                         }
                     }
@@ -154,7 +211,7 @@ fn neighbor_mean(
     if valid {
         var mean = position;
         if movable {
-            mean += displacement / f32(neighbors);
+            mean = moved_position(position, displacement, total_weight);
         }
         write_point(index, mean, current.edge_id);
     }
@@ -175,6 +232,7 @@ fn neighbor_mean_sparse(
         write_point(index, position, current.edge_id);
         return;
     }
+    let endpoints = edge_endpoints(current.edge_id);
     let texel_scale = vec2<f32>(map.size - vec2<u32>(1u)) * 0.5;
     let radius_squared = f32(grid.radius) * f32(grid.radius);
     let padding = vec2<f32>(map.size) * 0.00000024;
@@ -183,21 +241,26 @@ fn neighbor_mean_sparse(
     let first = grid_cell(texels - reach);
     let last = grid_cell(texels + reach);
     var displacement = vec2<f32>(0.0);
-    var neighbors = 0u;
+    var total_weight = 0.0;
     for (var y = first.y; y <= last.y; y += 1u) {
         for (var x = first.x; x <= last.x; x += 1u) {
             // Small cells are cheaper to scan directly, without building summaries.
             let cell = y * grid.size.x + x;
             let end = atomicLoad(&spatial.cells[cell].end);
             for (var neighbor = spatial.cells[cell].start; neighbor < end; neighbor += 1u) {
-                let delta = indexed_position(neighbor) - position;
+                let candidate = input_points[positions[neighbor].index];
+                if candidate.edge_id == current.edge_id {
+                    continue;
+                }
+                let delta = point_position(candidate) - position;
                 let texel_delta = delta * texel_scale;
                 if dot(texel_delta, texel_delta) <= radius_squared {
-                    displacement += delta;
-                    neighbors += 1u;
+                    let weight = endpoint_similarity(endpoints, edge_endpoints(candidate.edge_id), texel_scale);
+                    displacement += weight * delta;
+                    total_weight += weight;
                 }
             }
         }
     }
-    write_point(index, position + displacement / f32(neighbors), current.edge_id);
+    write_point(index, moved_position(position, displacement, total_weight), current.edge_id);
 }
