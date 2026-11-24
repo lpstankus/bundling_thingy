@@ -1,8 +1,12 @@
 use crate::{
-    density::{self, Density, DensityEncoder, DensityInput},
+    advection::Advection,
+    bundling::{BundlingMethod, CubuSchedule},
+    density::{self, Density, DensityEncoder},
     graph::ResampledGraph,
     palette::Palette,
     profiling::GpuTimings,
+    resampling::{Geometry, Resampling},
+    smoothing::{PathSmoothing, Smoothing},
 };
 use color_eyre::eyre::{OptionExt, Result, ensure};
 use std::{
@@ -27,6 +31,7 @@ pub struct Gpu {
     density: Density,
     density_binding: wgpu::BindGroup,
     palette: wgpu::Buffer,
+    kernel_radius: u16,
     density_timings: GpuTimings,
     render_timings: GpuTimings,
     graph: Option<UploadedGraph>,
@@ -40,7 +45,7 @@ pub struct Gpu {
 
 struct UploadedGraph {
     bindings: wgpu::BindGroup,
-    segment_count: u32,
+    geometry: Geometry,
 }
 
 impl Gpu {
@@ -49,6 +54,7 @@ impl Gpu {
         window: Option<Arc<Window>>,
         validation: bool,
         palette: Palette,
+        kernel_radius: u16,
     ) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             flags: if validation {
@@ -114,7 +120,7 @@ impl Gpu {
         let (width, height) = config
             .as_ref()
             .map_or((SIZE, SIZE), |c| (c.width, c.height));
-        let density = Density::new(&device, width, height)?;
+        let density = Density::new(&device, width, height, kernel_radius)?;
         let pipeline = Self::pipeline(&device, format);
         let palette = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("density palette"),
@@ -143,6 +149,7 @@ impl Gpu {
             density,
             density_binding,
             palette,
+            kernel_radius,
             density_timings,
             render_timings,
             graph: None,
@@ -275,29 +282,9 @@ impl Gpu {
             graph.dimensions() == self.dimensions(),
             "resampled graph dimensions differ from render target"
         );
-        let segment_count = u32::try_from(graph.segments().len())?;
-        let input = DensityInput::new(&self.device, graph)?;
-        let segments = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("resampled graph segments"),
-                contents: bytemuck::cast_slice(graph.segments()),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resampled graph rendering"),
-            layout: &self.pipeline.get_bind_group_layout(1),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.points().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: segments.as_entire_binding(),
-                },
-            ],
-        });
+        let geometry = Geometry::new(&self.device, graph)?;
+        self.density
+            .set_kernel(&self.queue, self.kernel_radius & !1)?;
         drop(upload_timing);
 
         let _density_timing = tracing::info_span!("density.compute").entered();
@@ -305,14 +292,165 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let density_encoder =
-            DensityEncoder::new(&self.device, &mut encoder, &self.density_timings);
-        self.density.encode(density_encoder, &input)?;
+            DensityEncoder::new(&self.device, &mut encoder, Some(&self.density_timings));
+        self.density.encode(density_encoder, &geometry.input)?;
         self.queue.submit([encoder.finish()]);
-        self.graph = Some(UploadedGraph {
-            bindings,
-            segment_count,
-        });
+        self.graph = Some(self.uploaded_graph(geometry));
         self.wait()
+    }
+
+    #[tracing::instrument(name = "gpu.bundle", skip(self, method), fields(bund_method = method.name()), err)]
+    pub fn bundle(
+        &mut self,
+        method: BundlingMethod,
+        iterations: u32,
+        step_size: f32,
+        spacing: f32,
+    ) -> Result<()> {
+        match method {
+            BundlingMethod::Cubu => {
+                self.bundle_cubu(iterations, step_size, spacing, PathSmoothing::Enabled)
+            }
+            BundlingMethod::CubuNoSmoothing => {
+                self.bundle_cubu(iterations, step_size, spacing, PathSmoothing::Disabled)
+            }
+        }
+    }
+
+    fn bundle_cubu(
+        &mut self,
+        iterations: u32,
+        step_size: f32,
+        spacing: f32,
+        path_smoothing: PathSmoothing,
+    ) -> Result<()> {
+        if iterations == 0 {
+            return Ok(());
+        }
+        let size = self.density.texture.size();
+        let resampling = Resampling::new(&self.device, size, spacing);
+        let schedule = CubuSchedule::new(self.kernel_radius, step_size, iterations)?;
+        let timing_stages: &[&str] = match path_smoothing {
+            PathSmoothing::Enabled => &["bundling.advect", "bundling.smooth"],
+            PathSmoothing::Disabled => &["bundling.advect"],
+        };
+        let advection_timings = GpuTimings::new(&self.device, &self.queue, timing_stages)?;
+        for (iteration, step) in schedule.enumerate() {
+            let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+            let geometry = self.resample_geometry(&resampling, &graph.geometry)?;
+            self.density.set_kernel(&self.queue, step.kernel_radius)?;
+            tracing::info!(
+                iteration = iteration.saturating_add(1),
+                radius = step.radius,
+                kernel_radius = step.kernel_radius,
+                step_size = step.step_size,
+                "CUBu iteration"
+            );
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            self.density.encode(
+                DensityEncoder::new(&self.device, &mut encoder, None),
+                &geometry.input,
+            )?;
+            let advection = Advection::new(
+                &self.device,
+                &self.density,
+                &geometry.input,
+                &geometry.segments,
+                step.step_size,
+            );
+            let final_iteration = step.final_iteration;
+            advection.encode(&mut encoder, final_iteration.then_some(&advection_timings));
+            if matches!(path_smoothing, PathSmoothing::Enabled) {
+                let smoothing = Smoothing::new(&self.device, &geometry, size, spacing);
+                smoothing.encode(&mut encoder, final_iteration.then_some(&advection_timings));
+            }
+            if final_iteration {
+                advection_timings.resolve(&mut encoder);
+            }
+            self.queue.submit([encoder.finish()]);
+            self.graph = Some(self.uploaded_graph(geometry));
+        }
+        self.refresh_density()
+    }
+
+    fn resample_geometry(&self, resampling: &Resampling, graph: &Geometry) -> Result<Geometry> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let readback = resampling.count(&self.device, &mut encoder, graph);
+        self.queue.submit([encoder.finish()]);
+        let counts = self.map_buffer(&readback)?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let geometry = resampling.sample(&self.device, &mut encoder, graph, &counts)?;
+        self.queue.submit([encoder.finish()]);
+        Ok(geometry)
+    }
+
+    fn refresh_density(&self) -> Result<()> {
+        let graph = self.graph.as_ref().ok_or_eyre("no uploaded graph")?;
+        let resampling = Resampling::new(
+            &self.device,
+            self.density.texture.size(),
+            density::SAMPLE_SPACING,
+        );
+        // Movement and smoothing change sample spacing, including in the final iteration.
+        // Sample the finished paths for density without changing their rendered geometry.
+        let samples = self.resample_geometry(&resampling, &graph.geometry)?;
+        tracing::info!(
+            spacing = density::SAMPLE_SPACING,
+            samples = samples.input.points().size() / 8,
+            "Display density samples"
+        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.density.encode(
+            DensityEncoder::new(&self.device, &mut encoder, Some(&self.density_timings)),
+            &samples.input,
+        )?;
+        self.queue.submit([encoder.finish()]);
+        self.wait()
+    }
+
+    fn uploaded_graph(&self, geometry: Geometry) -> UploadedGraph {
+        let bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resampled graph rendering"),
+            layout: &self.pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: geometry.input.points().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: geometry.segments.as_entire_binding(),
+                },
+            ],
+        });
+        UploadedGraph { bindings, geometry }
+    }
+
+    pub fn sample_count(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .map_or(0, |graph| graph.geometry.input.points().size() / 8)
+    }
+
+    fn map_buffer(&self, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.wait()?;
+        rx.recv()??;
+        let result = slice.get_mapped_range().to_vec();
+        buffer.unmap();
+        Ok(result)
     }
 
     fn encode_draw(&self, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
@@ -344,7 +482,7 @@ impl Gpu {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.density_binding, &[]);
                 pass.set_bind_group(1, &graph.bindings, &[]);
-                pass.draw(0..6, 0..graph.segment_count);
+                pass.draw(0..6, 0..graph.geometry.segment_count);
             }
         }
 
@@ -385,18 +523,7 @@ impl Gpu {
         );
 
         self.queue.submit([encoder.finish()]);
-        let (tx, rx) = mpsc::sync_channel(1);
-        let slice = self.download.slice(..);
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-
-        self.wait()?;
-        rx.recv()??;
-
-        let result = slice.get_mapped_range().to_vec();
-        self.download.unmap();
-        Ok(result)
+        self.map_buffer(&self.download)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -409,7 +536,7 @@ impl Gpu {
                 return Ok(());
             }
             let _timing = tracing::info_span!("gpu.resize", width, height).entered();
-            let density = Density::new(&self.device, width, height)?;
+            let density = Density::new(&self.device, width, height, self.kernel_radius)?;
             let binding = Self::density_binding(
                 &self.device,
                 &self.pipeline,

@@ -2,6 +2,8 @@ use crate::{graph::ResampledGraph, profiling::GpuTimings};
 use color_eyre::eyre::{Result, ensure};
 use wgpu::util::DeviceExt;
 
+pub const SAMPLE_SPACING: f32 = 1.0;
+
 pub const TIMING_STAGES: [&str; 6] = [
     "density.count",
     "density.resolve",
@@ -16,6 +18,8 @@ pub struct Density {
     maximum: wgpu::Buffer,
     count_pipeline: wgpu::ComputePipeline,
     stages: [Stage; 5],
+    kernel: Kernel,
+    pub values: wgpu::Buffer,
     pub texture: wgpu::Texture,
 }
 
@@ -28,7 +32,7 @@ pub struct DensityInput {
 pub struct DensityEncoder<'a> {
     device: &'a wgpu::Device,
     commands: &'a mut wgpu::CommandEncoder,
-    timings: &'a GpuTimings,
+    timings: Option<&'a GpuTimings>,
     next_query: u32,
 }
 
@@ -37,14 +41,20 @@ struct Stage {
     bindings: wgpu::BindGroup,
 }
 
+struct Kernel {
+    weights: wgpu::Buffer,
+    radius: wgpu::Buffer,
+}
+
 impl Density {
     #[tracing::instrument(name = "density.init", skip_all, fields(width = width, height = height), err)]
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self> {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32, radius: u16) -> Result<Self> {
         let limits = device.limits();
         ensure!(
             width > 0 && height > 0,
             "density map dimensions must be nonzero"
         );
+        ensure!(radius >= 2, "kernel radius must be at least 2 texels");
         ensure!(
             width <= limits.max_texture_dimension_2d && height <= limits.max_texture_dimension_2d,
             "density map exceeds GPU texture limits"
@@ -61,6 +71,7 @@ impl Density {
         let image_a = create_buffer(device, "density image A", bytes);
         let image_b = create_buffer(device, "density image B", bytes);
         let maximum = create_buffer(device, "density maximum", 4);
+        let kernel = Kernel::new(device, radius & !1);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -89,13 +100,23 @@ impl Density {
             ),
             Stage::new(
                 device,
-                build_gaussian_pipeline(device, size, 0.0),
-                &[buffer_entry(0, &image_a), buffer_entry(1, &image_b)],
+                build_blur_pipeline(device, size, 0.0),
+                &[
+                    buffer_entry(0, &image_a),
+                    buffer_entry(1, &image_b),
+                    buffer_entry(2, &kernel.weights),
+                    buffer_entry(3, &kernel.radius),
+                ],
             ),
             Stage::new(
                 device,
-                build_gaussian_pipeline(device, size, 1.0),
-                &[buffer_entry(0, &image_b), buffer_entry(1, &image_a)],
+                build_blur_pipeline(device, size, 1.0),
+                &[
+                    buffer_entry(0, &image_b),
+                    buffer_entry(1, &image_a),
+                    buffer_entry(2, &kernel.weights),
+                    buffer_entry(3, &kernel.radius),
+                ],
             ),
             Stage::new(
                 device,
@@ -120,8 +141,27 @@ impl Density {
             maximum,
             count_pipeline,
             stages,
+            kernel,
+            values: image_a,
             texture,
         })
+    }
+
+    pub fn set_kernel(&self, queue: &wgpu::Queue, radius: u16) -> Result<()> {
+        ensure!(radius >= 2, "kernel radius must be at least 2 texels");
+        let weights = parabolic_weights(radius);
+        let contents = bytemuck::cast_slice(&weights);
+        ensure!(
+            u64::try_from(contents.len())? <= self.kernel.weights.size(),
+            "kernel radius exceeds its initial allocation"
+        );
+        queue.write_buffer(&self.kernel.weights, 0, contents);
+        queue.write_buffer(
+            &self.kernel.radius,
+            0,
+            bytemuck::bytes_of(&u32::from(radius)),
+        );
+        Ok(())
     }
 
     pub fn encode(&self, mut encoder: DensityEncoder<'_>, input: &DensityInput) -> Result<()> {
@@ -146,7 +186,9 @@ impl Density {
         for stage in &self.stages {
             encoder.dispatch(stage, workgroups);
         }
-        encoder.timings.resolve(encoder.commands);
+        if let Some(timings) = encoder.timings {
+            timings.resolve(encoder.commands);
+        }
         Ok(())
     }
 }
@@ -154,30 +196,57 @@ impl Density {
 impl DensityInput {
     pub fn new(device: &wgpu::Device, graph: &ResampledGraph) -> Result<Self> {
         let count = u32::try_from(graph.points().len())?;
+        let workgroups = Self::validate_count(device, count)?;
+        Ok(Self {
+            points: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resampled graph points"),
+                contents: bytemuck::cast_slice(graph.points()),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            }),
+            dimensions: graph.dimensions(),
+            workgroups,
+        })
+    }
+
+    pub fn allocate(device: &wgpu::Device, count: u32, dimensions: [u32; 2]) -> Result<Self> {
+        let workgroups = Self::validate_count(device, count)?;
+        Ok(Self {
+            points: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("resampled graph points"),
+                size: u64::from(count).saturating_mul(8),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            dimensions,
+            workgroups,
+        })
+    }
+
+    fn validate_count(device: &wgpu::Device, count: u32) -> Result<[u32; 2]> {
+        ensure!(count > 0, "graph has no samples");
         let groups = count.div_ceil(256);
         let limit = device.limits().max_compute_workgroups_per_dimension;
         let x = groups.min(limit);
         let y = groups.div_ceil(x);
         ensure!(y <= limit, "density samples exceed GPU dispatch limit");
-        let contents = bytemuck::cast_slice(graph.points());
         ensure!(
-            u64::try_from(contents.len())?
+            u64::from(count).saturating_mul(8)
                 <= u64::from(device.limits().max_storage_buffer_binding_size),
             "resampled points exceed GPU storage buffer limit"
         );
-        Ok(Self {
-            points: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("resampled graph points"),
-                contents,
-                usage: wgpu::BufferUsages::STORAGE,
-            }),
-            dimensions: graph.dimensions(),
-            workgroups: [x, y],
-        })
+        Ok([x, y])
     }
 
     pub const fn points(&self) -> &wgpu::Buffer {
         &self.points
+    }
+
+    pub const fn workgroups(&self) -> [u32; 2] {
+        self.workgroups
     }
 }
 
@@ -200,7 +269,7 @@ impl<'a> DensityEncoder<'a> {
     pub const fn new(
         device: &'a wgpu::Device,
         commands: &'a mut wgpu::CommandEncoder,
-        timings: &'a GpuTimings,
+        timings: Option<&'a GpuTimings>,
     ) -> Self {
         Self {
             device,
@@ -211,7 +280,9 @@ impl<'a> DensityEncoder<'a> {
     }
 
     fn dispatch(&mut self, stage: &Stage, [x, y]: [u32; 2]) {
-        let timestamp_writes = self.timings.compute_pass(self.next_query);
+        let timestamp_writes = self
+            .timings
+            .and_then(|timings| timings.compute_pass(self.next_query));
         self.next_query = self.next_query.saturating_add(1);
         let mut pass = self
             .commands
@@ -234,6 +305,31 @@ fn create_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer
     })
 }
 
+impl Kernel {
+    fn new(device: &wgpu::Device, radius: u16) -> Self {
+        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("parabolic density kernel"),
+            contents: bytemuck::cast_slice(&parabolic_weights(radius)),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let radius = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("density kernel radius"),
+            contents: bytemuck::bytes_of(&u32::from(radius)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        Self { weights, radius }
+    }
+}
+
+fn parabolic_weights(radius: u16) -> Vec<f32> {
+    (0..=radius)
+        .map(|offset| {
+            let x = f32::from(offset) / f32::from(radius);
+            x.mul_add(-x, 1.0)
+        })
+        .collect()
+}
+
 fn build_pipeline(
     device: &wgpu::Device,
     source: &str,
@@ -243,7 +339,7 @@ fn build_pipeline(
     create_pipeline(device, source, entry, size, &[])
 }
 
-fn build_gaussian_pipeline(
+fn build_blur_pipeline(
     device: &wgpu::Device,
     size: wgpu::Extent3d,
     axis: f64,
@@ -257,7 +353,7 @@ fn build_gaussian_pipeline(
     )
 }
 
-fn create_pipeline(
+pub fn create_pipeline(
     device: &wgpu::Device,
     source: &str,
     entry: &str,
@@ -286,7 +382,7 @@ fn create_pipeline(
     })
 }
 
-fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),

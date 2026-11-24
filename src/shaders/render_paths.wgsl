@@ -24,7 +24,8 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     let index = segments[instance];
     let first = points[index];
     let second = points[index + 1u];
-    let direction = normalize(second - first);
+    let delta = second - first;
+    let direction = delta / max(length(delta), 1e-8);
     let normal = vec2<f32>(-direction.y, direction.x) * 0.001;
     let corner = CORNERS[vertex];
     let position = mix(first, second, corner.x) + normal * corner.y;

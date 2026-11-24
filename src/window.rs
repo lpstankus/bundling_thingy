@@ -1,4 +1,4 @@
-use crate::{Options, gpu::Gpu, graph::Graph, palette::Palette};
+use crate::{Options, gpu::Gpu, graph::Graph};
 use color_eyre::eyre::{OptionExt, Result};
 use std::{
     sync::Arc,
@@ -38,7 +38,7 @@ struct Running {
 
 impl Running {
     #[tracing::instrument(name = "viewer.init", skip_all, err)]
-    fn new(event_loop: &ActiveEventLoop, validation: bool, palette: Palette) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, opts: &Options) -> Result<Self> {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -47,7 +47,12 @@ impl Running {
             )?,
         );
 
-        let gpu = pollster::block_on(Gpu::new(Some(window.clone()), validation, palette))?;
+        let gpu = pollster::block_on(Gpu::new(
+            Some(window.clone()),
+            opts.validate_gpu,
+            opts.palette,
+            opts.kernel_radius,
+        ))?;
 
         let mut graphs = Vec::new();
         for input in INPUTS {
@@ -68,7 +73,7 @@ impl Running {
         })
     }
 
-    fn draw(&mut self) -> Result<()> {
+    fn draw(&mut self, opts: &Options) -> Result<()> {
         let started = Instant::now();
         let (name, graph) = self
             .graphs
@@ -80,6 +85,12 @@ impl Running {
         if self.dirty {
             let [width, height] = self.gpu.dimensions();
             self.gpu.upload(&graph.resample(width, height)?)?;
+            self.gpu.bundle(
+                opts.bund_method,
+                opts.iterations,
+                opts.step_size,
+                opts.sampling_step,
+            )?;
 
             self.dirty = false;
         }
@@ -88,7 +99,8 @@ impl Running {
         if update_title {
             // Measure the redraw itself, excluding time spent waiting for events.
             self.window.set_title(&format!(
-                "Bundling Thingy - {name} ({:.2}ms)",
+                "Bundling Thingy | {} | {name} | {:.2}ms",
+                opts.bund_method.name(),
                 started.elapsed().as_secs_f64() * 1000.0
             ));
             self.last_title_update = Instant::now();
@@ -96,7 +108,12 @@ impl Running {
         Ok(())
     }
 
-    fn handle_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> Result<()> {
+    fn handle_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: WindowEvent,
+        opts: &Options,
+    ) -> Result<()> {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -136,7 +153,7 @@ impl Running {
                 if size.width == 0 || size.height == 0 {
                     return Ok(());
                 }
-                self.draw()?;
+                self.draw(opts)?;
             }
             _ => {}
         }
@@ -150,7 +167,7 @@ impl ApplicationHandler for App {
             return;
         }
 
-        match Running::new(event_loop, self.opts.validate_gpu, self.opts.palette) {
+        match Running::new(event_loop, &self.opts) {
             Ok(running) => self.running = Some(running),
             Err(e) => {
                 self.error = Some(e);
@@ -164,7 +181,7 @@ impl ApplicationHandler for App {
             return;
         };
 
-        if let Err(e) = running.handle_event(event_loop, event) {
+        if let Err(e) = running.handle_event(event_loop, event, &self.opts) {
             self.error = Some(e);
             event_loop.exit();
         }

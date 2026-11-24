@@ -17,6 +17,7 @@ pub struct Graph {
 pub struct ResampledGraph {
     points: Vec<Point>,
     segments: Vec<u32>,
+    ranges: Vec<[u32; 2]>,
     dimensions: [u32; 2],
 }
 
@@ -109,6 +110,7 @@ impl Graph {
         );
         let mut points = Vec::new();
         let mut segments = Vec::new();
+        let mut ranges = Vec::new();
         for &[start, end] in self.starts.array_windows::<2>() {
             let edge = self
                 .points
@@ -150,6 +152,7 @@ impl Graph {
             for index in output_start..points.len().saturating_sub(1) {
                 segments.push(u32::try_from(index)?);
             }
+            ranges.push([u32::try_from(output_start)?, u32::try_from(points.len())?]);
         }
         ensure!(
             !segments.is_empty(),
@@ -164,6 +167,7 @@ impl Graph {
         Ok(ResampledGraph {
             points,
             segments,
+            ranges,
             dimensions: [width, height],
         })
     }
@@ -176,6 +180,10 @@ impl ResampledGraph {
 
     pub fn segments(&self) -> &[u32] {
         &self.segments
+    }
+
+    pub fn ranges(&self) -> &[[u32; 2]] {
+        &self.ranges
     }
 
     pub const fn dimensions(&self) -> [u32; 2] {
