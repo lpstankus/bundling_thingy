@@ -1,7 +1,13 @@
+override force_tiled: bool;
+
 struct GridParameters {
     size: vec2<u32>,
-    radius: u32,
+    cell_size: u32,
     dispatch_limit: u32,
+    radius: u32,
+    padding_0: u32,
+    padding_1: u32,
+    padding_2: u32,
 }
 
 struct Cell {
@@ -13,7 +19,11 @@ struct CellSummary {
     relative_sum: vec2<f32>,
     minimum: vec2<f32>,
     maximum: vec2<f32>,
+    edge_id: u32,
+    padding: u32,
 }
+
+const MIXED_EDGES: u32 = 0xffffffffu;
 
 struct Grid {
     cursor: atomic<u32>,
@@ -61,7 +71,7 @@ fn texel_position(position: vec2<f32>) -> vec2<f32> {
 }
 
 fn grid_cell(texels: vec2<f32>) -> vec2<u32> {
-    return min(vec2<u32>(max(texels / f32(grid.radius), vec2<f32>(0.0))), grid.size - vec2<u32>(1u));
+    return min(vec2<u32>(max(texels / f32(grid.cell_size), vec2<f32>(0.0))), grid.size - vec2<u32>(1u));
 }
 
 fn cell_index(position: vec2<f32>) -> u32 {
@@ -150,7 +160,7 @@ fn prepare_dispatch() {
     var tiled = summaries;
     var sparse = Dispatch(0u, 1u, 1u);
     // Sparse cells leave most lanes idle and do not amortize workgroup barriers.
-    if samples / count < 8u {
+    if !force_tiled && samples / count < 8u {
         summaries = Dispatch(0u, 1u, 1u);
         tiled = Dispatch(0u, 1u, 1u);
         sparse = dispatch_size((samples + block_size - 1u) / block_size);
@@ -163,6 +173,7 @@ var<workgroup> cell_range: vec2<u32>;
 var<workgroup> sums: array<vec2<f32>, block_size>;
 var<workgroup> minima: array<vec2<f32>, block_size>;
 var<workgroup> maxima: array<vec2<f32>, block_size>;
+var<workgroup> edge_ids: array<u32, block_size>;
 
 fn load_task(index: u32, lane: u32) -> Task {
     if lane == 0u {
@@ -193,6 +204,7 @@ fn summarize_cells(
         return;
     }
     let anchor = indexed_position(range.x);
+    var edge_id = input_points[positions[range.x].index].edge_id;
     var sum = vec2<f32>(0.0);
     var minimum = anchor;
     var maximum = anchor;
@@ -201,20 +213,27 @@ fn summarize_cells(
         sum += position - anchor;
         minimum = min(minimum, position);
         maximum = max(maximum, position);
+        if input_points[positions[index].index].edge_id != edge_id {
+            edge_id = MIXED_EDGES;
+        }
     }
     sums[lane] = sum;
     minima[lane] = minimum;
     maxima[lane] = maximum;
+    edge_ids[lane] = edge_id;
     workgroupBarrier();
     for (var stride = block_size / 2u; stride > 0u; stride /= 2u) {
         if lane < stride {
             sums[lane] += sums[lane + stride];
             minima[lane] = min(minima[lane], minima[lane + stride]);
             maxima[lane] = max(maxima[lane], maxima[lane + stride]);
+            if edge_ids[lane] != edge_ids[lane + stride] {
+                edge_ids[lane] = MIXED_EDGES;
+            }
         }
         workgroupBarrier();
     }
     if lane == 0u {
-        summaries[task.cell] = CellSummary(sums[0], minima[0], maxima[0]);
+        summaries[task.cell] = CellSummary(sums[0], minima[0], maxima[0], edge_ids[0], 0u);
     }
 }
