@@ -1,6 +1,7 @@
 mod density;
 mod gpu;
 mod graph;
+mod grouping;
 mod neighbor_mean;
 mod palette;
 mod profiling;
@@ -60,6 +61,10 @@ pub struct Options {
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     neighbor_radius: Option<u32>,
 
+    /// Merge mutual nearest samples within this distance in texels. Zero disables merges.
+    #[arg(long, requires = "neighbor_radius", value_parser = parse_merge_radius)]
+    merge_radius: Option<f32>,
+
     /// Mean updates per graph. Headless exports every iteration.
     #[arg(long, default_value_t = 1, requires = "neighbor_radius", value_parser = clap::value_parser!(u32).range(1..))]
     iterations: u32,
@@ -75,6 +80,15 @@ pub struct Options {
     /// Maximum graph buffer memory in MiB, excluding density and render targets.
     #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     max_graph_memory_mib: u64,
+}
+
+fn parse_merge_radius(value: &str) -> Result<f32, &'static str> {
+    let radius = value.parse::<f32>().map_err(|_| "invalid merge radius")?;
+    if radius.is_finite() && radius >= 0.0 {
+        Ok(radius)
+    } else {
+        Err("merge radius must be finite and nonnegative")
+    }
 }
 
 fn main() -> Result<()> {

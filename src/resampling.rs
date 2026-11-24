@@ -1,6 +1,7 @@
 use crate::{
     Options,
     graph::Graph,
+    grouping,
     neighbor_mean::{self, NeighborMean},
     palette::ColorBy,
     profiling::GpuTimings,
@@ -30,6 +31,7 @@ pub struct Resampler {
     budget: u64,
     sample_bytes: u64,
     grid_bytes: u64,
+    fixed_bytes: u64,
     output: Option<OutputBuffers>,
 }
 
@@ -65,6 +67,12 @@ pub struct PendingGraph {
     capacity: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct Statistics {
+    pub samples: u32,
+    pub segments: u32,
+}
+
 impl Resampler {
     pub fn new(device: &wgpu::Device, opts: &Options, size: [u32; 2]) -> Result<Self> {
         let budget = opts
@@ -74,6 +82,7 @@ impl Resampler {
         ensure!(budget > 0, "graph memory budget must be nonzero");
         let grid_bytes = opts
             .neighbor_radius
+            .filter(|_| opts.merge_radius.is_none())
             .map_or(0, |radius| NeighborMean::grid_bytes(size, radius));
         ensure!(
             grid_bytes < budget,
@@ -145,12 +154,19 @@ impl Resampler {
             emit,
             deduplicate,
             budget,
-            sample_bytes: SAMPLE_BYTES.saturating_add(if opts.neighbor_radius.is_some() {
+            sample_bytes: SAMPLE_BYTES.saturating_add(if opts.merge_radius.is_some() {
+                grouping::SAMPLE_RESERVE_BYTES
+            } else if opts.neighbor_radius.is_some() {
                 neighbor_mean::EXTRA_SAMPLE_BYTES
             } else {
                 0
             }),
             grid_bytes,
+            fixed_bytes: if opts.merge_radius.is_some() {
+                grouping::FIXED_RESERVE_BYTES
+            } else {
+                0
+            },
             output: None,
         })
     }
@@ -188,7 +204,7 @@ impl Resampler {
             graph,
             self.budget,
             self.sample_bytes,
-            self.grid_bytes,
+            self.grid_bytes.saturating_add(self.fixed_bytes),
         )?;
         let capacity = allocation.parameters.capacity;
 
@@ -282,7 +298,7 @@ impl Resampler {
 
 impl PendingGraph {
     /// Read only the counters after the submission's existing GPU wait.
-    pub fn finish(self) -> Result<(Geometry, u32)> {
+    pub fn finish(self) -> Result<(Geometry, Statistics)> {
         let [points, segments, endpoints, overflow] = self.statistics.recv()??;
         ensure!(
             overflow != 2,
@@ -295,7 +311,13 @@ impl PendingGraph {
         );
         ensure!(segments > 0, "resampled graph has no drawable edges");
         tracing::info!(points, segments, endpoints, "GPU resampled graph");
-        Ok((self.geometry, points))
+        Ok((
+            self.geometry,
+            Statistics {
+                samples: points,
+                segments,
+            },
+        ))
     }
 }
 
@@ -315,7 +337,7 @@ impl Allocation {
         graph: &Graph,
         budget: u64,
         sample_bytes: u64,
-        grid_bytes: u64,
+        extra_fixed_bytes: u64,
     ) -> Result<Self> {
         let normalization = graph.normalization()?;
         let path_count = u32::try_from(graph.starts().len().saturating_sub(1))?;
@@ -333,9 +355,9 @@ impl Allocation {
             .saturating_add(shader::MAP_UNIFORM_BYTES)
             .saturating_add(STATE_BYTES)
             .saturating_add(STATISTICS_BYTES)
-            .saturating_add(grid_bytes);
+            .saturating_add(extra_fixed_bytes);
         let available = budget.checked_sub(fixed_bytes).ok_or_eyre(
-            "control points, path metadata, and neighbor grid exceed --max-graph-memory-mib",
+            "control points, path metadata, and graph processing buffers exceed --max-graph-memory-mib",
         )?;
         let limits = device.limits();
         let binding_limit = limits

@@ -7,6 +7,8 @@ pub enum ColorBy {
     Density,
     /// Map input edge IDs across the palette, with one color per edge.
     EdgeId,
+    /// Color each shared segment by the number of distinct edges using it.
+    EdgeCount,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]

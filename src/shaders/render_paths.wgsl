@@ -1,4 +1,5 @@
 override color_by_edge: bool;
+override color_by_count: bool;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -23,6 +24,9 @@ struct Palette {
 @group(1) @binding(1) var<storage, read> segments: array<u32>;
 @group(1) @binding(2) var<storage, read> endpoints: array<u32>;
 @group(1) @binding(3) var<storage, read> edges: array<Edge>;
+@group(1) @binding(4) var<storage, read> segment_paths: array<u32>;
+@group(1) @binding(5) var<storage, read> path_counts: array<u32>;
+@group(1) @binding(6) var<storage, read> group_state: array<u32>;
 
 const PATH_OPACITY: f32 = 0.1;
 const ENDPOINT_RADIUS: f32 = 3.0;
@@ -49,13 +53,19 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     if color_by_edge {
         out.edge_value = f32(point.edge_id) / f32(max(arrayLength(&edges), 2u) - 1u);
     }
+    if color_by_count {
+        let path = segment_paths[instance];
+        if path != 0xffffffffu {
+            out.edge_value = f32(path_counts[path] - 1u) / f32(max(group_state[4], 2u) - 1u);
+        }
+    }
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var value = in.edge_value;
-    if !color_by_edge {
+    if !color_by_edge && !color_by_count {
         // Grid coordinates span [0, size - 1]. Align them with texel centers.
         let size = vec2<f32>(map.size);
         let uv = (in.uv * (size - 1.0) + 0.5) / size;

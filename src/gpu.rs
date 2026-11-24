@@ -2,6 +2,7 @@ use crate::{
     Options,
     density::{self, Density},
     graph::Graph,
+    grouping::{GroupedGraph, Grouping},
     neighbor_mean::NeighborMean,
     palette::{ColorBy, Palette},
     profiling::GpuTimings,
@@ -39,6 +40,7 @@ pub struct Gpu {
     resampling_timings: GpuTimings,
     resampler: Resampler,
     neighbor_mean: Option<NeighborMean>,
+    grouping: Option<Grouping>,
     graph: Option<UploadedGraph>,
 
     target: wgpu::Texture,
@@ -53,11 +55,13 @@ struct UploadedGraph {
     bindings: wgpu::BindGroup,
     geometry: resampling::Geometry,
     samples: u32,
+    grouped: Option<GroupedGraph>,
 }
 
 impl Gpu {
     #[tracing::instrument(name = "gpu.init", skip_all, fields(validation = opts.validate_gpu), err)]
     pub async fn new(window: Option<Arc<Window>>, opts: &Options) -> Result<Self> {
+        Self::validate_options(opts)?;
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             flags: if opts.validate_gpu {
                 wgpu::InstanceFlags::debugging()
@@ -114,19 +118,8 @@ impl Gpu {
         let render_timings = GpuTimings::new(&device, &queue, &["render.draw"])?;
         let resampler = Resampler::new(&device, opts, [width, height])?;
         let resampling_timings = GpuTimings::new(&device, &queue, resampler.timing_stages())?;
-        let neighbor_mean = opts
-            .neighbor_radius
-            .map(|radius| {
-                NeighborMean::new(
-                    &device,
-                    &queue,
-                    radius,
-                    [width, height],
-                    opts.color_by,
-                    &map,
-                )
-            })
-            .transpose()?;
+        let (neighbor_mean, grouping) =
+            Self::neighbor_processing(&device, &queue, opts, [width, height], &map)?;
         tracing::info!(adapter = %info.name, max_buffer_bytes = limits.max_buffer_size, max_storage_binding_bytes = limits.max_storage_buffer_binding_size, "GPU graph processing");
 
         let target = Self::texture(&device, SIZE, SIZE, FORMAT, 1);
@@ -156,6 +149,7 @@ impl Gpu {
             resampling_timings,
             resampler,
             neighbor_mean,
+            grouping,
             graph: None,
             target,
             msaa,
@@ -163,6 +157,36 @@ impl Gpu {
             download,
             surface: surface.zip(config),
         })
+    }
+
+    fn neighbor_processing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        opts: &Options,
+        size: [u32; 2],
+        map: &wgpu::Buffer,
+    ) -> Result<(Option<NeighborMean>, Option<Grouping>)> {
+        let neighbor_mean = opts
+            .neighbor_radius
+            .filter(|_| opts.merge_radius.is_none())
+            .map(|radius| NeighborMean::new(device, queue, radius, size, opts.color_by, map))
+            .transpose()?;
+        let grouping = opts
+            .merge_radius
+            .zip(opts.neighbor_radius)
+            .map(|(merge, attraction)| {
+                Grouping::new(device, queue, attraction, merge, opts.color_by, map)
+            })
+            .transpose()?;
+        Ok((neighbor_mean, grouping))
+    }
+
+    fn validate_options(opts: &Options) -> Result<()> {
+        ensure!(
+            opts.color_by != ColorBy::EdgeCount || opts.merge_radius.is_some(),
+            "edge-count coloring requires --merge-radius"
+        );
+        Ok(())
     }
 
     async fn request_device(
@@ -254,7 +278,7 @@ impl Gpu {
         });
         let graph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resampled points, segments, endpoint dots, and edges"),
-            entries: &[0, 1, 2, 3].map(|binding| wgpu::BindGroupLayoutEntry {
+            entries: &[0, 1, 2, 3, 4, 5, 6].map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
@@ -271,10 +295,16 @@ impl Gpu {
             push_constant_ranges: &[],
         });
 
-        let constants = [(
-            "color_by_edge",
-            f64::from(u8::from(color_by == ColorBy::EdgeId)),
-        )];
+        let constants = [
+            (
+                "color_by_edge",
+                f64::from(u8::from(color_by == ColorBy::EdgeId)),
+            ),
+            (
+                "color_by_count",
+                f64::from(u8::from(color_by == ColorBy::EdgeCount)),
+            ),
+        ];
         let pipeline = |vertex, fragment| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fragment),
@@ -380,7 +410,11 @@ impl Gpu {
     fn wait(&self) -> Result<()> {
         self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
-            timeout: Some(Duration::from_secs(60)),
+            timeout: Some(Duration::from_secs(if self.grouping.is_some() {
+                600
+            } else {
+                60
+            })),
         })?;
         Ok(())
     }
@@ -410,22 +444,32 @@ impl Gpu {
         }
         self.queue.submit([encoder.finish()]);
         self.wait()?;
-        let (geometry, samples) = pending.finish()?;
-        let bindings = Self::graph_bindings(&self.device, &self.pipeline, &geometry);
+        let (geometry, statistics) = pending.finish()?;
+        let grouped = if let Some(grouping) = &self.grouping {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            let grouped = grouping.prepare(&self.device, &mut encoder, &geometry, statistics)?;
+            self.queue.submit([encoder.finish()]);
+            self.wait()?;
+            Some(grouped)
+        } else {
+            None
+        };
+        let samples = statistics.samples;
+        let bindings =
+            Self::graph_bindings(&self.device, &self.pipeline, &geometry, grouped.as_ref());
         self.graph = Some(UploadedGraph {
             bindings,
             geometry,
             samples,
+            grouped,
         });
         Ok(samples)
     }
 
     #[tracing::instrument(name = "graph.iteration", skip_all, err)]
     pub fn iterate(&mut self) -> Result<()> {
-        let neighbor_mean = self
-            .neighbor_mean
-            .as_mut()
-            .ok_or_eyre("neighbor radius is not configured")?;
         let graph = self.graph.as_mut().ok_or_eyre("no uploaded graph")?;
         let mut encoder = self
             .device
@@ -433,25 +477,60 @@ impl Gpu {
         if self.color_by == ColorBy::Density {
             self.density.clear(&mut encoder);
         }
-        neighbor_mean.encode(
-            &self.device,
-            &mut encoder,
-            &mut graph.geometry,
-            graph.samples,
-            self.density.counts(),
-        )?;
+        let stats = if let (Some(grouping), Some(grouped)) = (&self.grouping, &graph.grouped) {
+            let (next_encoder, stats) = grouping.encode(
+                &self.device,
+                &self.queue,
+                encoder,
+                &graph.geometry,
+                grouped,
+                self.density.counts(),
+            )?;
+            encoder = next_encoder;
+            graph.geometry.points = grouped.resolved.clone();
+            Some(stats)
+        } else {
+            let neighbor_mean = self
+                .neighbor_mean
+                .as_mut()
+                .ok_or_eyre("neighbor radius is not configured")?;
+            neighbor_mean.encode(
+                &self.device,
+                &mut encoder,
+                &mut graph.geometry,
+                graph.samples,
+                self.density.counts(),
+            )?;
+            None
+        };
         if self.color_by == ColorBy::Density {
             self.density.encode(&mut encoder, &self.density_timings);
         }
-        graph.bindings = Self::graph_bindings(&self.device, &self.pipeline, &graph.geometry);
+        graph.bindings = Self::graph_bindings(
+            &self.device,
+            &self.pipeline,
+            &graph.geometry,
+            graph.grouped.as_ref(),
+        );
         self.queue.submit([encoder.finish()]);
-        self.wait()
+        self.wait()?;
+        if let Some(stats) = stats {
+            let [vertices, _, paths, shared_paths, max_edges] = stats.recv()??;
+            self.graph
+                .as_mut()
+                .and_then(|graph| graph.grouped.as_mut())
+                .ok_or_eyre("missing grouped graph")?
+                .set_active(vertices)?;
+            tracing::info!(vertices, paths, shared_paths, max_edges, "grouped graph");
+        }
+        Ok(())
     }
 
     fn graph_bindings(
         device: &wgpu::Device,
         pipeline: &wgpu::RenderPipeline,
         geometry: &resampling::Geometry,
+        grouped: Option<&GroupedGraph>,
     ) -> wgpu::BindGroup {
         shader::bindings(
             device,
@@ -461,6 +540,24 @@ impl Gpu {
                 (1, geometry.segments.as_entire_binding()),
                 (2, geometry.endpoints.as_entire_binding()),
                 (3, geometry.edges.as_entire_binding()),
+                (
+                    4,
+                    grouped
+                        .map_or(&geometry.segments, |g| &g.segment_paths)
+                        .as_entire_binding(),
+                ),
+                (
+                    5,
+                    grouped
+                        .map_or(&geometry.segments, |g| &g.path_counts)
+                        .as_entire_binding(),
+                ),
+                (
+                    6,
+                    grouped
+                        .map_or(&geometry.commands, GroupedGraph::state)
+                        .as_entire_binding(),
+                ),
             ],
         )
     }
